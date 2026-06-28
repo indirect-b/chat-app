@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>پنل ادمین</title>
+  <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    :root{--bg:#0f0f1a;--card:#1a1a2e;--border:#2a2a4a;--accent:#7c3aed;--a2:#06b6d4;--text:#f0f0f0;--muted:#9ca3af;--red:#ef4444;--green:#22c55e;--yellow:#f59e0b}
+    body{font-family:'Vazirmatn',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;direction:rtl}
+    .hidden{display:none!important}
+    .login-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh}
+    .login-card{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:40px;width:320px;text-align:center}
+    .login-card h1{font-size:20px;margin-bottom:6px}.login-card p{color:var(--muted);font-size:13px;margin-bottom:20px}
+    .layout{display:flex;min-height:100vh}
+    .side{width:220px;background:var(--card);border-left:1px solid var(--border);display:flex;flex-direction:column}
+    .side-logo{padding:20px;border-bottom:1px solid var(--border)}
+    .side-logo h2{font-size:15px}.side-logo p{font-size:12px;color:var(--muted)}
+    .nav{display:flex;align-items:center;gap:8px;padding:12px 20px;cursor:pointer;font-size:13px;color:var(--muted);transition:.15s;border-right:3px solid transparent}
+    .nav:hover{color:var(--text);background:rgba(255,255,255,.04)}
+    .nav.on{color:var(--accent);background:rgba(124,58,237,.1);border-right-color:var(--accent)}
+    .content{flex:1;padding:24px;overflow-y:auto}
+    .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:14px;margin-bottom:24px}
+    .stat{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px;text-align:center}
+    .stat .n{font-size:28px;font-weight:700;background:linear-gradient(135deg,var(--accent),var(--a2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+    .stat .l{font-size:12px;color:var(--muted);margin-top:4px}
+    .sec-title{font-size:15px;font-weight:600;margin-bottom:12px}
+    .tbl-wrap{background:var(--card);border:1px solid var(--border);border-radius:14px;overflow:hidden;margin-bottom:20px}
+    table{width:100%;border-collapse:collapse}
+    th{background:rgba(255,255,255,.04);padding:10px 14px;font-size:12px;color:var(--muted);text-align:right;font-weight:500}
+    td{padding:10px 14px;font-size:13px;border-top:1px solid var(--border)}
+    tr:hover td{background:rgba(255,255,255,.02)}
+    .badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:11px;font-weight:600}
+    .bon{background:rgba(34,197,94,.15);color:var(--green)}
+    .boff{background:rgba(156,163,175,.1);color:var(--muted)}
+    .bred{background:rgba(239,68,68,.15);color:var(--red)}
+    .byel{background:rgba(245,158,11,.15);color:var(--yellow)}
+    input,textarea,select{background:rgba(255,255,255,.07);border:1px solid var(--border);border-radius:10px;padding:10px 14px;font-size:14px;font-family:'Vazirmatn',sans-serif;color:var(--text);outline:none;direction:rtl;width:100%;margin-bottom:10px}
+    textarea{resize:vertical;min-height:80px}
+    input:focus,textarea:focus,select:focus{border-color:var(--accent)}
+    input::placeholder,textarea::placeholder{color:#6b7280}
+    button{background:linear-gradient(135deg,var(--accent),var(--a2));border:none;border-radius:10px;padding:10px 20px;font-size:14px;font-family:'Vazirmatn',sans-serif;font-weight:600;color:white;cursor:pointer;transition:.15s}
+    button:hover{opacity:.9}
+    .btn-red{background:var(--red)!important}
+    .btn-green{background:var(--green)!important}
+    .btn-yellow{background:var(--yellow)!important;color:#000!important}
+    .btn-sm{padding:5px 12px;font-size:12px;border-radius:8px}
+    .fcard{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;margin-bottom:16px}
+    .frow{display:flex;gap:10px}.frow input,.frow select{flex:1}
+    .ok{color:var(--green);font-size:13px;margin-top:6px}
+    .err{color:var(--red);font-size:13px;margin-top:6px}
+    .loc-link{color:var(--a2);text-decoration:none;font-size:12px}
+    .chart-bar{display:flex;align-items:flex-end;gap:8px;height:120px;padding:10px 0}
+    .bar{flex:1;background:linear-gradient(to top,var(--accent),var(--a2));border-radius:4px 4px 0 0;min-height:4px;position:relative;cursor:default}
+    .bar:hover::after{content:attr(data-val);position:absolute;top:-24px;left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:2px 8px;font-size:12px;white-space:nowrap}
+    .bar-label{font-size:10px;color:var(--muted);text-align:center;margin-top:4px}
+    .mode-btns{display:flex;gap:10px;margin-bottom:10px}
+  </style>
+</head>
+<body>
+<div class="login-wrap" id="loginWrap">
+  <div class="login-card">
+    <h1>🔐 پنل ادمین</h1><p>رمز ادمین را وارد کنید</p>
+    <input type="password" id="adminPass" placeholder="رمز عبور" onkeydown="if(event.key==='Enter')doLogin()"/>
+    <button onclick="doLogin()" style="width:100%;margin-top:4px">ورود</button>
+    <p id="loginErr" style="color:var(--red);font-size:13px;margin-top:8px"></p>
+  </div>
+</div>
+
+<div class="layout hidden" id="panel">
+  <div class="side">
+    <div class="side-logo"><h2>پنل ادمین</h2><p>مدیریت پیام‌رسان</p></div>
+    <div class="nav on" onclick="go('dash',this)">📊 داشبورد</div>
+    <div class="nav" onclick="go('users',this)">👥 کاربران</div>
+    <div class="nav" onclick="go('reports',this)">🚨 گزارشات</div>
+    <div class="nav" onclick="go('msgs',this)">💬 پیام‌ها</div>
+    <div class="nav" onclick="go('groups',this)">👥 گروه‌ها</div>
+    <div class="nav" onclick="go('newgroup',this)">➕ گروه جدید</div>
+    <div class="nav" onclick="go('announce',this)">📢 اطلاع‌رسانی</div>
+    <div class="nav" onclick="go('rules',this)">📋 قوانین</div>
+    <div class="nav" onclick="go('server',this)">⚙️ مدیریت سرور</div>
+  </div>
+
+  <div class="content">
+    <!-- DASH -->
+    <div id="s-dash">
+      <div class="sec-title">📊 آمار کلی</div>
+      <div class="stats">
+        <div class="stat"><div class="n" id="st1">0</div><div class="l">کل کاربران</div></div>
+        <div class="stat"><div class="n" id="st2">0</div><div class="l">آنلاین</div></div>
+        <div class="stat"><div class="n" id="st3">0</div><div class="l">پیام‌ها</div></div>
+        <div class="stat"><div class="n" id="st4">0</div><div class="l">گروه‌ها</div></div>
+        <div class="stat"><div class="n" id="st5" style="font-size:20px;color:var(--red)">0</div><div class="l">گزارشات جدید</div></div>
+      </div>
+      <div class="sec-title">📈 پیام‌های ۷ روز اخیر</div>
+      <div class="fcard">
+        <div class="chart-bar" id="chartBar"></div>
+        <div style="display:flex;gap:8px" id="chartLabels"></div>
+      </div>
+      <button onclick="loadStats()">🔄 بروزرسانی</button>
+    </div>
+
+    <!-- USERS -->
+    <div id="s-users" class="hidden">
+      <div class="sec-title">👥 کاربران</div>
+      <div class="tbl-wrap">
+        <table><thead><tr><th>آیدی</th><th>وضعیت</th><th>موقعیت</th><th>عملیات</th></tr></thead>
+        <tbody id="usersTbl"></tbody></table>
+      </div>
+    </div>
+
+    <!-- REPORTS -->
+    <div id="s-reports" class="hidden">
+      <div class="sec-title">🚨 گزارشات کاربران</div>
+      <div class="tbl-wrap">
+        <table><thead><tr><th>گزارش‌دهنده</th><th>کاربر گزارش شده</th><th>علت</th><th>پیام</th><th>وضعیت</th><th>عملیات</th></tr></thead>
+        <tbody id="reportsTbl"></tbody></table>
+      </div>
+    </div>
+
+    <!-- MSGS -->
+    <div id="s-msgs" class="hidden">
+      <div class="sec-title">💬 پیام‌ها</div>
+      <div id="msgsView"></div>
+    </div>
+
+    <!-- GROUPS -->
+    <div id="s-groups" class="hidden">
+      <div class="sec-title">👥 گروه‌ها</div>
+      <div class="tbl-wrap">
+        <table><thead><tr><th>نام</th><th>اعضا</th><th>تاریخ</th></tr></thead>
+        <tbody id="groupsTbl"></tbody></table>
+      </div>
+    </div>
+
+    <!-- NEW GROUP -->
+    <div id="s-newgroup" class="hidden">
+      <div class="sec-title">➕ ساخت گروه</div>
+      <div class="fcard">
+        <input type="text" id="gName" placeholder="نام گروه"/>
+        <input type="text" id="gMembers" placeholder="آیدی اعضا با کاما: ali,sara"/>
+        <button onclick="createGroup()">ساخت</button>
+        <p id="gMsg"></p>
+      </div>
+      <div class="sec-title">➕ افزودن به گروه</div>
+      <div class="fcard">
+        <div class="frow"><input type="text" id="agId" placeholder="آیدی گروه"/><input type="text" id="agUser" placeholder="آیدی کاربر"/></div>
+        <button onclick="addToGroup()">افزودن</button>
+        <p id="agMsg"></p>
+      </div>
+    </div>
+
+    <!-- ANNOUNCE -->
+    <div id="s-announce" class="hidden">
+      <div class="sec-title">📢 اطلاع‌رسانی</div>
+      <div class="fcard">
+        <textarea id="annText" placeholder="متن اطلاعیه..."></textarea>
+        <input type="text" id="annImg" placeholder="لینک عکس (اختیاری)"/>
+        <button onclick="sendAnnounce()">📢 ارسال به همه</button>
+        <p id="annMsg"></p>
+      </div>
+    </div>
+
+    <!-- RULES -->
+    <div id="s-rules" class="hidden">
+      <div class="sec-title">📋 متن قوانین</div>
+      <div class="fcard">
+        <textarea id="rulesText" placeholder="متن قوانین رو اینجا بنویس..." style="min-height:200px"></textarea>
+        <button onclick="saveRules()">ذخیره قوانین</button>
+        <p id="rulesMsg"></p>
+      </div>
+    </div>
+
+    <!-- SERVER -->
+    <div id="s-server" class="hidden">
+      <div class="sec-title">⚙️ مدیریت سرور</div>
+      <div class="fcard">
+        <p style="color:var(--muted);font-size:13px;margin-bottom:14px">وضعیت فعلی سرور: <span id="currentMode" style="color:var(--green);font-weight:600">عادی</span></p>
+        <div class="mode-btns">
+          <button class="btn-green" onclick="setMode('normal')">✅ حالت عادی</button>
+          <button class="btn-yellow" onclick="setMode('maintenance')">🔧 به‌روزرسانی</button>
+        </div>
+        <input type="text" id="maintMsg" placeholder="متن پیام به‌روزرسانی (اختیاری)"/>
+        <p id="serverMsg"></p>
+      </div>
+
+      <!-- BLOCK USER -->
+      <div class="sec-title">🚫 مسدود کردن کاربر</div>
+      <div class="fcard">
+        <input type="text" id="blockUser" placeholder="آیدی کاربر"/>
+        <input type="text" id="blockReason" placeholder="علت مسدودیت"/>
+        <div class="frow">
+          <select id="blockType">
+            <option value="permanent">دائمی</option>
+            <option value="temporary">موقت</option>
+          </select>
+          <input type="datetime-local" id="blockUntil" placeholder="تا تاریخ (اگر موقت)"/>
+        </div>
+        <button class="btn-red" onclick="blockUser()">🚫 مسدود کردن</button>
+        <p id="blockMsg"></p>
+      </div>
+
+      <!-- UNBLOCK -->
+      <div class="sec-title">✅ رفع مسدودیت</div>
+      <div class="fcard">
+        <div class="frow">
+          <input type="text" id="unblockUser" placeholder="آیدی کاربر"/>
+          <button class="btn-green" onclick="unblockUser()" style="white-space:nowrap">رفع مسدودیت</button>
+        </div>
+        <p id="unblockMsg"></p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let token = '';
+function doLogin() {
+  const p = document.getElementById('adminPass').value;
+  fetch('/api/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p})}).then(r=>r.json()).then(d=>{
+    if(d.ok){token=p;document.getElementById('loginWrap').classList.add('hidden');document.getElementById('panel').classList.remove('hidden');loadStats();}
+    else document.getElementById('loginErr').textContent='رمز اشتباه است';
+  });
+}
+function h(){return{'Content-Type':'application/json','x-admin-token':token};}
+function go(sec,el){
+  document.querySelectorAll('[id^="s-"]').forEach(e=>e.classList.add('hidden'));
+  document.getElementById('s-'+sec).classList.remove('hidden');
+  document.querySelectorAll('.nav').forEach(e=>e.classList.remove('on'));
+  el.classList.add('on');
+  if(sec==='users')loadUsers();
+  if(sec==='reports')loadReports();
+  if(sec==='msgs')loadMsgs();
+  if(sec==='groups')loadGroups();
+  if(sec==='dash')loadStats();
+  if(sec==='rules')loadRules();
+}
+function loadStats(){
+  fetch('/api/admin/stats',{headers:h()}).then(r=>r.json()).then(d=>{
+    if(!d.ok)return;
+    document.getElementById('st1').textContent=d.stats.totalUsers;
+    document.getElementById('st2').textContent=d.stats.onlineUsers;
+    document.getElementById('st3').textContent=d.stats.totalMessages;
+    document.getElementById('st4').textContent=d.stats.totalGroups;
+    document.getElementById('st5').textContent=d.stats.pendingReports;
+    // chart
+    const max=Math.max(...d.stats.daily.map(x=>x.count),1);
+    const bar=document.getElementById('chartBar');
+    const lbl=document.getElementById('chartLabels');
+    bar.innerHTML='';lbl.innerHTML='';
+    d.stats.daily.forEach(({date,count})=>{
+      const h2=Math.max((count/max)*100,2);
+      bar.innerHTML+=`<div class="bar" style="height:${h2}%" data-val="${count}"></div>`;
+      lbl.innerHTML+=`<div class="bar-label" style="flex:1">${date.slice(5)}</div>`;
+    });
+  });
+}
+function loadUsers(){
+  fetch('/api/admin/users',{headers:h()}).then(r=>r.json()).then(d=>{
+    if(!d.ok)return;
+    document.getElementById('usersTbl').innerHTML=d.users.map(u=>`
+      <tr>
+        <td><b>@${u.username}</b>${u.is_blocked?'<span class="badge bred" style="margin-right:6px">مسدود</span>':''}</td>
+        <td><span class="badge ${u.last_seen&&!u.is_blocked?'bon':'boff'}">${u.is_blocked?'🚫 مسدود':'⚫ آفلاین'}</span></td>
+        <td>${u.last_seen&&u.last_seen.startsWith('{')? `<a class="loc-link" href="https://maps.google.com/?q=${JSON.parse(u.last_seen).lat},${JSON.parse(u.last_seen).lng}" target="_blank">📍 نقشه</a>`:'-'}</td>
+        <td style="display:flex;gap:6px">
+          <button class="btn-sm btn-red" onclick="kickUserDirect('${u.username}')">کیک</button>
+          ${u.is_blocked?`<button class="btn-sm btn-green" onclick="unblockDirect('${u.username}')">رفع بلاک</button>`:`<button class="btn-sm" style="background:var(--red)" onclick="blockDirect('${u.username}')">بلاک</button>`}
+        </td>
+      </tr>`).join('');
+  });
+}
+function kickUserDirect(u){
+  if(!confirm('کیک؟'))return;
+  fetch('/api/admin/kick',{method:'POST',headers:h(),body:JSON.stringify({username:u})}).then(r=>r.json()).then(d=>{if(d.ok)loadUsers();});
+}
+function blockDirect(u){
+  document.getElementById('blockUser').value=u;
+  go('server',document.querySelector('.nav:nth-child(10)'));
+}
+function unblockDirect(u){
+  fetch('/api/admin/unblock',{method:'POST',headers:h(),body:JSON.stringify({username:u})}).then(r=>r.json()).then(d=>{if(d.ok)loadUsers();});
+}
+function loadReports(){
+  fetch('/api/admin/reports',{headers:h()}).then(r=>r.json()).then(d=>{
+    if(!d.ok)return;
+    document.getElementById('reportsTbl').innerHTML=!d.reports.length?'<tr><td colspan="6" style="text-align:center;color:#6b7280">گزارشی نیست</td></tr>':
+    d.reports.map(r=>`<tr>
+      <td>${r.reporter}</td><td>${r.reported_user}</td>
+      <td>${r.reason}</td>
+      <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${e(r.message_text||'-')}</td>
+      <td><span class="badge ${r.status==='pending'?'byel':r.status==='resolved'?'bon':'bred'}">${r.status==='pending'?'در انتظار':r.status==='resolved'?'رسیدگی شد':'رد شد'}</span></td>
+      <td style="display:flex;gap:4px">
+        <button class="btn-sm btn-green" onclick="resolveReport('${r.id}')">✅</button>
+        <button class="btn-sm btn-red" onclick="dismissReport('${r.id}')">❌</button>
+        <button class="btn-sm" onclick="blockFromReport('${r.reported_user}')">🚫</button>
+      </td>
+    </tr>`).join('');
+  });
+}
+function resolveReport(id){fetch('/api/admin/report-action',{method:'POST',headers:h(),body:JSON.stringify({reportId:id,status:'resolved'})}).then(()=>loadReports());}
+function dismissReport(id){fetch('/api/admin/report-action',{method:'POST',headers:h(),body:JSON.stringify({reportId:id,status:'dismissed'})}).then(()=>loadReports());}
+function blockFromReport(u){document.getElementById('blockUser').value=u;go('server',document.querySelectorAll('.nav')[8]);}
+function loadMsgs(){
+  fetch('/api/admin/messages',{headers:h()}).then(r=>r.json()).then(d=>{
+    if(!d.ok)return;
+    const v=document.getElementById('msgsView');
+    const entries=Object.entries(d.messages);
+    if(!entries.length){v.innerHTML='<p style="color:#6b7280">پیامی وجود ندارد</p>';return;}
+    v.innerHTML=entries.map(([rid,msgs])=>`
+      <div class="tbl-wrap" style="margin-bottom:14px">
+        <div style="padding:10px 14px;font-size:12px;color:#6b7280;background:rgba(255,255,255,.02)">🗂 ${rid.replace('group__','گروه: ').replace('__',' ↔ ')}</div>
+        <table><thead><tr><th>فرستنده</th><th>پیام</th><th>زمان</th><th>حذف</th></tr></thead>
+        <tbody>${msgs.map(m=>`<tr><td>${m.sender}</td><td>${e(m.text||'[فایل]')}</td><td>${m.time}</td><td><button class="btn-sm btn-red" onclick="delMsg('${rid}','${m.id}')">حذف</button></td></tr>`).join('')}</tbody></table>
+      </div>`).join('');
+  });
+}
+function delMsg(rid,mid){fetch('/api/admin/message',{method:'DELETE',headers:h(),body:JSON.stringify({roomId:rid,msgId:mid})}).then(()=>loadMsgs());}
+function loadGroups(){
+  fetch('/api/admin/groups',{headers:h()}).then(r=>r.json()).then(d=>{
+    if(!d.ok)return;
+    document.getElementById('groupsTbl').innerHTML=!d.groups.length?'<tr><td colspan="3" style="text-align:center;color:#6b7280">گروهی نیست</td></tr>':
+    d.groups.map(g=>`<tr><td>${g.name}</td><td>${g.members.join(', ')}</td><td>${new Date(g.created_at).toLocaleDateString('fa-IR')}</td></tr>`).join('');
+  });
+}
+function createGroup(){
+  const name=document.getElementById('gName').value.trim();
+  const members=document.getElementById('gMembers').value.split(',').map(m=>m.trim()).filter(Boolean);
+  if(!name||!members.length)return;
+  fetch('/api/admin/create-group',{method:'POST',headers:h(),body:JSON.stringify({name,members})}).then(r=>r.json()).then(d=>{
+    const p=document.getElementById('gMsg');p.className=d.ok?'ok':'err';p.textContent=d.ok?'✅ گروه ساخته شد':d.msg;
+  });
+}
+function addToGroup(){
+  fetch('/api/admin/add-to-group',{method:'POST',headers:h(),body:JSON.stringify({groupId:document.getElementById('agId').value.trim(),username:document.getElementById('agUser').value.trim()})}).then(r=>r.json()).then(d=>{
+    const p=document.getElementById('agMsg');p.className=d.ok?'ok':'err';p.textContent=d.ok?'✅ اضافه شد':d.msg;
+  });
+}
+function sendAnnounce(){
+  const text=document.getElementById('annText').value.trim();
+  const imageUrl=document.getElementById('annImg').value.trim();
+  if(!text)return;
+  fetch('/api/admin/announce',{method:'POST',headers:h(),body:JSON.stringify({text,imageUrl})}).then(r=>r.json()).then(d=>{
+    const p=document.getElementById('annMsg');p.className=d.ok?'ok':'err';p.textContent=d.ok?`✅ به ${d.sent} نفر ارسال شد`:d.msg;
+  });
+}
+function loadRules(){
+  fetch('/api/settings/rules').then(r=>r.json()).then(d=>{document.getElementById('rulesText').value=d.rules||'';});
+}
+function saveRules(){
+  fetch('/api/admin/set-rules',{method:'POST',headers:h(),body:JSON.stringify({rules:document.getElementById('rulesText').value})}).then(r=>r.json()).then(d=>{
+    const p=document.getElementById('rulesMsg');p.className=d.ok?'ok':'err';p.textContent=d.ok?'✅ ذخیره شد':'خطا';
+  });
+}
+function setMode(mode){
+  const msg=document.getElementById('maintMsg').value;
+  fetch('/api/admin/set-mode',{method:'POST',headers:h(),body:JSON.stringify({mode,msg})}).then(r=>r.json()).then(d=>{
+    const p=document.getElementById('serverMsg');p.className=d.ok?'ok':'err';
+    p.textContent=d.ok?`✅ سرور حالت ${mode==='normal'?'عادی':'به‌روزرسانی'} شد`:'خطا';
+    document.getElementById('currentMode').textContent=mode==='normal'?'عادی':'به‌روزرسانی';
+    document.getElementById('currentMode').style.color=mode==='normal'?'var(--green)':'var(--yellow)';
+  });
+}
+function blockUser(){
+  const username=document.getElementById('blockUser').value.trim();
+  const reason=document.getElementById('blockReason').value.trim();
+  const blockType=document.getElementById('blockType').value;
+  const blockUntil=document.getElementById('blockUntil').value;
+  if(!username)return;
+  fetch('/api/admin/block',{method:'POST',headers:h(),body:JSON.stringify({username,reason,blockType,blockUntil:blockUntil||null})}).then(r=>r.json()).then(d=>{
+    const p=document.getElementById('blockMsg');p.className=d.ok?'ok':'err';p.textContent=d.ok?'✅ کاربر مسدود شد':'خطا';
+  });
+}
+function unblockUser(){
+  const username=document.getElementById('unblockUser').value.trim();
+  if(!username)return;
+  fetch('/api/admin/unblock',{method:'POST',headers:h(),body:JSON.stringify({username})}).then(r=>r.json()).then(d=>{
+    const p=document.getElementById('unblockMsg');p.className=d.ok?'ok':'err';p.textContent=d.ok?'✅ مسدودیت برداشته شد':'خطا';
+  });
+}
+function unblockDirect(u){
+  fetch('/api/admin/unblock',{method:'POST',headers:h(),body:JSON.stringify({username:u})}).then(r=>r.json()).then(d=>{if(d.ok)loadUsers();});
+}
+function e(t){return(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+</script>
+</body>
+</html>
