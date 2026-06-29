@@ -49,7 +49,7 @@ function showStep(n) {
 
 function setMsg(id, text, isOk) {
   const el = document.getElementById(id);
-  el.textContent = text;
+  el.innerHTML = text;
   el.className = 'auth-msg' + (isOk ? ' ok' : '');
 }
 
@@ -64,7 +64,7 @@ async function sendOTP() {
   if (res.ok) {
     verifiedBaleId = baleId;
     if (res.needStart) {
-      setMsg('msg1', '⚠️ ابتدا به ربات بله /start بزن', false);
+      setMsg('msg1', '⚠️ ابتدا <a href="https://ble.ir/Optcodebot" target="_blank" style="color:#9d5cff">@Optcodebot</a> را در بله استارت کن', false);
     } else {
       setMsg('msg1', res.msg, true);
       setTimeout(() => { showStep(2); startResendTimer(); }, 800);
