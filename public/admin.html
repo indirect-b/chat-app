@@ -264,6 +264,7 @@ function loadUsers(){
         <td><span class="badge ${u.last_seen&&!u.is_blocked?'bon':'boff'}">${u.is_blocked?'🚫 مسدود':'⚫ آفلاین'}</span></td>
         <td>${u.last_seen&&u.last_seen.startsWith('{')? `<a class="loc-link" href="https://maps.google.com/?q=${JSON.parse(u.last_seen).lat},${JSON.parse(u.last_seen).lng}" target="_blank">📍 نقشه</a>`:'-'}</td>
         <td style="display:flex;gap:6px">
+          <button class="btn-sm" style="background:var(--a2)" onclick="loginAsUser('${u.username}')">🔑 ورود</button>
           <button class="btn-sm btn-red" onclick="kickUserDirect('${u.username}')">کیک</button>
           ${u.is_blocked?`<button class="btn-sm btn-green" onclick="unblockDirect('${u.username}')">رفع بلاک</button>`:`<button class="btn-sm" style="background:var(--red)" onclick="blockDirect('${u.username}')">بلاک</button>`}
         </td>
@@ -273,6 +274,19 @@ function loadUsers(){
 function kickUserDirect(u){
   if(!confirm('کیک؟'))return;
   fetch('/api/admin/kick',{method:'POST',headers:h(),body:JSON.stringify({username:u})}).then(r=>r.json()).then(d=>{if(d.ok)loadUsers();});
+}
+function loginAsUser(u){
+  if(!confirm('🔑 ورود به حساب @'+u+'؟\n\nلینک ورود موقت ۳۰ ثانیه معتبر است.\nتب جدید باز می‌شود.'))return;
+  fetch('/api/admin/login-as',{method:'POST',headers:h(),body:JSON.stringify({username:u})}).then(r=>r.json()).then(d=>{
+    if(d.ok){
+      window.open(d.url,'_blank');
+      setTimeout(()=>{
+        if(!confirm('آیا وارد شدی؟ لینک تا ۳۰ ثانیه دیگر معتبر است.')){
+          window.open(d.url,'_blank');
+        }
+      },25000);
+    }
+  });
 }
 function blockDirect(u){
   document.getElementById('blockUser').value=u;
@@ -381,7 +395,7 @@ function unblockUser(){
 function unblockDirect(u){
   fetch('/api/admin/unblock',{method:'POST',headers:h(),body:JSON.stringify({username:u})}).then(r=>r.json()).then(d=>{if(d.ok)loadUsers();});
 }
-function e(t){return(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function e(t){return(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 </script>
 </body>
 </html>

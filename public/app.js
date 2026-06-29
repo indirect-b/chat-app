@@ -27,49 +27,19 @@ window.onload = async () => {
     document.getElementById('maintMsg').textContent = modeRes.msg;
     return;
   }
-  checkLocation();
+
+  // بررسی ورود موقت ادمین (Login As)
+  const adminLoginUser = sessionStorage.getItem('adminLoginToken');
+  if (adminLoginUser) {
+    sessionStorage.removeItem('adminLoginToken');
+    document.getElementById('authScreen').classList.remove('hidden');
+    enterApp(adminLoginUser);
+    return;
+  }
+
+  // geoip-lite حذف شد - مستقیم وارد صفحه ورود میشیم
+  document.getElementById('authScreen').classList.remove('hidden');
 };
-
-// ===== LOCATION =====
-async function checkLocation() {
-  const ipRes = await fetch('/api/check-ip').then(r => r.json());
-  if (!ipRes.isIran) {
-    showLocationScreen();
-    return;
-  }
-  requestLocation();
-}
-
-function showLocationScreen() {
-  document.getElementById('locationScreen').classList.remove('hidden');
-  document.getElementById('authScreen').classList.add('hidden');
-}
-
-function requestLocation() {
-  if (!navigator.geolocation) {
-    showLocationScreen();
-    return;
-  }
-  navigator.geolocation.getCurrentPosition(
-    (pos) => {
-      document.getElementById('locationScreen').classList.add('hidden');
-      document.getElementById('authScreen').classList.remove('hidden');
-      if (myUsername) {
-        socket.emit('update-location', { lat: pos.coords.latitude, lng: pos.coords.longitude });
-      }
-    },
-    () => showLocationScreen(),
-    { enableHighAccuracy: true }
-  );
-}
-
-// location update every 60s
-setInterval(() => {
-  if (!myUsername) return;
-  navigator.geolocation.getCurrentPosition(pos => {
-    socket.emit('update-location', { lat: pos.coords.latitude, lng: pos.coords.longitude });
-  });
-}, 60000);
 
 // ===== AUTH =====
 function showStep(n) {
@@ -655,7 +625,7 @@ socket.on('announcement', ({ text, imageUrl }) => {
 
 // ===== UTILS =====
 function scrollBottom() { const c = document.getElementById('messagesContainer'); c.scrollTop = c.scrollHeight; }
-function esc(t) { return (t || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function esc(t) { return (t || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
 function cancelReply() { replyTo = null; document.getElementById('replyPreview').classList.add('hidden'); }
 function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
 function closeAnnounce() { document.getElementById('announceOverlay').classList.add('hidden'); }

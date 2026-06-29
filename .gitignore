@@ -1,0 +1,26 @@
+# وابستگی‌ها
+node_modules/
+package-lock.json
+
+# دیتابیس محلی
+chat.db
+chat.db-journal
+
+# فایل‌های آپلود شده
+public/uploads/*
+!public/uploads/.gitkeep
+
+# تنظیمات محیطی (اسرار)
+.env
+.env.local
+.env.production
+
+# سیستم‌عامل و IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# لاگ‌ها
+*.log
+npm-debug.log*
