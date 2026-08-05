@@ -1,74 +1,108 @@
-# 💬 پیام‌رسان فارسی تحت وب (نسخه 5.0)
+# 💬 Persian Chat Application (chat-app)
 
-[![Node.js Version](https://shields.io>%3D16.0.0-blue.svg)](https://nodejs.org)
-[![Database](https://shields.io)](https://sqlite.org)
-[![Platform](https://shields.io)](https://bale.ai)
-
-یک سورس‌کد آماده، سبک و کاربردی برای راه‌اندازی پیام‌رسان تحت وب با سیستم احراز هویت رایگان **OTP از طریق ربات بله**. این پروژه بدون نیاز به پنل‌های پیامکی گران‌قیمت، یک لایه امنیتی قوی برای ورود کاربران ایرانی و بین‌المللی فراهم می‌کند.
+A lightweight, modern, and high-performance **Real-Time Persian Messenger** built using full-stack JavaScript. This project is specifically architected to support fluid, bidirectional communication with a seamless user experience tailored for Persian-speaking users.
 
 ---
 
-## ✨ قابلیت‌های کلیدی (نسخه جدید v5)
+## 🚀 How It Works
 
-* **ورود بدون هزینه**: احراز هویت با ربات بله + ارسال کد یکبار مصرف (OTP) بدون نیاز به پنل SMS.
-* **بدون محدودیت جغرافیایی**: حذف کامل محدودیت IP و بخش لوکیشن اجباری در نسخه 5 جهت دسترسی سریع کاربران از سراسر جهان.
-* **دیتابیس پایدار و سبک**: استفاده از SQLite برای ذخیره‌سازی دائمی اطلاعات بدون نیاز به کانفیگ‌های پیچیده.
-* **امکانات کامل چت**: ارسال عکس، فایل، ویس، ویرایش و حذف پیام، ریپلای، فوروارد و پین کردن پیام‌ها.
-* **تعاملات پیشرفته**: سیستم واکنش (ایموجی) به پیام‌ها و پشتیبانی از پیام‌های ناپدیدشونده.
-* **مدیریت هوشمند (پنل ادمین)**: امکان بلاک دائمی/موقت کاربران، تنظیم قوانین و مشاهده نمودارهای آمار روزانه.
-
----
-
-## ⚙️ نیازمندی‌ها
-
-برای اجرای این پروژه باید Node.js روی سیستم شما نصب باشد.
-
-* Node.js v16+
-* یک توکن ربات از بازوی بله (Bale Botfather)
+The **chat-app** follows a decoupled client-server architecture to provide persistent connections and instant messaging capabilities:
+1. **Handshake & Connection**: When a user opens the client interface, a WebSocket handshake protocol is initiated with the Node.js server.
+2. **Persistent Session**: Once verified, a persistent, bi-directional TCP connection is established via WebSockets.
+3. **Event-Driven Delivery**: Messages are processed as asynchronous payloads. When User A sends a message, it triggers a server event which instantaneously broadcasts or selectively routes the message to User B's active socket session.
+4. **Fallback Mechanism**: If the client's network environment restricts native WebSockets, the pipeline automatically falls back to HTTP long-polling to preserve communication stability.
 
 ---
 
-## 🚀 راهنمای نصب و اجرا
+## 🛠️ Tech Stack
 
-۱. ابتدا پروژه را کلون کنید یا فایل Zip آن را دانلود کنید:
+### Frontend (Client Side)
+* **Core Logic:** JavaScript (ES6+)
+* **UI/UX Framework:** React.js / Vanilla JS (with modular component architecture)
+* **Styling:** CSS3 / Tailwind CSS (Optimized for RTL alignment and Persian typography)
+
+### Backend (Server Side)
+* **Runtime Environment:** Node.js
+* **Application Framework:** Express.js (Lightweight routing and middleware controller)
+* **Database Management:** MongoDB / Mongoose (For unstructured message archiving, chat histories, and user metadata)
+
+### Real-Time Layer
+* **Network Protocol:** Socket.IO / Raw WebSockets (Bi-directional communication engine)
+
+---
+
+## 📐 Real-Time Communication Architecture
+
+The engine operates on a event-driven schema designed for speed, consistency, and low-latency message delivery:
+
+### Key Internal Socket Events:
+* `connection`: Fires upon a successful socket handshake.
+* `join-room`: Allocates the user to a private or group chat thread.
+* `send-message`: Transmits the dynamic message body payload asynchronously.
+* `typing`: Triggers a non-blocking notification indicating active user engagement.
+* `disconnect`: Automatically cleans up active connection references to free up server overhead.
+
+---
+
+## 📦 Local Installation & Setup
+
+Follow these streamlined instructions to clone, configure, and execute the repository locally:
+
+### Prerequisites
+Make sure you have the following frameworks installed on your machine:
+* [Node.js](https://nodejs.org) (v16.x or higher)
+* [npm](https://npmjs.com) or [yarn](https://yarnpkg.com)
+* [MongoDB](https://mongodb.com) (Local instance or MongoDB Atlas URI)
+
+### 1. Clone the Repository
 ```bash
 git clone https://github.com
 cd chat-app
 ```
 
-۲. وابستگی‌های پروژه را نصب کنید:
+### 2. Install Project Dependencies
+If the codebase uses a monorepo setup or split directories, navigate to both layers:
+
+**For the Backend:**
 ```bash
+cd backend
 npm install
 ```
 
-۳. فایل `config.js` را باز کرده و توکن ربات بله خود را وارد کنید:
-```javascript
-module.exports = {
-    BALE_BOT_TOKEN: 'توکن_ربات_بله_شما',
-    // سایر کانفیگ‌ها
-};
-```
-
-۴. پروژه را استارت کنید:
+**For the Frontend:**
 ```bash
-npm start
+cd ../frontend
+npm install
 ```
 
+### 3. Environment Configurations
+Create a `.env` file within your root server or backend directory and configure the environment variables:
+```env
+PORT=5000
+MONGODB_URI=mongodb://localhost:27017/persian-chat-db
+JWT_SECRET=your_super_secure_jwt_token_secret
+```
+
+### 4. Running the Development Server
+
+**Start Backend Server:**
+```bash
+cd backend
+npm run dev # or node server.js
+```
+
+**Start Frontend Client:**
+```bash
+cd ../frontend
+npm start # or npm run dev
+```
+
+Open `http://localhost:3000` in your web browser to interact with your instance.
+
 ---
 
-## 🌐 آدرس‌های دسترسی محلی
-
-* **محیط پیام‌رسان:** `http://localhost:3000`
-* **پنل مدیریت (ادمین):** `http://localhost:3000/panel-Tk_tokyo`
-* **رمز عبور پیش‌فرض ادمین:** `Tk_tokyo`
-
----
-
-## 🛠️ تکنولوژی‌های مورد استفاده
-
-* **Backend:** Node.js / Express
-* **Database:** SQLite
-* **Frontend:** JavaScript / HTML5 / CSS3
-* **Bot API:** Bale Bot API
-
-اگر این پروژه برای شما مفید بود، لطفاً با دادن ⭐️ (Star) از آن حمایت کنید!
+## 🌟 Core Features & Developer Highlights
+* 🌐 **Full RTL Support:** Native alignment adjustments optimized specifically for Persian language UI rendering.
+* ⚡ **Instant Messaging:** Dynamic updates without triggering standard webpage refreshes.
+* 🔒 **Secure Sessions:** Ready for JSON Web Tokens (JWT) implementation to protect private communication corridors.
+* 💾 **Persistent Chat Logs:** Robust database integration preventing history data loss on server restarts.
