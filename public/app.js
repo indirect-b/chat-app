@@ -67,6 +67,17 @@ async function sendOTP() {
       setMsg('msg1', '⚠️ ابتدا <a href="https://ble.ir/Optcodebot" target="_blank" style="color:#9d5cff">@Optcodebot</a> را در بله استارت کن', false);
     } else {
       setMsg('msg1', res.msg, true);
+      if (res.msg && res.msg.includes('آزمایشی')) {
+        const match = res.msg.match(/\d{6}/);
+        if (match) {
+          setTimeout(() => {
+            const desc = document.getElementById('step2desc');
+            if (desc) desc.textContent = res.msg;
+            const otpInp = document.getElementById('otpInput');
+            if (otpInp) otpInp.value = match[0];
+          }, 400);
+        }
+      }
       setTimeout(() => { showStep(2); startResendTimer(); }, 800);
     }
   } else setMsg('msg1', res.msg, false);

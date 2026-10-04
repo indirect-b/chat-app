@@ -1,0 +1,6 @@
+{
+  "name": "پیامرسان",
+  "description": "پیام‌رسان تحت وب با امکان گفتگوی خصوصی، گروه‌ها، ارسال فایل و استیکر",
+  "permissions": [],
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

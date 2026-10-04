@@ -9,6 +9,7 @@ const { Server } = require('socket.io');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const multer = require('multer');
+const fs = require('fs');
 const config = require('./config');
 const bale = require('./bale');
 const { pool, init } = require('./db');
@@ -21,8 +22,12 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
 // ===== آپلود فایل =====
+const uploadsDir = path.join(__dirname, 'public/uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, path.join(__dirname, 'public/uploads')),
+  destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => cb(null, uuidv4() + path.extname(file.originalname))
 });
 const upload = multer({ storage, limits: { fileSize: config.MAX_FILE_SIZE } });
@@ -164,7 +169,12 @@ app.post('/api/send-otp', async (req, res) => {
     await bale.sendMessage(chatId, `🔐 کد تأیید:\n\n${code}\n\n⏱ ${config.OTP_EXPIRE} ثانیه معتبر است.`);
     res.json({ ok: true, msg: '✅ کد به بله‌ات فرستاده شد' });
   } else {
-    res.json({ ok: true, needStart: true, msg: 'ابتدا به ربات بله /start بزن' });
+    if (!config.BALE_BOT_TOKEN) {
+      console.log(`🔐 [حالت آزمایشی] کد تأیید برای @${key}: ${code}`);
+      res.json({ ok: true, msg: `کد تأیید آزمایشی: ${code}` });
+    } else {
+      res.json({ ok: true, needStart: true, msg: 'ابتدا به ربات بله /start بزن' });
+    }
   }
 });
 
@@ -693,16 +703,24 @@ io.on('connection', (socket) => {
 async function start() {
   try {
     await init();
-    server.listen(config.PORT, () => {
-      console.log(`✅ سرور روی پورت ${config.PORT}`);
-      console.log(`🌐 http://localhost:${config.PORT}`);
-      console.log(`🔐 پنل ادمین: http://localhost:${config.PORT}${config.ADMIN_PATH}`);
-      startBalePolling();
-    });
   } catch (e) {
-    console.error('❌ خطا در راه‌اندازی سرور:', e.message);
-    process.exit(1);
+    console.warn('⚠️ اخطار در آماده‌سازی اولیه دیتابیس:', e.message);
   }
+
+  server.listen(config.PORT, '0.0.0.0', () => {
+    console.log(`✅ سرور روی پورت ${config.PORT}`);
+    console.log(`🌐 http://localhost:${config.PORT}`);
+    console.log(`🔐 پنل ادمین: http://localhost:${config.PORT}${config.ADMIN_PATH}`);
+    startBalePolling();
+  });
 }
+
+process.on('uncaughtException', (err) => {
+  console.error('❌ خطای مدیریت‌نشده (Uncaught Exception):', err.message);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('❌ ریجکشن مدیریت‌نشده (Unhandled Rejection):', reason);
+});
 
 start();
