@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Socket } from 'socket.io-client';
 import { ChatMessage, RoomSummary, UserProfile } from '../types';
 import {
+  ensureUserECDHKeyPair,
   encryptMessageText,
   decryptMessageText,
   isE2EEEnabled,
@@ -109,9 +110,9 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
 
-  // Refs for socket access without stale closures
   const currentRoomRef = useRef<string | null>(null);
   const currentPartnerRef = useRef<string | null>(null);
+  const peerPublicKeysRef = useRef<Record<string, string | null>>({});
   const messagesContainerRef = useRef<HTMLDivElement | null>(null);
   const typingTimerRef = useRef<number | null>(null);
   const isTypingRef = useRef(false);
@@ -127,12 +128,28 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     }, 30);
   }, []);
 
+  const getPeerKeyForRoom = useCallback(
+    (roomId: string): string | null => {
+      if (roomId.startsWith('group__')) return null;
+      const partner = roomId.split('__').find(u => u !== myUsername);
+      return partner ? peerPublicKeysRef.current[partner] || null : null;
+    },
+    [myUsername]
+  );
+
   const processDecryption = useCallback(
     async (msg: ChatMessage, roomId: string): Promise<DecryptedChatMessage> => {
-      const dec = await decryptMessageText(msg.text || '', roomId);
+      const peerPublicKey = getPeerKeyForRoom(roomId);
+      const dec = await decryptMessageText(msg.text || '', roomId, {
+        myUsername,
+        peerPublicKey,
+      });
       let decReply = msg.reply_to_text;
       if (msg.reply_to_text && isE2EEPayload(msg.reply_to_text)) {
-        const rDec = await decryptMessageText(msg.reply_to_text, roomId);
+        const rDec = await decryptMessageText(msg.reply_to_text, roomId, {
+          myUsername,
+          peerPublicKey,
+        });
         decReply = rDec.text;
       }
       return {
@@ -143,7 +160,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         decryptFailed: dec.failed,
       };
     },
-    []
+    [myUsername, getPeerKeyForRoom]
   );
 
   const loadRoomList = useCallback(
@@ -153,6 +170,11 @@ export const ChatApp: React.FC<ChatAppProps> = ({
           r.json()
         );
         if (res.ok) {
+          res.contacts.forEach((c: any) => {
+            if (c.public_key) {
+              peerPublicKeysRef.current[c.username] = c.public_key;
+            }
+          });
           setRooms(
             res.contacts.map((c: any) => ({
               id: c.username,
@@ -161,6 +183,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               avatar: c.avatar,
               online: !!c.online,
               preview: c.online ? 'آنلاین' : 'آفلاین',
+              publicKey: c.public_key || null,
             }))
           );
         }
@@ -183,10 +206,20 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     [myUsername]
   );
 
-  // Initial load
+  // Initial load + Automatic ECDH (P-256) Asymmetric Key Exchange
   useEffect(() => {
     socket.emit('auth', myUsername);
     loadRoomList('chats');
+
+    ensureUserECDHKeyPair(myUsername).then(pubKey => {
+      if (pubKey) {
+        fetch('/api/user/public-key', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: myUsername, publicKey: pubKey }),
+        }).catch(() => {});
+      }
+    });
 
     fetch('/api/user/' + encodeURIComponent(myUsername))
       .then(r => r.json())
@@ -263,7 +296,10 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       newText: string;
     }) => {
       if (roomId !== currentRoomRef.current) return;
-      const dec = await decryptMessageText(newText, roomId);
+      const dec = await decryptMessageText(newText, roomId, {
+        myUsername,
+        peerPublicKey: getPeerKeyForRoom(roomId),
+      });
       setMessages(prev =>
         prev.map(m =>
           m.id === msgId
@@ -365,6 +401,10 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       });
     };
 
+    const onPeerKeyUpdated = ({ username, publicKey }: { username: string; publicKey: string }) => {
+      peerPublicKeysRef.current[username] = publicKey;
+    };
+
     socket.on('new-message', onNewMessage);
     socket.on('read', onRead);
     socket.on('msg-edited', onMsgEdited);
@@ -376,6 +416,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     socket.on('contact-offline', onContactOffline);
     socket.on('contact-status', onContactStatus);
     socket.on('new-group', onNewGroup);
+    socket.on('peer-key-updated', onPeerKeyUpdated);
 
     return () => {
       socket.off('new-message', onNewMessage);
@@ -389,13 +430,25 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       socket.off('contact-offline', onContactOffline);
       socket.off('contact-status', onContactStatus);
       socket.off('new-group', onNewGroup);
+      socket.off('peer-key-updated', onPeerKeyUpdated);
     };
-  }, [myUsername, socket, processDecryption, scrollBottom]);
+  }, [myUsername, socket, processDecryption, scrollBottom, getPeerKeyForRoom]);
 
   const handleOpenChat = async (room: RoomSummary) => {
     const roomId = room.isGroup
       ? 'group__' + room.id
       : [myUsername, room.id].sort().join('__');
+
+    if (!room.isGroup && !peerPublicKeysRef.current[room.id]) {
+      try {
+        const uRes = await fetch('/api/user/' + encodeURIComponent(room.id)).then(r => r.json());
+        if (uRes.ok && uRes.user?.public_key) {
+          peerPublicKeysRef.current[room.id] = uRes.user.public_key;
+        }
+      } catch {
+        // ignore
+      }
+    }
 
     setCurrentPartner(room.id);
     setCurrentPartnerName(room.name);
@@ -426,7 +479,10 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     if (!trimmed || !currentRoom || !currentPartner) return;
 
     const payloadText = e2eeActive
-      ? await encryptMessageText(trimmed, currentRoom)
+      ? await encryptMessageText(trimmed, currentRoom, {
+          myUsername,
+          peerPublicKey: getPeerKeyForRoom(currentRoom),
+        })
       : trimmed;
 
     socket.emit('send-message', {
@@ -643,7 +699,10 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     const trimmed = editModal.text.trim();
     if (!trimmed || !currentRoom) return;
     const payload = e2eeActive
-      ? await encryptMessageText(trimmed, currentRoom)
+      ? await encryptMessageText(trimmed, currentRoom, {
+          myUsername,
+          peerPublicKey: getPeerKeyForRoom(currentRoom),
+        })
       : trimmed;
     socket.emit('edit-message', {
       msgId: ctxMenu.msgId,
@@ -1292,21 +1351,21 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       {e2eeModalOpen && (
         <div className="modal">
           <div className="modal-box">
-            <h3>🔐 کلید رمزنگاری سرتاسری (E2EE)</h3>
-            <p>
-              پیام‌ها در مرورگر شما با الگوریتم <b>AES-256-GCM</b> قبل از ارسال به سرور
-              رمزنگاری می‌شوند. در صورت تمایل می‌توانید یک رمز مشترک اختصاصی با مخاطب
-              تنظیم کنید:
+            <h3>🔐 رمزنگاری سرتاسری پیشرفته (ECDH + AES-256-GCM)</h3>
+            <p style={{ fontSize: '12.5px', lineHeight: '1.7' }}>
+              در گفتگوهای خصوصی، تبادل کلید به صورت کاملاً خودکار با پروتکل{' '}
+              <b>Diffie-Hellman (ECDH P-256)</b> انجام می‌شود (بدون نیاز به رمز دستی). در صورت
+              تمایل می‌توانید یک رمز مشترک سفارشی (PBKDF2 Override) نیز تنظیم کنید:
             </p>
             <input
               type="password"
-              placeholder="کلید/رمز مشترک (اختیاری)..."
+              placeholder="کلید/رمز مشترک سفارشی (اختیاری - خالی = ECDH خودکار)..."
               value={customSecretInput}
               onChange={e => setCustomSecretInput(e.target.value)}
             />
             <div className="modal-btns" style={{ marginTop: '10px' }}>
               <button type="button" onClick={handleSaveRoomSecret}>
-                ذخیره کلید
+                ذخیره تنظیمات
               </button>
               <button
                 type="button"

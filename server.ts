@@ -6,17 +6,18 @@ import path from 'path';
 import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import multer from 'multer';
-import { config } from './src/server/config';
+import { config, verifyAdminSecret } from './src/server/config';
 import * as bale from './src/server/bale';
 import { pool, init } from './src/server/db';
+import { presence } from './src/server/presence';
 
 const app = express();
 const server = http.createServer(app);
 const io = new SocketIOServer(server);
 
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 
-// آپلود فایل
+// آپلود فایل با پشتیبانی ترکیبی (Hybrid Cloud-Safe Media Storage + Disk Stream)
 const uploadsDir = path.join(process.cwd(), 'public/uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
@@ -29,10 +30,8 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage, limits: { fileSize: config.MAX_FILE_SIZE } });
 
-// متغیرهای درون‌حافظه‌ای نشست‌های زنده
+// متغیرهای درون‌حافظه‌ای کدهای تایید و توکن‌های موقت
 const otps: Record<string, any> = {};
-const onlineSockets: Record<string, string> = {};
-const usernameToSocket: Record<string, string> = {};
 const adminTokens: Record<string, { username: string; expire: number; adminAt: number }> = {};
 
 async function getSetting(key: string): Promise<string | null> {
@@ -48,7 +47,9 @@ async function setSetting(key: string, value: string): Promise<void> {
 }
 
 function isAdmin(req: Request): boolean {
-  return req.headers['x-admin-token'] === config.ADMIN_PASSWORD;
+  const headerToken = req.headers['x-admin-token'];
+  const token = Array.isArray(headerToken) ? headerToken[0] : headerToken;
+  return verifyAdminSecret(token);
 }
 
 function getRoomId(u1: string, u2: string): string {
@@ -76,24 +77,6 @@ async function isUserBlocked(username: string): Promise<boolean> {
     return false;
   }
   return false;
-}
-
-function setOnline(socketId: string, username: string): void {
-  onlineSockets[socketId] = username;
-  usernameToSocket[username] = socketId;
-}
-
-function setOffline(socketId: string): string | undefined {
-  const username = onlineSockets[socketId];
-  delete onlineSockets[socketId];
-  if (username && usernameToSocket[username] === socketId) {
-    delete usernameToSocket[username];
-  }
-  return username;
-}
-
-function getSocketIdByUsername(username: string): string | undefined {
-  return usernameToSocket[username];
 }
 
 function parseMsg(m: any) {
@@ -149,16 +132,57 @@ async function handleBaleUpdate(update: bale.BaleUpdate): Promise<void> {
   }
 }
 
-// ===== FILE UPLOAD =====
-app.post('/api/upload', upload.single('file'), (req: Request, res: Response) => {
+// ===== HYBRID PERSISTENT FILE UPLOAD & MEDIA SERVING =====
+app.post('/api/upload', upload.single('file'), async (req: Request, res: Response) => {
   if (!req.file) return res.json({ ok: false, msg: 'فایل آپلود نشد' });
-  const fileUrl = '/uploads/' + req.file.filename;
   const ext = path.extname(req.file.originalname).toLowerCase();
   let fileType = 'file';
   if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) fileType = 'image';
   else if (['.mp3', '.ogg', '.wav', '.webm', '.m4a'].includes(ext)) fileType = 'voice';
   else if (['.mp4', '.mov', '.avi'].includes(ext)) fileType = 'video';
+
+  let fileUrl = '/uploads/' + req.file.filename;
+
+  // ذخیره‌سازی پایدار ابری برای فایل‌های زیر ۲ مگابایت (ویس‌ها، آواتارها، تصاویر چت)
+  // جلوگیری از پاک شدن فایل‌ها در محیط‌های کانتینری Ephemeral (مانند Render و Railway)
+  if (config.STORAGE_MODE !== 'disk' && req.file.size <= config.INLINE_MAX_BYTES) {
+    try {
+      const mediaId = req.file.filename;
+      const rawBuffer = await fs.promises.readFile(req.file.path);
+      const base64Data = rawBuffer.toString('base64');
+      await pool.query(
+        'INSERT INTO media_blobs (id, mime_type, data_base64, created_at) VALUES ($1, $2, $3, $4)',
+        [mediaId, req.file.mimetype || 'application/octet-stream', base64Data, new Date().toISOString()]
+      );
+      fileUrl = `/api/media/${mediaId}`;
+    } catch {
+      // در صورت خطا از همان مسیر دیسک استفاده می‌شود
+    }
+  }
+
   res.json({ ok: true, fileUrl, fileType, originalName: req.file.originalname });
+});
+
+app.get('/api/media/:id', async (req: Request, res: Response) => {
+  const mediaId = req.params.id;
+  try {
+    const { rows } = await pool.query('SELECT * FROM media_blobs WHERE id = $1', [mediaId]);
+    if (rows.length) {
+      const blob = rows[0];
+      const buffer = Buffer.from(blob.data_base64, 'base64');
+      res.setHeader('Content-Type', blob.mime_type || 'application/octet-stream');
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      return res.send(buffer);
+    }
+  } catch {
+    // fallback to disk
+  }
+
+  const diskFile = path.join(uploadsDir, path.basename(mediaId));
+  if (fs.existsSync(diskFile)) {
+    return res.sendFile(diskFile);
+  }
+  return res.status(404).send('Media not found');
 });
 
 // ===== AUTH =====
@@ -252,13 +276,28 @@ app.post('/api/quick-login', async (req: Request, res: Response) => {
   res.json({ ok: true, username: key });
 });
 
-// ===== USER =====
+// ===== USER & ECDH PUBLIC KEY DIRECTORY =====
 app.get('/api/user/:username', async (req: Request, res: Response) => {
-  const { rows } = await pool.query('SELECT username, avatar, bio, status FROM users WHERE username = $1', [
-    req.params.username,
-  ]);
+  const { rows } = await pool.query(
+    'SELECT username, avatar, bio, status, public_key FROM users WHERE username = $1',
+    [req.params.username]
+  );
   if (!rows.length) return res.json({ ok: false });
   res.json({ ok: true, user: rows[0] });
+});
+
+app.post('/api/user/public-key', async (req: Request, res: Response) => {
+  const { username, publicKey } = req.body;
+  if (!username || !publicKey) return res.json({ ok: false });
+  await pool.query('UPDATE users SET public_key=$1 WHERE username=$2', [publicKey, username]);
+
+  // اطلاع‌رسانی کلید عمومی جدید به مخاطبان آنلاین برای رمزنگاری خودکار ECDH
+  const { rows: contacts } = await pool.query('SELECT contact FROM contacts WHERE username=$1', [username]);
+  contacts.forEach(({ contact }: any) => {
+    presence.emitToUser(io, contact, 'peer-key-updated', { username, publicKey });
+  });
+
+  res.json({ ok: true });
 });
 
 app.post('/api/user/update', async (req: Request, res: Response) => {
@@ -274,19 +313,21 @@ app.post('/api/user/update', async (req: Request, res: Response) => {
 
 app.post('/api/add-contact', async (req: Request, res: Response) => {
   const { myUsername, contactUsername } = req.body;
-  const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [contactUsername]);
+  const { rows } = await pool.query('SELECT username, public_key FROM users WHERE username = $1', [
+    contactUsername,
+  ]);
   if (!rows.length) return res.json({ ok: false, msg: 'این آیدی وجود ندارد' });
   if (myUsername === contactUsername) return res.json({ ok: false, msg: 'نمی‌تونی خودت رو اضافه کنی' });
   await pool.query('INSERT INTO contacts (username, contact) VALUES ($1, $2) ON CONFLICT DO NOTHING', [
     myUsername,
     contactUsername,
   ]);
-  res.json({ ok: true });
+  res.json({ ok: true, publicKey: rows[0].public_key || null });
 });
 
 app.get('/api/contacts/:username', async (req: Request, res: Response) => {
   const { rows } = await pool.query(
-    'SELECT c.contact, u.avatar, u.status FROM contacts c JOIN users u ON c.contact = u.username WHERE c.username = $1',
+    'SELECT c.contact, u.avatar, u.status, u.public_key FROM contacts c JOIN users u ON c.contact = u.username WHERE c.username = $1',
     [req.params.username]
   );
   res.json({
@@ -295,7 +336,8 @@ app.get('/api/contacts/:username', async (req: Request, res: Response) => {
       username: r.contact,
       avatar: r.avatar,
       status: r.status,
-      online: !!getSocketIdByUsername(r.contact),
+      public_key: r.public_key || null,
+      online: presence.isOnline(r.contact),
     })),
   });
 });
@@ -339,7 +381,7 @@ app.get('/api/settings/mode', async (_req: Request, res: Response) => {
 
 // ===== ADMIN =====
 app.post('/api/admin/login', (req: Request, res: Response) => {
-  res.json({ ok: req.body.password === config.ADMIN_PASSWORD });
+  res.json({ ok: verifyAdminSecret(req.body.password) });
 });
 
 app.get('/api/admin/users', async (req: Request, res: Response) => {
@@ -371,7 +413,7 @@ app.post('/api/admin/block', async (req: Request, res: Response) => {
 
   const { rows } = await pool.query('SELECT bale_chat_id FROM users WHERE username = $1', [username]);
   const user = rows[0];
-  const sockId = getSocketIdByUsername(username);
+  const sockId = presence.getSocketIdByUsername(username);
   if (sockId) {
     io.to(sockId).emit('blocked', { block_reason: reason, block_type: blockType, block_until: blockUntil });
     const s = io.sockets.sockets.get(sockId);
@@ -410,7 +452,7 @@ app.post('/api/admin/unblock', async (req: Request, res: Response) => {
 app.post('/api/admin/kick', (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { username } = req.body;
-  const sockId = getSocketIdByUsername(username);
+  const sockId = presence.getSocketIdByUsername(username);
   if (sockId) {
     io.to(sockId).emit('kicked');
     const s = io.sockets.sockets.get(sockId);
@@ -438,8 +480,7 @@ app.post('/api/admin/create-group', async (req: Request, res: Response) => {
     new Date().toISOString(),
   ]);
   (members as string[]).forEach(m => {
-    const sockId = getSocketIdByUsername(m);
-    if (sockId) io.to(sockId).emit('new-group', { id: groupId, name, members });
+    presence.emitToUser(io, m, 'new-group', { id: groupId, name, members });
   });
   res.json({ ok: true, groupId });
 });
@@ -453,8 +494,7 @@ app.post('/api/admin/add-to-group', async (req: Request, res: Response) => {
   const members: string[] = JSON.parse(group.members);
   if (!members.includes(username)) members.push(username);
   await pool.query('UPDATE groups SET members = $1 WHERE id = $2', [JSON.stringify(members), groupId]);
-  const sockId = getSocketIdByUsername(username);
-  if (sockId) io.to(sockId).emit('new-group', { id: groupId, name: group.name, members });
+  presence.emitToUser(io, username, 'new-group', { id: groupId, name: group.name, members });
   res.json({ ok: true });
 });
 
@@ -478,7 +518,7 @@ app.get('/api/admin/messages', async (req: Request, res: Response) => {
 app.get('/api/admin/stats', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const totalUsers = (await pool.query('SELECT COUNT(*) as c FROM users')).rows[0].c;
-  const onlineUsers = Object.keys(onlineSockets).length;
+  const onlineUsers = presence.getOnlineCount();
   const totalMessages = (await pool.query('SELECT COUNT(*) as c FROM messages WHERE is_deleted=0')).rows[0].c;
   const totalGroups = (await pool.query('SELECT COUNT(*) as c FROM groups')).rows[0].c;
   const pendingReports = (await pool.query("SELECT COUNT(*) as c FROM reports WHERE status='pending'")).rows[0].c;
@@ -579,6 +619,7 @@ app.get('/api/admin-login-as/:token', async (req: Request, res: Response) => {
   );
 });
 
+// مسیر پنل مدیریت فقط در سمت سرور تعریف شده و هیچ اثری از آن در باندل فرانت‌اند وجود ندارد
 app.get(config.ADMIN_PATH, (_req: Request, res: Response) => {
   res.sendFile(path.join(process.cwd(), 'public', 'admin.html'));
 });
@@ -599,13 +640,12 @@ io.on('connection', (socket) => {
     const { rows } = await pool.query('SELECT * FROM users WHERE username=$1', [username]);
     if (!rows.length) return;
     currentUser = username;
-    setOnline(socket.id, username);
+    presence.setOnline(socket.id, username);
     await pool.query('UPDATE users SET last_seen=$1 WHERE username=$2', [new Date().toISOString(), username]);
 
     const { rows: contacts } = await pool.query('SELECT contact FROM contacts WHERE username=$1', [username]);
     contacts.forEach(({ contact }: any) => {
-      const sockId = getSocketIdByUsername(contact);
-      if (sockId) io.to(sockId).emit('contact-online', username);
+      presence.emitToUser(io, contact, 'contact-online', username);
     });
 
     socket.emit('auth-ok');
@@ -679,14 +719,12 @@ io.on('connection', (socket) => {
       const { rows } = await pool.query('SELECT members FROM groups WHERE id=$1', [to]);
       if (rows.length) {
         JSON.parse(rows[0].members).forEach((m: string) => {
-          const sockId = getSocketIdByUsername(m);
-          if (sockId) io.to(sockId).emit('new-message', { roomId, msg: parsedMsg });
+          presence.emitToUser(io, m, 'new-message', { roomId, msg: parsedMsg });
         });
       }
     } else {
       socket.emit('new-message', { roomId, msg: parsedMsg });
-      const sockId = getSocketIdByUsername(to);
-      if (sockId) io.to(sockId).emit('new-message', { roomId, msg: parsedMsg });
+      presence.emitToUser(io, to, 'new-message', { roomId, msg: parsedMsg });
     }
 
     if (disappearAt) {
@@ -791,14 +829,12 @@ io.on('connection', (socket) => {
       if (rows.length) {
         JSON.parse(rows[0].members).forEach((m: string) => {
           if (m !== currentUser) {
-            const sockId = getSocketIdByUsername(m);
-            if (sockId) io.to(sockId).emit('typing', { roomId, username: currentUser, isTyping });
+            presence.emitToUser(io, m, 'typing', { roomId, username: currentUser, isTyping });
           }
         });
       }
     } else {
-      const sockId = getSocketIdByUsername(to);
-      if (sockId) io.to(sockId).emit('typing', { roomId, username: currentUser, isTyping });
+      presence.emitToUser(io, to, 'typing', { roomId, username: currentUser, isTyping });
     }
   });
 
@@ -813,19 +849,17 @@ io.on('connection', (socket) => {
     await pool.query('UPDATE users SET status=$1 WHERE username=$2', [status, currentUser]);
     const { rows: contacts } = await pool.query('SELECT contact FROM contacts WHERE username=$1', [currentUser]);
     contacts.forEach(({ contact }: any) => {
-      const sockId = getSocketIdByUsername(contact);
-      if (sockId) io.to(sockId).emit('contact-status', { username: currentUser, status });
+      presence.emitToUser(io, contact, 'contact-status', { username: currentUser, status });
     });
   });
 
   socket.on('disconnect', async () => {
-    const username = setOffline(socket.id);
+    const username = presence.setOffline(socket.id);
     if (username) {
       await pool.query('UPDATE users SET last_seen=$1 WHERE username=$2', [new Date().toISOString(), username]);
       const { rows: contacts } = await pool.query('SELECT contact FROM contacts WHERE username=$1', [username]);
       contacts.forEach(({ contact }: any) => {
-        const sockId = getSocketIdByUsername(contact);
-        if (sockId) io.to(sockId).emit('contact-offline', username);
+        presence.emitToUser(io, contact, 'contact-offline', username);
       });
     }
   });
@@ -860,7 +894,7 @@ async function start(): Promise<void> {
   server.listen(config.PORT, '0.0.0.0', () => {
     console.log(`✅ سرور TypeScript + React روی پورت ${config.PORT}`);
     console.log(`🌐 http://localhost:${config.PORT}`);
-    console.log(`🔐 پنل ادمین: http://localhost:${config.PORT}${config.ADMIN_PATH}`);
+    console.log(`🔐 پنل مدیریت: http://localhost:${config.PORT}${config.ADMIN_PATH}`);
     startBalePolling();
   });
 }

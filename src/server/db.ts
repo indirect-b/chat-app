@@ -8,6 +8,7 @@ export interface DbUser {
   avatar: string | null;
   bio: string;
   status: string;
+  public_key: string | null;
   joined_at: string;
   is_blocked: number;
   block_reason: string | null;
@@ -58,6 +59,13 @@ export interface DbReport {
   status: string;
 }
 
+export interface DbMediaBlob {
+  id: string;
+  mime_type: string;
+  data_base64: string;
+  created_at: string;
+}
+
 interface SnapshotData {
   users: [string, DbUser][];
   contacts: DbContact[];
@@ -65,10 +73,14 @@ interface SnapshotData {
   groups: [string, DbGroup][];
   reports: DbReport[];
   settings: [string, string][];
+  mediaBlobs?: [string, DbMediaBlob][];
 }
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const SNAPSHOT_FILE = path.join(DATA_DIR, 'database.json');
+const TEMP_SNAPSHOT_FILE = path.join(DATA_DIR, 'database.json.tmp');
+const MAX_STORED_MESSAGES = 5000;
+const DEBOUNCE_WRITE_MS = 250;
 
 export class PersistentFallbackDatabase {
   private users = new Map<string, DbUser>();
@@ -76,17 +88,23 @@ export class PersistentFallbackDatabase {
   private messages: DbMessage[] = [];
   private groups = new Map<string, DbGroup>();
   private reports: DbReport[] = [];
+  private mediaBlobs = new Map<string, DbMediaBlob>();
   private settings = new Map<string, string>([
     ['server_mode', 'normal'],
     ['maintenance_msg', 'سرور در حال به‌روزرسانی است. لطفاً بعداً مراجعه کنید.'],
     ['rules', 'قوانین پیام‌رسان:\n\n۱. احترام به دیگران\n۲. عدم ارسال محتوای نامناسب\n۳. عدم اسپم'],
   ]);
 
+  // مکانیزم صف غیرمسدودکننده و قفل اتمیک (Non-Blocking Debounced Write Mutex)
+  private writeTimer: NodeJS.Timeout | null = null;
+  private isFlushing = false;
+  private flushPending = false;
+
   constructor() {
-    this.loadFromDisk();
+    this.loadFromDiskSync();
   }
 
-  private loadFromDisk(): void {
+  private loadFromDiskSync(): void {
     try {
       if (!fs.existsSync(DATA_DIR)) {
         fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -99,6 +117,7 @@ export class PersistentFallbackDatabase {
         if (Array.isArray(parsed.messages)) this.messages = parsed.messages;
         if (Array.isArray(parsed.groups)) this.groups = new Map(parsed.groups);
         if (Array.isArray(parsed.reports)) this.reports = parsed.reports;
+        if (Array.isArray(parsed.mediaBlobs)) this.mediaBlobs = new Map(parsed.mediaBlobs);
         if (Array.isArray(parsed.settings)) {
           for (const [k, v] of parsed.settings) {
             this.settings.set(k, v);
@@ -110,11 +129,37 @@ export class PersistentFallbackDatabase {
     }
   }
 
-  private saveToDisk(): void {
+  /**
+   * زمان‌بندی ذخیره ناهمگام با قفل انحصاری (Mutex) و نوشتن اتمیک (Temp File + Rename)
+   * جلوگیری کامل از Race Conditions و انسداد Event Loop در ترافیک بالا
+   */
+  private scheduleSave(): void {
+    if (this.writeTimer) {
+      clearTimeout(this.writeTimer);
+    }
+    this.writeTimer = setTimeout(() => {
+      this.writeTimer = null;
+      void this.flushToDiskAtomic();
+    }, DEBOUNCE_WRITE_MS);
+  }
+
+  private async flushToDiskAtomic(): Promise<void> {
+    if (this.isFlushing) {
+      this.flushPending = true;
+      return;
+    }
+    this.isFlushing = true;
+
     try {
       if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
+        await fs.promises.mkdir(DATA_DIR, { recursive: true });
       }
+
+      // هرس خودکار پیام‌های بسیار قدیمی برای جلوگیری از افزایش بی‌رویه حجم فایل JSON
+      if (this.messages.length > MAX_STORED_MESSAGES) {
+        this.messages = this.messages.slice(-MAX_STORED_MESSAGES);
+      }
+
       const snapshot: SnapshotData = {
         users: Array.from(this.users.entries()),
         contacts: this.contacts,
@@ -122,16 +167,38 @@ export class PersistentFallbackDatabase {
         groups: Array.from(this.groups.entries()),
         reports: this.reports,
         settings: Array.from(this.settings.entries()),
+        mediaBlobs: Array.from(this.mediaBlobs.entries()),
       };
-      fs.writeFileSync(SNAPSHOT_FILE, JSON.stringify(snapshot, null, 2), 'utf-8');
+
+      const payload = JSON.stringify(snapshot);
+      await fs.promises.writeFile(TEMP_SNAPSHOT_FILE, payload, 'utf-8');
+      await fs.promises.rename(TEMP_SNAPSHOT_FILE, SNAPSHOT_FILE);
     } catch (e: any) {
-      console.warn('⚠️ اخطار در ذخیره فایل دیتابیس محلی:', e.message);
+      console.warn('⚠️ اخطار در ذخیره اتمیک دیتابیس محلی:', e.message);
+    } finally {
+      this.isFlushing = false;
+      if (this.flushPending) {
+        this.flushPending = false;
+        void this.flushToDiskAtomic();
+      }
     }
   }
 
   async query(sql: string, params: any[] = []): Promise<{ rows: any[] }> {
     const s = sql.trim().replace(/\s+/g, ' ');
     const lower = s.toLowerCase();
+
+    // 0. MEDIA BLOBS (Persistent Cloud-Safe File Storage)
+    if (lower.startsWith('insert into media_blobs')) {
+      const [id, mime_type, data_base64, created_at] = params;
+      this.mediaBlobs.set(id, { id, mime_type, data_base64, created_at });
+      this.scheduleSave();
+      return { rows: [] };
+    }
+    if (lower.startsWith('select * from media_blobs where id = $1')) {
+      const item = this.mediaBlobs.get(params[0]);
+      return { rows: item ? [item] : [] };
+    }
 
     // 1. SETTINGS
     if (lower.startsWith('select value from settings where key = $1')) {
@@ -140,7 +207,7 @@ export class PersistentFallbackDatabase {
     }
     if (lower.startsWith('insert into settings (key, value)')) {
       this.settings.set(params[0], params[1]);
-      this.saveToDisk();
+      this.scheduleSave();
       return { rows: [] };
     }
 
@@ -164,6 +231,7 @@ export class PersistentFallbackDatabase {
         avatar: null,
         bio: '',
         status: 'online',
+        public_key: null,
         joined_at,
         is_blocked: 0,
         block_reason: null,
@@ -172,7 +240,16 @@ export class PersistentFallbackDatabase {
         last_seen: new Date().toISOString(),
       };
       this.users.set(username, user);
-      this.saveToDisk();
+      this.scheduleSave();
+      return { rows: [] };
+    }
+    if (lower.includes('update users set public_key=$1 where username=$2')) {
+      const [public_key, username] = params;
+      const u = this.users.get(username);
+      if (u) {
+        u.public_key = public_key;
+        this.scheduleSave();
+      }
       return { rows: [] };
     }
     if (lower.includes('update users set bio=$1, status=$2, avatar=$3 where username=$4')) {
@@ -182,7 +259,7 @@ export class PersistentFallbackDatabase {
         u.bio = bio;
         u.status = status;
         u.avatar = avatar;
-        this.saveToDisk();
+        this.scheduleSave();
       }
       return { rows: [] };
     }
@@ -194,7 +271,7 @@ export class PersistentFallbackDatabase {
         u.block_reason = null;
         u.block_type = null;
         u.block_until = null;
-        this.saveToDisk();
+        this.scheduleSave();
       }
       return { rows: [] };
     }
@@ -206,7 +283,7 @@ export class PersistentFallbackDatabase {
         u.block_reason = reason;
         u.block_type = blockType;
         u.block_until = blockUntil;
-        this.saveToDisk();
+        this.scheduleSave();
       }
       return { rows: [] };
     }
@@ -215,7 +292,7 @@ export class PersistentFallbackDatabase {
       const u = this.users.get(username);
       if (u) {
         u.last_seen = last_seen;
-        this.saveToDisk();
+        this.scheduleSave();
       }
       return { rows: [] };
     }
@@ -224,7 +301,7 @@ export class PersistentFallbackDatabase {
       const u = this.users.get(username);
       if (u) {
         u.status = status;
-        this.saveToDisk();
+        this.scheduleSave();
       }
       return { rows: [] };
     }
@@ -241,7 +318,7 @@ export class PersistentFallbackDatabase {
       const exists = this.contacts.some(c => c.username === username && c.contact === contact);
       if (!exists) {
         this.contacts.push({ username, contact });
-        this.saveToDisk();
+        this.scheduleSave();
       }
       return { rows: [] };
     }
@@ -250,8 +327,13 @@ export class PersistentFallbackDatabase {
       const res: any[] = [];
       for (const c of this.contacts) {
         if (c.username === username) {
-          const u = this.users.get(c.contact) || { avatar: null, status: 'offline' };
-          res.push({ contact: c.contact, avatar: u.avatar, status: u.status });
+          const u = this.users.get(c.contact) || { avatar: null, status: 'offline', public_key: null };
+          res.push({
+            contact: c.contact,
+            avatar: u.avatar,
+            status: u.status,
+            public_key: u.public_key,
+          });
         }
       }
       return { rows: res };
@@ -305,7 +387,7 @@ export class PersistentFallbackDatabase {
         time,
         timestamp: Number(timestamp),
       });
-      this.saveToDisk();
+      this.scheduleSave();
       return { rows: [] };
     }
     if (lower.includes('from messages where room_id = $1 and is_deleted = 0 order by timestamp asc')) {
@@ -336,7 +418,7 @@ export class PersistentFallbackDatabase {
       if (m) {
         m.text = newText;
         m.is_edited = 1;
-        this.saveToDisk();
+        this.scheduleSave();
       }
       return { rows: [] };
     }
@@ -345,7 +427,7 @@ export class PersistentFallbackDatabase {
       const m = this.messages.find(msg => msg.id === id);
       if (m) {
         m.is_deleted = 1;
-        this.saveToDisk();
+        this.scheduleSave();
       }
       return { rows: [] };
     }
@@ -354,7 +436,7 @@ export class PersistentFallbackDatabase {
       this.messages.forEach(m => {
         if (m.room_id === roomId) m.is_pinned = 0;
       });
-      this.saveToDisk();
+      this.scheduleSave();
       return { rows: [] };
     }
     if (lower.includes('update messages set is_pinned=1 where id=$1')) {
@@ -362,7 +444,7 @@ export class PersistentFallbackDatabase {
       const m = this.messages.find(msg => msg.id === id);
       if (m) {
         m.is_pinned = 1;
-        this.saveToDisk();
+        this.scheduleSave();
       }
       return { rows: [] };
     }
@@ -371,7 +453,7 @@ export class PersistentFallbackDatabase {
       const m = this.messages.find(msg => msg.id === id);
       if (m) {
         m.reactions = reactions;
-        this.saveToDisk();
+        this.scheduleSave();
       }
       return { rows: [] };
     }
@@ -380,7 +462,7 @@ export class PersistentFallbackDatabase {
       const m = this.messages.find(msg => msg.id === id);
       if (m) {
         m.is_read = 1;
-        this.saveToDisk();
+        this.scheduleSave();
       }
       return { rows: [] };
     }
@@ -407,7 +489,7 @@ export class PersistentFallbackDatabase {
     if (lower.startsWith('insert into groups')) {
       const [id, name, members, created_at] = params;
       this.groups.set(id, { id, name, members, created_at });
-      this.saveToDisk();
+      this.scheduleSave();
       return { rows: [] };
     }
     if (lower.includes('update groups set members = $1 where id = $2')) {
@@ -415,7 +497,7 @@ export class PersistentFallbackDatabase {
       const g = this.groups.get(id);
       if (g) {
         g.members = members;
-        this.saveToDisk();
+        this.scheduleSave();
       }
       return { rows: [] };
     }
@@ -433,7 +515,7 @@ export class PersistentFallbackDatabase {
         created_at,
         status: 'pending',
       });
-      this.saveToDisk();
+      this.scheduleSave();
       return { rows: [] };
     }
     if (lower.startsWith('select * from reports order by created_at desc')) {
@@ -444,7 +526,7 @@ export class PersistentFallbackDatabase {
       const r = this.reports.find(rep => rep.id === id);
       if (r) {
         r.status = status;
-        this.saveToDisk();
+        this.scheduleSave();
       }
       return { rows: [] };
     }
@@ -505,7 +587,7 @@ export const pool = {
       try {
         return await pgPool.query(text, params);
       } catch (err: any) {
-        console.warn('⚠️ خطای کوئری PostgreSQL، انتقال به دیتابیس پایدار دیسک:', err.message);
+        console.warn('⚠️ خطای کوئری PostgreSQL، انتقال به دیتابیس اتمیک دیسک:', err.message);
         useFallback = true;
         return await fallbackDb.query(text, params);
       }
@@ -526,6 +608,7 @@ export async function init(): Promise<void> {
             avatar TEXT,
             bio TEXT DEFAULT '',
             status TEXT DEFAULT 'online',
+            public_key TEXT,
             joined_at TEXT,
             is_blocked INTEGER DEFAULT 0,
             block_reason TEXT,
@@ -533,6 +616,8 @@ export async function init(): Promise<void> {
             block_until TEXT,
             last_seen TEXT
           );
+          ALTER TABLE users ADD COLUMN IF NOT EXISTS public_key TEXT;
+
           CREATE TABLE IF NOT EXISTS contacts (
             username TEXT,
             contact TEXT,
@@ -576,6 +661,12 @@ export async function init(): Promise<void> {
             key TEXT PRIMARY KEY,
             value TEXT
           );
+          CREATE TABLE IF NOT EXISTS media_blobs (
+            id TEXT PRIMARY KEY,
+            mime_type TEXT,
+            data_base64 TEXT,
+            created_at TEXT
+          );
         `);
 
         const defaults: [string, string][] = [
@@ -595,9 +686,9 @@ export async function init(): Promise<void> {
         client.release();
       }
     } catch (e: any) {
-      console.warn('⚠️ اتصال به PostgreSQL برقرار نشد، استفاده از دیتابیس پایدار دیسک (data/database.json):', e.message);
+      console.warn('⚠️ اتصال به PostgreSQL برقرار نشد، استفاده از موتور اتمیک دیسک (data/database.json):', e.message);
       useFallback = true;
     }
   }
-  console.log('✅ دیتابیس پایدار دیسک (Persistent Fallback - data/database.json) آماده است');
+  console.log('✅ موتور دیتابیس اتمیک دیسک (Debounced Atomic Fallback - data/database.json) آماده است');
 }

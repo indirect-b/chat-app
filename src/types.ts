@@ -3,6 +3,7 @@ export interface UserProfile {
   avatar: string | null;
   bio: string;
   status: 'online' | 'busy' | 'away' | string;
+  public_key?: string | null;
 }
 
 export interface ContactItem {
@@ -10,6 +11,7 @@ export interface ContactItem {
   avatar: string | null;
   status: string;
   online?: boolean;
+  public_key?: string | null;
 }
 
 export interface GroupItem {
@@ -46,6 +48,7 @@ export interface RoomSummary {
   online?: boolean;
   preview?: string;
   time?: string;
+  publicKey?: string | null;
 }
 
 export interface BlockedInfo {
