@@ -18,6 +18,7 @@ export interface GroupItem {
   id: string;
   name: string;
   members: string[];
+  epoch?: number;
   created_at?: string;
 }
 
@@ -49,6 +50,8 @@ export interface RoomSummary {
   preview?: string;
   time?: string;
   publicKey?: string | null;
+  epoch?: number;
+  members?: string[];
 }
 
 export interface BlockedInfo {

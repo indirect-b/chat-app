@@ -6,10 +6,19 @@ import path from 'path';
 import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import multer from 'multer';
+import { ristretto255_oprf } from '@noble/curves/ed25519.js';
+import { sha256 } from '@noble/hashes/sha2.js';
 import { config, verifyAdminSecret } from './src/server/config';
 import * as bale from './src/server/bale';
 import { pool, init } from './src/server/db';
 import { presence } from './src/server/presence';
+
+// کلید سرور برای پروتکل احراز هویت کور Ristretto255-VOPRF (RFC 9497)
+const voprfSeed = sha256(new TextEncoder().encode(config.ADMIN_SECRET + '::voprf-ristretto255-seed'));
+const serverVoprfKeys = ristretto255_oprf.voprf.deriveKeyPair(
+  voprfSeed,
+  new TextEncoder().encode('PersianMessenger-Ristretto255-VOPRF-v2')
+);
 
 const app = express();
 const server = http.createServer(app);
@@ -276,7 +285,29 @@ app.post('/api/quick-login', async (req: Request, res: Response) => {
   res.json({ ok: true, username: key });
 });
 
-// ===== USER & ECDH PUBLIC KEY DIRECTORY =====
+// ===== RISTRETTO255-VOPRF BLINDED IDENTITY EVALUATION (RFC 9497) =====
+app.post('/api/voprf/evaluate', (req: Request, res: Response) => {
+  try {
+    const { blindedB64 } = req.body;
+    if (!blindedB64) return res.status(400).json({ ok: false });
+    const blindedBytes = new Uint8Array(Buffer.from(blindedB64, 'base64'));
+    const { evaluated, proof } = ristretto255_oprf.voprf.blindEvaluate(
+      serverVoprfKeys.secretKey,
+      serverVoprfKeys.publicKey,
+      blindedBytes
+    );
+    res.json({
+      ok: true,
+      evaluatedB64: Buffer.from(evaluated).toString('base64'),
+      proofB64: Buffer.from(proof).toString('base64'),
+      serverPublicKeyB64: Buffer.from(serverVoprfKeys.publicKey).toString('base64'),
+    });
+  } catch (e: any) {
+    res.status(400).json({ ok: false, msg: e.message });
+  }
+});
+
+// ===== USER & HYBRID POST-QUANTUM PUBLIC KEY DIRECTORY =====
 app.get('/api/user/:username', async (req: Request, res: Response) => {
   const { rows } = await pool.query(
     'SELECT username, avatar, bio, status, public_key FROM users WHERE username = $1',
@@ -353,7 +384,14 @@ app.get('/api/messages/:roomId', async (req: Request, res: Response) => {
 app.get('/api/groups/:username', async (req: Request, res: Response) => {
   const { rows } = await pool.query('SELECT * FROM groups');
   const myGroups = rows.filter((g: any) => JSON.parse(g.members).includes(req.params.username));
-  res.json({ ok: true, groups: myGroups.map((g: any) => ({ ...g, members: JSON.parse(g.members) })) });
+  res.json({
+    ok: true,
+    groups: myGroups.map((g: any) => ({
+      ...g,
+      epoch: Number(g.epoch) || 1,
+      members: JSON.parse(g.members),
+    })),
+  });
 });
 
 // ===== REPORT =====
@@ -480,7 +518,7 @@ app.post('/api/admin/create-group', async (req: Request, res: Response) => {
     new Date().toISOString(),
   ]);
   (members as string[]).forEach(m => {
-    presence.emitToUser(io, m, 'new-group', { id: groupId, name, members });
+    presence.emitToUser(io, m, 'new-group', { id: groupId, name, members, epoch: 1 });
   });
   res.json({ ok: true, groupId });
 });
@@ -493,15 +531,37 @@ app.post('/api/admin/add-to-group', async (req: Request, res: Response) => {
   const group = rows[0];
   const members: string[] = JSON.parse(group.members);
   if (!members.includes(username)) members.push(username);
-  await pool.query('UPDATE groups SET members = $1 WHERE id = $2', [JSON.stringify(members), groupId]);
-  presence.emitToUser(io, username, 'new-group', { id: groupId, name: group.name, members });
-  res.json({ ok: true });
+  const newEpoch = (Number(group.epoch) || 1) + 1;
+  await pool.query('UPDATE groups SET members = $1, epoch = $2 WHERE id = $3', [
+    JSON.stringify(members),
+    newEpoch,
+    groupId,
+  ]);
+  presence.emitToUser(io, username, 'new-group', {
+    id: groupId,
+    name: group.name,
+    members,
+    epoch: newEpoch,
+  });
+  // اطلاع‌رسانی چرخش اپوک گروه (Group Epoch Rotation FSM) به تمام اعضای گروه
+  members.forEach(m => {
+    presence.emitToUser(io, m, 'group-epoch-rotated', {
+      groupId,
+      name: group.name,
+      epoch: newEpoch,
+      members,
+    });
+  });
+  res.json({ ok: true, epoch: newEpoch });
 });
 
 app.get('/api/admin/groups', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { rows } = await pool.query('SELECT * FROM groups');
-  res.json({ ok: true, groups: rows.map((g: any) => ({ ...g, members: JSON.parse(g.members) })) });
+  res.json({
+    ok: true,
+    groups: rows.map((g: any) => ({ ...g, epoch: Number(g.epoch) || 1, members: JSON.parse(g.members) })),
+  });
 });
 
 app.get('/api/admin/messages', async (req: Request, res: Response) => {

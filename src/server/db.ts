@@ -45,6 +45,7 @@ export interface DbGroup {
   id: string;
   name: string;
   members: string;
+  epoch?: number;
   created_at: string;
 }
 
@@ -488,8 +489,18 @@ export class PersistentFallbackDatabase {
     }
     if (lower.startsWith('insert into groups')) {
       const [id, name, members, created_at] = params;
-      this.groups.set(id, { id, name, members, created_at });
+      this.groups.set(id, { id, name, members, epoch: 1, created_at });
       this.scheduleSave();
+      return { rows: [] };
+    }
+    if (lower.includes('update groups set members = $1, epoch = $2 where id = $3')) {
+      const [members, epoch, id] = params;
+      const g = this.groups.get(id);
+      if (g) {
+        g.members = members;
+        g.epoch = Number(epoch) || (g.epoch || 1) + 1;
+        this.scheduleSave();
+      }
       return { rows: [] };
     }
     if (lower.includes('update groups set members = $1 where id = $2')) {
@@ -497,6 +508,7 @@ export class PersistentFallbackDatabase {
       const g = this.groups.get(id);
       if (g) {
         g.members = members;
+        g.epoch = (g.epoch || 1) + 1;
         this.scheduleSave();
       }
       return { rows: [] };
@@ -645,8 +657,10 @@ export async function init(): Promise<void> {
             id TEXT PRIMARY KEY,
             name TEXT,
             members TEXT,
+            epoch INTEGER DEFAULT 1,
             created_at TEXT
           );
+          ALTER TABLE groups ADD COLUMN IF NOT EXISTS epoch INTEGER DEFAULT 1;
           CREATE TABLE IF NOT EXISTS reports (
             id TEXT PRIMARY KEY,
             reporter TEXT,
