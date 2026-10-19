@@ -1,108 +1,116 @@
-# 💬 Persian Chat Application (chat-app)
+# 💬 پیام‌رسان تحت وب (Persian Real-Time Chat Application)
 
-A lightweight, modern, and high-performance **Real-Time Persian Messenger** built using full-stack JavaScript. This project is specifically architected to support fluid, bidirectional communication with a seamless user experience tailored for Persian-speaking users.
-
----
-
-## 🚀 How It Works
-
-The **chat-app** follows a decoupled client-server architecture to provide persistent connections and instant messaging capabilities:
-1. **Handshake & Connection**: When a user opens the client interface, a WebSocket handshake protocol is initiated with the Node.js server.
-2. **Persistent Session**: Once verified, a persistent, bi-directional TCP connection is established via WebSockets.
-3. **Event-Driven Delivery**: Messages are processed as asynchronous payloads. When User A sends a message, it triggers a server event which instantaneously broadcasts or selectively routes the message to User B's active socket session.
-4. **Fallback Mechanism**: If the client's network environment restricts native WebSockets, the pipeline automatically falls back to HTTP long-polling to preserve communication stability.
+یک پیام‌رسان بلادرنگ (Real-Time)، سبک و مدرن به زبان فارسی که با معماری **SPA ماژولار (مشابه Telegram Web)**، بر پایه **Node.js**، **Express**، **Socket.IO** و **PostgreSQL** (به همراه دیتابیس پشتیبان درون‌حافظه‌ای) طراحی شده است.
 
 ---
 
-## 🛠️ Tech Stack
+## 📋 گزارش تغییرات و به‌روزرسانی‌های اخیر (Changelog)
 
-### Frontend (Client Side)
-* **Core Logic:** JavaScript (ES6+)
-* **UI/UX Framework:** React.js / Vanilla JS (with modular component architecture)
-* **Styling:** CSS3 / Tailwind CSS (Optimized for RTL alignment and Persian typography)
+### ۱. بازطراحی معماری فرانت‌اند به سبک تلگرام وب (Modular SPA)
+* **پوسته سبک و امن (`index.html`):** فایل `index.html` از تمامی کدهای ایستا پاکسازی شد و اکنون صرفاً شامل ظرف‌های خالی (`#root`، `#modalRoot` و `#toastRoot`) است.
+* **رندر پویا (Dynamic DOM Mount / Unmount):** تا پیش از ورود کاربر، هیچ‌یک از تگ‌های محیط چت در DOM وجود خارجی ندارند (حتی با Inspect مرورگر قابل مشاهده نیستند). به محض احراز هویت، کامپوننت لاگین (`AuthView`) به طور کامل از حافظه صفحه حذف شده و کامپوننت محیط اصلی چت (`AppView`) ساخته می‌شود.
+* **مودال‌های در لحظه (On-Demand Modals):** پنجره‌های پروفایل، افزودن مخاطب، ویرایش پیام، فوروارد، گزارش تخلف، تایمر پیام ناپدیدشونده و قوانین فقط در لحظه کلیک در `#modalRoot` ساخته می‌شوند و با بستن پنجره از DOM پاک می‌شوند.
+* **حفظ نشست کاربر با `LocalStorage`:** وضعیت لاگین کاربر در مرورگر ذخیره می‌شود تا با رفرش کردن صفحه (`F5`) یا بستن و باز کردن تب، کاربر از حساب خود خارج نشود و مستقیماً به محیط گفتگو بازگردد.
+* **حذف `alert`های سنتی و جایگزینی با Toast:** تمامی پیام‌های سیستمی با اعلان‌های شناور مدرن (`showToast`) جایگزین شدند و پنجره مشاهده پروفایل مخاطب (`showContactProfile`) تکمیل گردید.
 
-### Backend (Server Side)
-* **Runtime Environment:** Node.js
-* **Application Framework:** Express.js (Lightweight routing and middleware controller)
-* **Database Management:** MongoDB / Mongoose (For unstructured message archiving, chat histories, and user metadata)
+### ۲. ماژولار کردن استایل‌ها و جاوااسکریپت (ES Modules)
+* تفکیک فایل یکپارچه قدیمی `app.js` به ماژول‌های مستقل در پوشه‌های `public/js/components/` و `public/js/modules/`.
+* تفکیک استایل‌ها به ۴ فایل مجزا در `public/css/` (`base.css`، `auth.css`، `chat.css` و `modals.css`).
 
-### Real-Time Layer
-* **Network Protocol:** Socket.IO / Raw WebSockets (Bi-directional communication engine)
+### ۳. سیستم ورود سریع تستی (Quick Demo Login)
+* افزودن دکمه **«⚡ ورود سریع تستی (بدون نیاز به کد)»** و میانبرهای **«👤 اکانت ۱»** و **«👤 اکانت ۲»** در صفحه ورود (`/api/quick-login`).
+* اتصال خودکار `کاربر_۱` و `کاربر_۲` در لیست مخاطبین یکدیگر جهت تست فوری چت دوطرفه، ارسال ویس، فایل و واکنش‌ها در دو تب مرورگر.
+* افزودن حالت آزمایشی کد تأیید (OTP) در صورت تنظیم نبودن توکن ربات بله (`BALE_BOT_TOKEN`).
 
----
-
-## 📐 Real-Time Communication Architecture
-
-The engine operates on a event-driven schema designed for speed, consistency, and low-latency message delivery:
-
-### Key Internal Socket Events:
-* `connection`: Fires upon a successful socket handshake.
-* `join-room`: Allocates the user to a private or group chat thread.
-* `send-message`: Transmits the dynamic message body payload asynchronously.
-* `typing`: Triggers a non-blocking notification indicating active user engagement.
-* `disconnect`: Automatically cleans up active connection references to free up server overhead.
+### ۴. پایدارسازی سرور و رفع خطای کرش (`Exited with status 1`)
+* **مکانیزم دیتابیس پشتیبان درون‌حافظه‌ای (`MemoryDatabase` در `db.js`):** در صورتی که `DATABASE_URL` تنظیم نشده باشد یا ارتباط با سرور PostgreSQL قطع شود، برنامه به جای فراخوانی `process.exit(1)` و کرش کردن، به صورت خودکار روی دیتابیس درون‌حافظه‌ای سوییچ می‌کند و تمامی کوئری‌ها را بدون قطعی پاسخ می‌دهد.
+* **پشتیبانی استاندارد پورت و هاست (`0.0.0.0`):** تنظیم `server.listen(config.PORT, '0.0.0.0')` برای سازگاری کامل با محیط‌های ابری (Render، Docker، Cloud Run و AI Studio).
+* **مدیریت خطاهای سراسری:** افزودن هندلرهای `uncaughtException` و `unhandledRejection` و ایجاد خودکار پوشه آپلود (`public/uploads`) هنگام راه‌اندازی سرور.
 
 ---
 
-## 📦 Local Installation & Setup
+## 📂 ساختار پوشه‌بندی پروژه (Folder Structure)
 
-Follow these streamlined instructions to clone, configure, and execute the repository locally:
-
-### Prerequisites
-Make sure you have the following frameworks installed on your machine:
-* [Node.js](https://nodejs.org) (v16.x or higher)
-* [npm](https://npmjs.com) or [yarn](https://yarnpkg.com)
-* [MongoDB](https://mongodb.com) (Local instance or MongoDB Atlas URI)
-
-### 1. Clone the Repository
-```bash
-git clone https://github.com
-cd chat-app
+```text
+/
+├── server.js                   # سرور اصلی Express + Socket.IO و روت‌های API
+├── db.js                       # لایه دیتابیس PostgreSQL به همراه Fallback درون‌حافظه‌ای
+├── config.js                   # تنظیمات محیطی، پورت و مقادیر پیش‌فرض
+├── bale.js                     # ماژول ارتباط با بازوی (ربات) پیام‌رسان بله جهت OTP
+├── package.json                # وابستگی‌ها و اسکریپت‌های اجرای پروژه (dev, start, build)
+├── .env.example                # نمونه متغیرهای محیطی
+└── public/                     # فایل‌های سمت کلاینت (SPA)
+    ├── index.html              # پوسته اصلی برنامه (شامل #root، #modalRoot، #toastRoot)
+    ├── style.css               # فایل ورودی استایل‌ها (@import)
+    ├── admin.html              # پنل مدیریت اختصاصی
+    ├── uploads/                # محل ذخیره فایل‌ها، تصاویر و پیام‌های صوتی آپلودشده
+    ├── css/                    # استایل‌های تفکیک‌شده
+    │   ├── base.css            # متغیرهای رنگ، فونت وزیرمتن، ریست‌ها و استایل Toast
+    │   ├── auth.css            # استایل‌های مراحل ورود و ثبت‌نام
+    │   ├── chat.css            # استایل‌های سایدبار، هدر، لیست پیام‌ها و ضبط ویس
+    │   └── modals.css          # استایل‌های مودال‌ها، منوی راست‌کلیک و اطلاعیه‌ها
+    └── js/                     # منطق ماژولار کلاینت (ES6 Modules)
+        ├── main.js             # راه‌انداز اولیه (Bootstrap)، بررسی سشن و اتصال رویدادها
+        ├── state.js            # مدیریت وضعیت سراسری و LocalStorage نشست کاربر
+        ├── socket.js           # راه‌اندازی و مدیریت رویدادهای بلادرنگ Socket.IO
+        ├── utils.js            # توابع کمکی (Escape HTML، اسکرول، Toast و بستن مودال)
+        ├── components/         # کامپوننت‌های رابط کاربری (رندر پویا)
+        │   ├── AuthView.js     # کامپوننت صفحه ورود، کد تأیید و قوانین
+        │   ├── AppView.js      # کامپوننت محیط اصلی پیام‌رسان (سایدبار و پنجره چت)
+        │   └── Modals.js       # سازنده پویا برای تمامی پنجره‌های پاپ‌آپ
+        └── modules/            # ماژول‌های عملیاتی برنامه
+            ├── auth.js         # منطق احراز هویت، ورود سریع تستی، ثبت‌نام و خروج
+            ├── contacts.js     # مدیریت مخاطبین، گروه‌ها، جستجو و پروفایل مخاطب
+            ├── chat.js         # ارسال/دریافت پیام، ریپلای، ویرایش، حذف، پین، فوروارد و ری‌اکشن
+            ├── media.js        # آپلود تصویر/فایل، آواتار و ضبط پیام صوتی (MediaRecorder)
+            └── profile.js      # مدیریت پروفایل، بیوگرافی و وضعیت آنلاین کاربر
 ```
 
-### 2. Install Project Dependencies
-If the codebase uses a monorepo setup or split directories, navigate to both layers:
+---
 
-**For the Backend:**
+## 🛠️ تکنولوژی‌های استفاده‌شده (Tech Stack)
+
+### بخش کلاینت (Frontend)
+* **معماری:** Vanilla JavaScript (ES6 Modules) با الگوی SPA و Dynamic DOM Mounting
+* **مدیریت نشست:** `LocalStorage` و `SessionStorage`
+* **طراحی و استایل:** CSS3 ماژولار با پشتیبانی کامل از راست‌به‌چپ (RTL) و فونت فارسی **Vazirmatn**
+* **ارتباط زنده:** Socket.IO Client + Web Audio / MediaRecorder API برای ضبط ویس
+
+### بخش سرور (Backend)
+* **محیط اجرا:** Node.js و فریم‌ورک Express.js
+* **ارتباط بلادرنگ:** Socket.IO (مدیریت وضعیت آنلاین، تایپینگ، تیک خوانده‌شدن و پیام‌های ناپدیدشونده)
+* **پایگاه داده:** PostgreSQL (`pg`) به همراه موتور دیتابیس درون‌حافظه‌ای خودکار (`MemoryDatabase`)
+* **مدیریت فایل:** `multer` برای آپلود تصاویر، فایل‌ها و ویس‌ها
+
+---
+
+## 🚀 راه‌اندازی و اجرا (Installation & Setup)
+
+### ۱. نصب وابستگی‌ها
 ```bash
-cd backend
 npm install
 ```
 
-**For the Frontend:**
-```bash
-cd ../frontend
-npm install
-```
-
-### 3. Environment Configurations
-Create a `.env` file within your root server or backend directory and configure the environment variables:
+### ۲. تنظیم متغیرهای محیطی (اختیاری)
+فایل `.env` را بر اساس `.env.example` بسازید (در صورت عدم تنظیم، برنامه با مقادیر پیش‌فرض و دیتابیس درون‌حافظه‌ای اجرا می‌شود):
 ```env
-PORT=5000
-MONGODB_URI=mongodb://localhost:27017/persian-chat-db
-JWT_SECRET=your_super_secure_jwt_token_secret
+PORT=3000
+ADMIN_PASSWORD=Tk_tokyo
+ADMIN_PATH=/panel-Tk_tokyo
+BALE_API=https://tapi.bale.ai/bot
+BALE_BOT_TOKEN=
+DATABASE_URL=
+MAX_FILE_SIZE=52428800
+OTP_EXPIRE=120
 ```
 
-### 4. Running the Development Server
-
-**Start Backend Server:**
+### ۳. اجرای برنامه
 ```bash
-cd backend
-npm run dev # or node server.js
+# اجرای محیط توسعه
+npm run dev
+
+# اجرای محیط عملیاتی
+npm start
 ```
-
-**Start Frontend Client:**
-```bash
-cd ../frontend
-npm start # or npm run dev
-```
-
-Open `http://localhost:3000` in your web browser to interact with your instance.
-
----
-
-## 🌟 Core Features & Developer Highlights
-* 🌐 **Full RTL Support:** Native alignment adjustments optimized specifically for Persian language UI rendering.
-* ⚡ **Instant Messaging:** Dynamic updates without triggering standard webpage refreshes.
-* 🔒 **Secure Sessions:** Ready for JSON Web Tokens (JWT) implementation to protect private communication corridors.
-* 💾 **Persistent Chat Logs:** Robust database integration preventing history data loss on server restarts.
+سپس در مرورگر آدرس `http://localhost:3000` را باز کنید.
+برای دسترسی به پنل مدیریت نیز می‌توانید به مسیر `/panel-Tk_tokyo` مراجعه نمایید.

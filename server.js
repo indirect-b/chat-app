@@ -202,6 +202,32 @@ app.post('/api/register', async (req, res) => {
   res.json({ ok: true, username: key });
 });
 
+app.post('/api/quick-login', async (req, res) => {
+  let { username } = req.body;
+  if (!username) username = 'کاربر_۱';
+  const key = String(username).toLowerCase().replace('@', '').trim();
+  if (!key) return res.json({ ok: false, msg: 'نام کاربری نامعتبر است' });
+
+  // ایجاد کاربر در صورت عدم وجود
+  const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [key]);
+  if (!rows.length) {
+    await pool.query('INSERT INTO users (username, bale_chat_id, joined_at) VALUES ($1, $2, $3)', [key, null, new Date().toISOString()]);
+  }
+
+  // ثبت مخاطب پیش‌فرض برای کاربر_۱ و کاربر_۲ جهت تست فوری چت دوطرفه
+  if (key === 'کاربر_۱' || key === 'کاربر_۲') {
+    const other = key === 'کاربر_۱' ? 'کاربر_۲' : 'کاربر_۱';
+    const { rows: otherRows } = await pool.query('SELECT username FROM users WHERE username = $1', [other]);
+    if (!otherRows.length) {
+      await pool.query('INSERT INTO users (username, bale_chat_id, joined_at) VALUES ($1, $2, $3)', [other, null, new Date().toISOString()]);
+    }
+    await pool.query('INSERT INTO contacts (username, contact) VALUES ($1, $2) ON CONFLICT DO NOTHING', [key, other]);
+    await pool.query('INSERT INTO contacts (username, contact) VALUES ($1, $2) ON CONFLICT DO NOTHING', [other, key]);
+  }
+
+  res.json({ ok: true, username: key });
+});
+
 // ===== USER =====
 app.get('/api/user/:username', async (req, res) => {
   const { rows } = await pool.query('SELECT username, avatar, bio, status FROM users WHERE username = $1', [req.params.username]);
