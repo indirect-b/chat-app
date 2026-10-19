@@ -1,0 +1,63 @@
+{
+  "users": [
+    [
+      "کاربر_۱",
+      {
+        "username": "کاربر_۱",
+        "bale_chat_id": null,
+        "avatar": null,
+        "bio": "",
+        "status": "online",
+        "joined_at": "2026-10-19T07:26:28.804Z",
+        "is_blocked": 0,
+        "block_reason": null,
+        "block_type": null,
+        "block_until": null,
+        "last_seen": "2026-10-19T07:26:28.805Z"
+      }
+    ],
+    [
+      "کاربر_۲",
+      {
+        "username": "کاربر_۲",
+        "bale_chat_id": null,
+        "avatar": null,
+        "bio": "",
+        "status": "online",
+        "joined_at": "2026-10-19T07:26:28.805Z",
+        "is_blocked": 0,
+        "block_reason": null,
+        "block_type": null,
+        "block_until": null,
+        "last_seen": "2026-10-19T07:26:28.805Z"
+      }
+    ]
+  ],
+  "contacts": [
+    {
+      "username": "کاربر_۱",
+      "contact": "کاربر_۲"
+    },
+    {
+      "username": "کاربر_۲",
+      "contact": "کاربر_۱"
+    }
+  ],
+  "messages": [],
+  "groups": [],
+  "reports": [],
+  "settings": [
+    [
+      "server_mode",
+      "normal"
+    ],
+    [
+      "maintenance_msg",
+      "سرور در حال به‌روزرسانی است. لطفاً بعداً مراجعه کنید."
+    ],
+    [
+      "rules",
+      "قوانین پیام‌رسان:\n\n۱. احترام به دیگران\n۲. عدم ارسال محتوای نامناسب\n۳. عدم اسپم"
+    ]
+  ]
+}

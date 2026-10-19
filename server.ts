@@ -1,103 +1,105 @@
-// بارگذاری .env برای محیط لوکال (در Render خودکار مدیریت می‌شود)
-if (process.env.NODE_ENV !== 'production') {
-  require('dotenv').config();
-}
-
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const path = require('path');
-const { v4: uuidv4 } = require('uuid');
-const multer = require('multer');
-const fs = require('fs');
-const config = require('./config');
-const bale = require('./bale');
-const { pool, init } = require('./db');
+import 'dotenv/config';
+import express, { Request, Response } from 'express';
+import http from 'http';
+import { Server as SocketIOServer } from 'socket.io';
+import path from 'path';
+import fs from 'fs';
+import { v4 as uuidv4 } from 'uuid';
+import multer from 'multer';
+import { config } from './src/server/config';
+import * as bale from './src/server/bale';
+import { pool, init } from './src/server/db';
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new SocketIOServer(server);
 
-app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
-// ===== آپلود فایل =====
-const uploadsDir = path.join(__dirname, 'public/uploads');
+// آپلود فایل
+const uploadsDir = path.join(process.cwd(), 'public/uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
+app.use('/uploads', express.static(uploadsDir));
+
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadsDir),
-  filename: (req, file, cb) => cb(null, uuidv4() + path.extname(file.originalname))
+  destination: (_req, _file, cb) => cb(null, uploadsDir),
+  filename: (_req, file, cb) => cb(null, uuidv4() + path.extname(file.originalname)),
 });
 const upload = multer({ storage, limits: { fileSize: config.MAX_FILE_SIZE } });
 
-// ===== متغیرهای درون‌حافظه‌ای =====
-let otps = {};                  // baleId -> { code, expire }
-let onlineSockets = {};         // socketId -> username
-let usernameToSocket = {};      // username -> socketId (سرعت جستجوی O(1))
-let adminTokens = {};           // token -> { username, expire } لینک‌های ورود موقت ادمین
+// متغیرهای درون‌حافظه‌ای نشست‌های زنده
+const otps: Record<string, any> = {};
+const onlineSockets: Record<string, string> = {};
+const usernameToSocket: Record<string, string> = {};
+const adminTokens: Record<string, { username: string; expire: number; adminAt: number }> = {};
 
-// ===== Helper Functions =====
-async function getSetting(key) {
+async function getSetting(key: string): Promise<string | null> {
   const { rows } = await pool.query('SELECT value FROM settings WHERE key = $1', [key]);
   return rows.length ? rows[0].value : null;
 }
 
-async function setSetting(key, value) {
-  await pool.query('INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2', [key, value]);
+async function setSetting(key: string, value: string): Promise<void> {
+  await pool.query(
+    'INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2',
+    [key, value]
+  );
 }
 
-function isAdmin(req) {
+function isAdmin(req: Request): boolean {
   return req.headers['x-admin-token'] === config.ADMIN_PASSWORD;
 }
 
-function getRoomId(u1, u2) {
+function getRoomId(u1: string, u2: string): string {
   return [u1, u2].sort().join('__');
 }
 
-function generateOTP() {
+function generateOTP(): string {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-async function isUserBlocked(username) {
-  const { rows } = await pool.query('SELECT is_blocked, block_type, block_until FROM users WHERE username = $1', [username]);
+async function isUserBlocked(username: string): Promise<boolean> {
+  const { rows } = await pool.query(
+    'SELECT is_blocked, block_type, block_until FROM users WHERE username = $1',
+    [username]
+  );
   const user = rows[0];
   if (!user || !user.is_blocked) return false;
   if (user.block_type === 'permanent') return true;
   if (user.block_type === 'temporary' && user.block_until) {
     if (new Date(user.block_until) > new Date()) return true;
-    // منقضی شده - رفع مسدودیت
-    await pool.query('UPDATE users SET is_blocked=0, block_type=NULL, block_until=NULL WHERE username=$1', [username]);
+    await pool.query(
+      'UPDATE users SET is_blocked=0, block_type=NULL, block_until=NULL WHERE username=$1',
+      [username]
+    );
     return false;
   }
   return false;
 }
 
-// ثبت ورود/خروج کاربر آنلاین
-function setOnline(socketId, username) {
+function setOnline(socketId: string, username: string): void {
   onlineSockets[socketId] = username;
   usernameToSocket[username] = socketId;
 }
 
-function setOffline(socketId) {
+function setOffline(socketId: string): string | undefined {
   const username = onlineSockets[socketId];
   delete onlineSockets[socketId];
-  // فقط اگر این سوکت، سوکت فعلی کاربر بود (جلوگیری از overwrite چندتبی)
   if (username && usernameToSocket[username] === socketId) {
     delete usernameToSocket[username];
   }
   return username;
 }
 
-function getSocketIdByUsername(username) {
+function getSocketIdByUsername(username: string): string | undefined {
   return usernameToSocket[username];
 }
 
-function parseMsg(m) {
+function parseMsg(m: any) {
   return {
     ...m,
-    reactions: JSON.parse(m.reactions || '{}'),
+    reactions: typeof m.reactions === 'string' ? JSON.parse(m.reactions || '{}') : m.reactions || {},
     is_edited: !!m.is_edited,
     is_deleted: !!m.is_deleted,
     is_pinned: !!m.is_pinned,
@@ -108,7 +110,7 @@ function parseMsg(m) {
 // ===== Bale Bot Polling =====
 let baleOffset = 0;
 
-async function startBalePolling() {
+async function startBalePolling(): Promise<void> {
   if (!config.BALE_BOT_TOKEN) {
     console.log('⚠️ توکن بله ست نشده - polling غیرفعال است');
     return;
@@ -121,18 +123,18 @@ async function startBalePolling() {
         baleOffset = update.update_id + 1;
         await handleBaleUpdate(update);
       }
-    } catch (e) {
+    } catch (e: any) {
       console.error('❌ خطای polling بله:', e.message);
     }
     await new Promise(r => setTimeout(r, 1000));
   }
 }
 
-async function handleBaleUpdate(update) {
+async function handleBaleUpdate(update: bale.BaleUpdate): Promise<void> {
   const msg = update.message;
   if (!msg || !msg.text) return;
   const chatId = msg.chat.id;
-  const baleId = msg.from.username || String(msg.from.id);
+  const baleId = (msg.from.username || String(msg.from.id)).toLowerCase();
   otps[`__chatid__${baleId}`] = chatId;
 
   if (msg.text === '/start') {
@@ -140,12 +142,15 @@ async function handleBaleUpdate(update) {
     return;
   }
   if (otps[baleId]) {
-    await bale.sendMessage(chatId, `🔐 کد تأیید:\n\n${otps[baleId].code}\n\n⏱ ${config.OTP_EXPIRE} ثانیه معتبر است.`);
+    await bale.sendMessage(
+      chatId,
+      `🔐 کد تأیید:\n\n${otps[baleId].code}\n\n⏱ ${config.OTP_EXPIRE} ثانیه معتبر است.`
+    );
   }
 }
 
 // ===== FILE UPLOAD =====
-app.post('/api/upload', upload.single('file'), (req, res) => {
+app.post('/api/upload', upload.single('file'), (req: Request, res: Response) => {
   if (!req.file) return res.json({ ok: false, msg: 'فایل آپلود نشد' });
   const fileUrl = '/uploads/' + req.file.filename;
   const ext = path.extname(req.file.originalname).toLowerCase();
@@ -157,10 +162,10 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
 });
 
 // ===== AUTH =====
-app.post('/api/send-otp', async (req, res) => {
+app.post('/api/send-otp', async (req: Request, res: Response) => {
   const { baleId } = req.body;
   if (!baleId) return res.json({ ok: false, msg: 'آیدی بله رو وارد کن' });
-  const key = baleId.toLowerCase().replace('@', '');
+  const key = String(baleId).toLowerCase().replace('@', '').trim();
   const code = generateOTP();
   otps[key] = { code, expire: Date.now() + config.OTP_EXPIRE * 1000 };
 
@@ -178,12 +183,15 @@ app.post('/api/send-otp', async (req, res) => {
   }
 });
 
-app.post('/api/verify-otp', async (req, res) => {
+app.post('/api/verify-otp', async (req: Request, res: Response) => {
   const { baleId, code } = req.body;
-  const key = baleId.toLowerCase().replace('@', '');
+  const key = String(baleId || '').toLowerCase().replace('@', '').trim();
   const otp = otps[key];
   if (!otp) return res.json({ ok: false, msg: 'ابتدا کد درخواست کن' });
-  if (Date.now() > otp.expire) { delete otps[key]; return res.json({ ok: false, msg: 'کد منقضی شده' }); }
+  if (Date.now() > otp.expire) {
+    delete otps[key];
+    return res.json({ ok: false, msg: 'کد منقضی شده' });
+  }
   if (otp.code !== code) return res.json({ ok: false, msg: 'کد اشتباه است' });
   delete otps[key];
 
@@ -191,86 +199,123 @@ app.post('/api/verify-otp', async (req, res) => {
   res.json({ ok: true, isNew: rows.length === 0, username: key });
 });
 
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', async (req: Request, res: Response) => {
   const { baleId } = req.body;
-  const key = baleId.toLowerCase().replace('@', '');
+  const key = String(baleId || '').toLowerCase().replace('@', '').trim();
   const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [key]);
   if (rows.length) return res.json({ ok: false, msg: 'این حساب قبلاً ثبت‌نام کرده' });
 
   const chatId = otps[`__chatid__${key}`] || null;
-  await pool.query('INSERT INTO users (username, bale_chat_id, joined_at) VALUES ($1, $2, $3)', [key, chatId, new Date().toISOString()]);
+  await pool.query('INSERT INTO users (username, bale_chat_id, joined_at) VALUES ($1, $2, $3)', [
+    key,
+    chatId,
+    new Date().toISOString(),
+  ]);
   res.json({ ok: true, username: key });
 });
 
-app.post('/api/quick-login', async (req, res) => {
+app.post('/api/quick-login', async (req: Request, res: Response) => {
   let { username } = req.body;
   if (!username) username = 'کاربر_۱';
   const key = String(username).toLowerCase().replace('@', '').trim();
   if (!key) return res.json({ ok: false, msg: 'نام کاربری نامعتبر است' });
 
-  // ایجاد کاربر در صورت عدم وجود
   const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [key]);
   if (!rows.length) {
-    await pool.query('INSERT INTO users (username, bale_chat_id, joined_at) VALUES ($1, $2, $3)', [key, null, new Date().toISOString()]);
+    await pool.query('INSERT INTO users (username, bale_chat_id, joined_at) VALUES ($1, $2, $3)', [
+      key,
+      null,
+      new Date().toISOString(),
+    ]);
   }
 
-  // ثبت مخاطب پیش‌فرض برای کاربر_۱ و کاربر_۲ جهت تست فوری چت دوطرفه
   if (key === 'کاربر_۱' || key === 'کاربر_۲') {
     const other = key === 'کاربر_۱' ? 'کاربر_۲' : 'کاربر_۱';
     const { rows: otherRows } = await pool.query('SELECT username FROM users WHERE username = $1', [other]);
     if (!otherRows.length) {
-      await pool.query('INSERT INTO users (username, bale_chat_id, joined_at) VALUES ($1, $2, $3)', [other, null, new Date().toISOString()]);
+      await pool.query('INSERT INTO users (username, bale_chat_id, joined_at) VALUES ($1, $2, $3)', [
+        other,
+        null,
+        new Date().toISOString(),
+      ]);
     }
-    await pool.query('INSERT INTO contacts (username, contact) VALUES ($1, $2) ON CONFLICT DO NOTHING', [key, other]);
-    await pool.query('INSERT INTO contacts (username, contact) VALUES ($1, $2) ON CONFLICT DO NOTHING', [other, key]);
+    await pool.query('INSERT INTO contacts (username, contact) VALUES ($1, $2) ON CONFLICT DO NOTHING', [
+      key,
+      other,
+    ]);
+    await pool.query('INSERT INTO contacts (username, contact) VALUES ($1, $2) ON CONFLICT DO NOTHING', [
+      other,
+      key,
+    ]);
   }
 
   res.json({ ok: true, username: key });
 });
 
 // ===== USER =====
-app.get('/api/user/:username', async (req, res) => {
-  const { rows } = await pool.query('SELECT username, avatar, bio, status FROM users WHERE username = $1', [req.params.username]);
+app.get('/api/user/:username', async (req: Request, res: Response) => {
+  const { rows } = await pool.query('SELECT username, avatar, bio, status FROM users WHERE username = $1', [
+    req.params.username,
+  ]);
   if (!rows.length) return res.json({ ok: false });
   res.json({ ok: true, user: rows[0] });
 });
 
-app.post('/api/user/update', async (req, res) => {
+app.post('/api/user/update', async (req: Request, res: Response) => {
   const { username, bio, status, avatar } = req.body;
-  await pool.query('UPDATE users SET bio=$1, status=$2, avatar=$3 WHERE username=$4', [bio || '', status || 'online', avatar || null, username]);
+  await pool.query('UPDATE users SET bio=$1, status=$2, avatar=$3 WHERE username=$4', [
+    bio || '',
+    status || 'online',
+    avatar || null,
+    username,
+  ]);
   res.json({ ok: true });
 });
 
-app.post('/api/add-contact', async (req, res) => {
+app.post('/api/add-contact', async (req: Request, res: Response) => {
   const { myUsername, contactUsername } = req.body;
   const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [contactUsername]);
   if (!rows.length) return res.json({ ok: false, msg: 'این آیدی وجود ندارد' });
-  if (myUsername === contactUsername) return res.json({ ok: false, msg: 'نمیتونی خودت رو اضافه کنی' });
-  await pool.query('INSERT INTO contacts (username, contact) VALUES ($1, $2) ON CONFLICT DO NOTHING', [myUsername, contactUsername]);
+  if (myUsername === contactUsername) return res.json({ ok: false, msg: 'نمی‌تونی خودت رو اضافه کنی' });
+  await pool.query('INSERT INTO contacts (username, contact) VALUES ($1, $2) ON CONFLICT DO NOTHING', [
+    myUsername,
+    contactUsername,
+  ]);
   res.json({ ok: true });
 });
 
-app.get('/api/contacts/:username', async (req, res) => {
+app.get('/api/contacts/:username', async (req: Request, res: Response) => {
   const { rows } = await pool.query(
     'SELECT c.contact, u.avatar, u.status FROM contacts c JOIN users u ON c.contact = u.username WHERE c.username = $1',
     [req.params.username]
   );
-  res.json({ ok: true, contacts: rows.map(r => ({ username: r.contact, avatar: r.avatar, status: r.status })) });
+  res.json({
+    ok: true,
+    contacts: rows.map((r: any) => ({
+      username: r.contact,
+      avatar: r.avatar,
+      status: r.status,
+      online: !!getSocketIdByUsername(r.contact),
+    })),
+  });
 });
 
-app.get('/api/messages/:roomId', async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM messages WHERE room_id = $1 AND is_deleted = 0 ORDER BY timestamp ASC', [req.params.roomId]);
+app.get('/api/messages/:roomId', async (req: Request, res: Response) => {
+  const { rows } = await pool.query(
+    'SELECT * FROM messages WHERE room_id = $1 AND is_deleted = 0 ORDER BY timestamp ASC',
+    [req.params.roomId]
+  );
   res.json({ ok: true, messages: rows.map(parseMsg) });
 });
 
-app.get('/api/groups/:username', async (req, res) => {
+app.get('/api/groups/:username', async (req: Request, res: Response) => {
   const { rows } = await pool.query('SELECT * FROM groups');
-  const myGroups = rows.filter(g => JSON.parse(g.members).includes(req.params.username));
-  res.json({ ok: true, groups: myGroups.map(g => ({ ...g, members: JSON.parse(g.members) })) });
+  const myGroups = rows.filter((g: any) => JSON.parse(g.members).includes(req.params.username));
+  res.json({ ok: true, groups: myGroups.map((g: any) => ({ ...g, members: JSON.parse(g.members) })) });
 });
 
 // ===== REPORT =====
-app.post('/api/report', async (req, res) => {
+app.post('/api/report', async (req: Request, res: Response) => {
   const { reporter, reportedUser, messageId, messageText, reason } = req.body;
   await pool.query(
     'INSERT INTO reports (id, reporter, reported_user, message_id, message_text, reason, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)',
@@ -280,48 +325,55 @@ app.post('/api/report', async (req, res) => {
 });
 
 // ===== SETTINGS =====
-app.get('/api/settings/rules', async (req, res) => {
+app.get('/api/settings/rules', async (_req: Request, res: Response) => {
   res.json({ ok: true, rules: await getSetting('rules') });
 });
 
-app.get('/api/settings/mode', async (req, res) => {
-  res.json({ ok: true, mode: await getSetting('server_mode'), msg: await getSetting('maintenance_msg') });
+app.get('/api/settings/mode', async (_req: Request, res: Response) => {
+  res.json({
+    ok: true,
+    mode: await getSetting('server_mode'),
+    msg: await getSetting('maintenance_msg'),
+  });
 });
 
 // ===== ADMIN =====
-app.post('/api/admin/login', (req, res) => {
+app.post('/api/admin/login', (req: Request, res: Response) => {
   res.json({ ok: req.body.password === config.ADMIN_PASSWORD });
 });
 
-app.get('/api/admin/users', async (req, res) => {
+app.get('/api/admin/users', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { rows } = await pool.query('SELECT * FROM users ORDER BY joined_at DESC');
   res.json({ ok: true, users: rows });
 });
 
-app.get('/api/admin/reports', async (req, res) => {
+app.get('/api/admin/reports', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { rows } = await pool.query('SELECT * FROM reports ORDER BY created_at DESC');
   res.json({ ok: true, reports: rows });
 });
 
-app.post('/api/admin/report-action', async (req, res) => {
+app.post('/api/admin/report-action', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { reportId, status } = req.body;
   await pool.query('UPDATE reports SET status = $1 WHERE id = $2', [status, reportId]);
   res.json({ ok: true });
 });
 
-app.post('/api/admin/block', async (req, res) => {
+app.post('/api/admin/block', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { username, reason, blockType, blockUntil } = req.body;
-  await pool.query('UPDATE users SET is_blocked=1, block_reason=$1, block_type=$2, block_until=$3 WHERE username=$4', [reason || '', blockType || 'permanent', blockUntil || null, username]);
+  await pool.query(
+    'UPDATE users SET is_blocked=1, block_reason=$1, block_type=$2, block_until=$3 WHERE username=$4',
+    [reason || '', blockType || 'permanent', blockUntil || null, username]
+  );
 
   const { rows } = await pool.query('SELECT bale_chat_id FROM users WHERE username = $1', [username]);
   const user = rows[0];
   const sockId = getSocketIdByUsername(username);
   if (sockId) {
-    io.to(sockId).emit('blocked', { reason, blockType, blockUntil });
+    io.to(sockId).emit('blocked', { block_reason: reason, block_type: blockType, block_until: blockUntil });
     const s = io.sockets.sockets.get(sockId);
     if (s) s.disconnect(true);
   }
@@ -339,10 +391,13 @@ app.post('/api/admin/block', async (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/admin/unblock', async (req, res) => {
+app.post('/api/admin/unblock', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { username } = req.body;
-  await pool.query('UPDATE users SET is_blocked=0, block_reason=NULL, block_type=NULL, block_until=NULL WHERE username=$1', [username]);
+  await pool.query(
+    'UPDATE users SET is_blocked=0, block_reason=NULL, block_type=NULL, block_until=NULL WHERE username=$1',
+    [username]
+  );
 
   const { rows } = await pool.query('SELECT bale_chat_id FROM users WHERE username = $1', [username]);
   const user = rows[0];
@@ -352,7 +407,7 @@ app.post('/api/admin/unblock', async (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/admin/kick', (req, res) => {
+app.post('/api/admin/kick', (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { username } = req.body;
   const sockId = getSocketIdByUsername(username);
@@ -364,7 +419,7 @@ app.post('/api/admin/kick', (req, res) => {
   res.json({ ok: true });
 });
 
-app.delete('/api/admin/message', async (req, res) => {
+app.delete('/api/admin/message', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { roomId, msgId } = req.body;
   await pool.query('UPDATE messages SET is_deleted=1 WHERE id=$1', [msgId]);
@@ -372,25 +427,30 @@ app.delete('/api/admin/message', async (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/admin/create-group', async (req, res) => {
+app.post('/api/admin/create-group', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { name, members } = req.body;
   const groupId = uuidv4();
-  await pool.query('INSERT INTO groups (id, name, members, created_at) VALUES ($1,$2,$3,$4)', [groupId, name, JSON.stringify(members), new Date().toISOString()]);
-  members.forEach(m => {
+  await pool.query('INSERT INTO groups (id, name, members, created_at) VALUES ($1,$2,$3,$4)', [
+    groupId,
+    name,
+    JSON.stringify(members),
+    new Date().toISOString(),
+  ]);
+  (members as string[]).forEach(m => {
     const sockId = getSocketIdByUsername(m);
     if (sockId) io.to(sockId).emit('new-group', { id: groupId, name, members });
   });
   res.json({ ok: true, groupId });
 });
 
-app.post('/api/admin/add-to-group', async (req, res) => {
+app.post('/api/admin/add-to-group', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { groupId, username } = req.body;
   const { rows } = await pool.query('SELECT * FROM groups WHERE id = $1', [groupId]);
   if (!rows.length) return res.json({ ok: false, msg: 'گروه یافت نشد' });
   const group = rows[0];
-  const members = JSON.parse(group.members);
+  const members: string[] = JSON.parse(group.members);
   if (!members.includes(username)) members.push(username);
   await pool.query('UPDATE groups SET members = $1 WHERE id = $2', [JSON.stringify(members), groupId]);
   const sockId = getSocketIdByUsername(username);
@@ -398,24 +458,24 @@ app.post('/api/admin/add-to-group', async (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/admin/groups', async (req, res) => {
+app.get('/api/admin/groups', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { rows } = await pool.query('SELECT * FROM groups');
-  res.json({ ok: true, groups: rows.map(g => ({ ...g, members: JSON.parse(g.members) })) });
+  res.json({ ok: true, groups: rows.map((g: any) => ({ ...g, members: JSON.parse(g.members) })) });
 });
 
-app.get('/api/admin/messages', async (req, res) => {
+app.get('/api/admin/messages', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { rows } = await pool.query('SELECT * FROM messages WHERE is_deleted=0 ORDER BY timestamp DESC LIMIT 500');
-  const grouped = {};
-  rows.forEach(m => {
+  const grouped: Record<string, any[]> = {};
+  rows.forEach((m: any) => {
     if (!grouped[m.room_id]) grouped[m.room_id] = [];
     grouped[m.room_id].push(parseMsg(m));
   });
   res.json({ ok: true, messages: grouped });
 });
 
-app.get('/api/admin/stats', async (req, res) => {
+app.get('/api/admin/stats', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const totalUsers = (await pool.query('SELECT COUNT(*) as c FROM users')).rows[0].c;
   const onlineUsers = Object.keys(onlineSockets).length;
@@ -423,20 +483,34 @@ app.get('/api/admin/stats', async (req, res) => {
   const totalGroups = (await pool.query('SELECT COUNT(*) as c FROM groups')).rows[0].c;
   const pendingReports = (await pool.query("SELECT COUNT(*) as c FROM reports WHERE status='pending'")).rows[0].c;
 
-  // آمار روزانه (۷ روز اخیر)
-  const daily = [];
+  const daily: { date: string; count: number }[] = [];
   for (let i = 6; i >= 0; i--) {
     const d = new Date();
     d.setDate(d.getDate() - i);
     const dateStr = d.toISOString().split('T')[0];
-    const count = (await pool.query("SELECT COUNT(*) as c FROM messages WHERE to_char(to_timestamp(timestamp/1000) AT TIME ZONE 'UTC', 'YYYY-MM-DD') = $1", [dateStr])).rows[0].c;
-    daily.push({ date: dateStr, count: parseInt(count) });
+    const count = (
+      await pool.query(
+        "SELECT COUNT(*) as c FROM messages WHERE to_char(to_timestamp(timestamp/1000) AT TIME ZONE 'UTC', 'YYYY-MM-DD') = $1",
+        [dateStr]
+      )
+    ).rows[0].c;
+    daily.push({ date: dateStr, count: parseInt(String(count), 10) });
   }
 
-  res.json({ ok: true, stats: { totalUsers: parseInt(totalUsers), onlineUsers, totalMessages: parseInt(totalMessages), totalGroups: parseInt(totalGroups), pendingReports: parseInt(pendingReports), daily } });
+  res.json({
+    ok: true,
+    stats: {
+      totalUsers: parseInt(String(totalUsers), 10),
+      onlineUsers,
+      totalMessages: parseInt(String(totalMessages), 10),
+      totalGroups: parseInt(String(totalGroups), 10),
+      pendingReports: parseInt(String(pendingReports), 10),
+      daily,
+    },
+  });
 });
 
-app.post('/api/admin/announce', async (req, res) => {
+app.post('/api/admin/announce', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { text, imageUrl } = req.body;
   if (!text) return res.json({ ok: false, msg: 'متن رو وارد کن' });
@@ -450,79 +524,75 @@ app.post('/api/admin/announce', async (req, res) => {
   res.json({ ok: true, sent: rows.length });
 });
 
-app.post('/api/admin/set-mode', async (req, res) => {
+app.post('/api/admin/set-mode', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { mode, msg } = req.body;
   await setSetting('server_mode', mode);
   if (msg) await setSetting('maintenance_msg', msg);
-  if (mode === 'maintenance') io.emit('server-maintenance', { msg: msg || await getSetting('maintenance_msg') });
+  if (mode === 'maintenance') io.emit('server-maintenance', { msg: msg || (await getSetting('maintenance_msg')) });
   else if (mode === 'normal') io.emit('server-normal');
   res.json({ ok: true });
 });
 
-app.post('/api/admin/set-rules', async (req, res) => {
+app.post('/api/admin/set-rules', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   await setSetting('rules', req.body.rules || '');
   res.json({ ok: true });
 });
 
-// ===== Admin: ورود به حساب کاربر با لینک موقت =====
-app.post('/api/admin/login-as', (req, res) => {
+app.post('/api/admin/login-as', (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { username } = req.body;
   if (!username) return res.json({ ok: false, msg: 'آیدی کاربر رو وارد کن' });
 
-  // ساختن توکن تصادفی
   const token = uuidv4();
   adminTokens[token] = {
-    username: username,
-    expire: Date.now() + 30000, // ۳۰ ثانیه
-    adminAt: Date.now()
+    username,
+    expire: Date.now() + 30000,
+    adminAt: Date.now(),
   };
 
   res.json({ ok: true, token, url: `/api/admin-login-as/${token}` });
 });
 
-// مصرف توکن ورود موقت
-app.get('/api/admin-login-as/:token', async (req, res) => {
+app.get('/api/admin-login-as/:token', async (req: Request, res: Response) => {
   const token = req.params.token;
   const data = adminTokens[token];
 
-  if (!data) {
-    return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>لینک منقضی</title></head><body style="font-family:Vazirmatn,sans-serif;direction:rtl;text-align:center;padding:60px"><div style="font-size:60px">⏱️</div><h1>لینک منقضی شده</h1><p>این لینک دیگر معتبر نیست.</p></body></html>`);
+  if (!data || Date.now() > data.expire) {
+    if (data) delete adminTokens[token];
+    return res.send(
+      `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>لینک منقضی</title></head><body style="font-family:Vazirmatn,sans-serif;direction:rtl;text-align:center;padding:60px"><div style="font-size:60px">⏱️</div><h1>لینک منقضی شده</h1><p>این لینک دیگر معتبر نیست.</p></body></html>`
+    );
   }
 
-  // بررسی انقضا
-  if (Date.now() > data.expire) {
-    delete adminTokens[token];
-    return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>لینک منقضی</title></head><body style="font-family:Vazirmatn,sans-serif;direction:rtl;text-align:center;padding:60px"><div style="font-size:60px">⏱️</div><h1>لینک منقضی شده</h1><p>۳۰ ثانیه گذشته و لینک دیگر معتبر نیست.</p></body></html>`);
-  }
-
-  // بررسی کاربر
   const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [data.username]);
+  delete adminTokens[token];
   if (!rows.length) {
-    delete adminTokens[token];
-    return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>کاربر یافت نشد</title></head><body style="font-family:Vazirmatn,sans-serif;direction:rtl;text-align:center;padding:60px"><div style="font-size:60px">❌</div><h1>کاربر یافت نشد</h1><p>کاربر "${data.username}" وجود ندارد.</p></body></html>`);
+    return res.send(
+      `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>کاربر یافت نشد</title></head><body style="font-family:Vazirmatn,sans-serif;direction:rtl;text-align:center;padding:60px"><div style="font-size:60px">❌</div><h1>کاربر یافت نشد</h1><p>کاربر "${data.username}" وجود ندارد.</p></body></html>`
+    );
   }
 
-  // مصرف توکن (یکبار مصرف)
-  delete adminTokens[token];
-
-  // ریدایرکت به صفحه اصلی با توکن ورود
-  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>ورود موقت ادمین</title></head><body style="margin:0"><script>window.opener ? window.close() : (location.href='/'); sessionStorage.setItem('adminLoginToken','${data.username}');</script></body></html>`);
+  res.send(
+    `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>ورود موقت ادمین</title></head><body style="margin:0"><script>sessionStorage.setItem('adminLoginToken','${data.username}'); location.href='/';</script></body></html>`
+  );
 });
 
-app.get(config.ADMIN_PATH, (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
+app.get(config.ADMIN_PATH, (_req: Request, res: Response) => {
+  res.sendFile(path.join(process.cwd(), 'public', 'admin.html'));
 });
 
 // ===== SOCKET.IO =====
 io.on('connection', (socket) => {
-  let currentUser = null;
+  let currentUser: string | null = null;
 
-  socket.on('auth', async (username) => {
+  socket.on('auth', async (username: string) => {
     if (await isUserBlocked(username)) {
-      const { rows } = await pool.query('SELECT block_reason, block_type, block_until FROM users WHERE username=$1', [username]);
+      const { rows } = await pool.query(
+        'SELECT block_reason, block_type, block_until FROM users WHERE username=$1',
+        [username]
+      );
       socket.emit('blocked', rows[0] || {});
       return;
     }
@@ -533,7 +603,7 @@ io.on('connection', (socket) => {
     await pool.query('UPDATE users SET last_seen=$1 WHERE username=$2', [new Date().toISOString(), username]);
 
     const { rows: contacts } = await pool.query('SELECT contact FROM contacts WHERE username=$1', [username]);
-    contacts.forEach(({ contact }) => {
+    contacts.forEach(({ contact }: any) => {
       const sockId = getSocketIdByUsername(contact);
       if (sockId) io.to(sockId).emit('contact-online', username);
     });
@@ -541,18 +611,22 @@ io.on('connection', (socket) => {
     socket.emit('auth-ok');
   });
 
-  socket.on('update-location', (loc) => {
-    // نگه‌داری لوکیشن غیرفعال شد (geoip حذف شد) - فقط last_seen آپدیت میشه
-    if (currentUser) pool.query('UPDATE users SET last_seen=$1 WHERE username=$2', [new Date().toISOString(), currentUser]);
+  socket.on('update-location', () => {
+    if (currentUser) {
+      pool.query('UPDATE users SET last_seen=$1 WHERE username=$2', [new Date().toISOString(), currentUser]);
+    }
   });
 
-  socket.on('send-message', async (data) => {
+  socket.on('send-message', async (data: any) => {
     if (!currentUser) return;
     const { to, text, fileUrl, fileType, replyToId, replyToText, isGroup, disappearAfter } = data;
     const roomId = isGroup ? `group__${to}` : getRoomId(currentUser, to);
 
     if (!isGroup) {
-      const { rows } = await pool.query('SELECT 1 FROM contacts WHERE username=$1 AND contact=$2', [currentUser, to]);
+      const { rows } = await pool.query('SELECT 1 FROM contacts WHERE username=$1 AND contact=$2', [
+        currentUser,
+        to,
+      ]);
       if (!rows.length) return;
     }
 
@@ -574,12 +648,29 @@ io.on('connection', (socket) => {
       is_read: 0,
       disappear_at: disappearAt,
       time: new Date().toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' }),
-      timestamp: Date.now()
+      timestamp: Date.now(),
     };
 
     await pool.query(
       'INSERT INTO messages (id,room_id,sender,text,file_url,file_type,reply_to_id,reply_to_text,reactions,is_edited,is_deleted,is_pinned,is_read,disappear_at,time,timestamp) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)',
-      [msg.id, msg.room_id, msg.sender, msg.text, msg.file_url, msg.file_type, msg.reply_to_id, msg.reply_to_text, msg.reactions, msg.is_edited, msg.is_deleted, msg.is_pinned, msg.is_read, msg.disappear_at, msg.time, msg.timestamp]
+      [
+        msg.id,
+        msg.room_id,
+        msg.sender,
+        msg.text,
+        msg.file_url,
+        msg.file_type,
+        msg.reply_to_id,
+        msg.reply_to_text,
+        msg.reactions,
+        msg.is_edited,
+        msg.is_deleted,
+        msg.is_pinned,
+        msg.is_read,
+        msg.disappear_at,
+        msg.time,
+        msg.timestamp,
+      ]
     );
 
     const parsedMsg = parseMsg(msg);
@@ -587,7 +678,7 @@ io.on('connection', (socket) => {
     if (isGroup) {
       const { rows } = await pool.query('SELECT members FROM groups WHERE id=$1', [to]);
       if (rows.length) {
-        JSON.parse(rows[0].members).forEach(m => {
+        JSON.parse(rows[0].members).forEach((m: string) => {
           const sockId = getSocketIdByUsername(m);
           if (sockId) io.to(sockId).emit('new-message', { roomId, msg: parsedMsg });
         });
@@ -598,7 +689,6 @@ io.on('connection', (socket) => {
       if (sockId) io.to(sockId).emit('new-message', { roomId, msg: parsedMsg });
     }
 
-    // ناپدیدشونده
     if (disappearAt) {
       setTimeout(async () => {
         await pool.query('UPDATE messages SET is_deleted=1 WHERE id=$1', [msg.id]);
@@ -607,7 +697,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('edit-message', async ({ msgId, newText, roomId }) => {
+  socket.on('edit-message', async ({ msgId, newText, roomId }: any) => {
     if (!currentUser) return;
     const { rows } = await pool.query('SELECT * FROM messages WHERE id=$1 AND sender=$2', [msgId, currentUser]);
     if (!rows.length) return;
@@ -615,7 +705,7 @@ io.on('connection', (socket) => {
     io.emit('msg-edited', { roomId, msgId, newText });
   });
 
-  socket.on('delete-message', async ({ msgId, roomId }) => {
+  socket.on('delete-message', async ({ msgId, roomId }: any) => {
     if (!currentUser) return;
     const { rows } = await pool.query('SELECT * FROM messages WHERE id=$1 AND sender=$2', [msgId, currentUser]);
     if (!rows.length) return;
@@ -623,19 +713,18 @@ io.on('connection', (socket) => {
     io.emit('msg-deleted', { roomId, msgId });
   });
 
-  // 🐛 رفع باگ پین: حذف پین قبلی قبل از پین جدید
-  socket.on('pin-message', async ({ msgId, roomId }) => {
+  socket.on('pin-message', async ({ msgId, roomId }: any) => {
     if (!currentUser) return;
     await pool.query('UPDATE messages SET is_pinned=0 WHERE room_id=$1', [roomId]);
     await pool.query('UPDATE messages SET is_pinned=1 WHERE id=$1', [msgId]);
     io.emit('msg-pinned', { roomId, msgId });
   });
 
-  socket.on('react', async ({ msgId, roomId, emoji }) => {
+  socket.on('react', async ({ msgId, roomId, emoji }: any) => {
     if (!currentUser) return;
     const { rows } = await pool.query('SELECT reactions FROM messages WHERE id=$1', [msgId]);
     if (!rows.length) return;
-    const reactions = JSON.parse(rows[0].reactions || '{}');
+    const reactions: Record<string, string[]> = JSON.parse(rows[0].reactions || '{}');
     if (!reactions[emoji]) reactions[emoji] = [];
     const idx = reactions[emoji].indexOf(currentUser);
     if (idx === -1) reactions[emoji].push(currentUser);
@@ -645,8 +734,7 @@ io.on('connection', (socket) => {
     io.emit('msg-reaction', { roomId, msgId, reactions });
   });
 
-  // 🐛 رفع باگ فوروارد: فقط متن/فایل کپی میشه، فیلدهای وضعیت نه
-  socket.on('forward-message', async ({ msgId, toRooms }) => {
+  socket.on('forward-message', async ({ msgId, toRooms }: any) => {
     if (!currentUser) return;
     const { rows } = await pool.query('SELECT * FROM messages WHERE id=$1', [msgId]);
     if (!rows.length) return;
@@ -668,45 +756,63 @@ io.on('connection', (socket) => {
         is_read: 0,
         disappear_at: null,
         time: new Date().toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' }),
-        timestamp: Date.now()
+        timestamp: Date.now(),
       };
       await pool.query(
         'INSERT INTO messages (id,room_id,sender,text,file_url,file_type,reply_to_id,reply_to_text,reactions,is_edited,is_deleted,is_pinned,is_read,disappear_at,time,timestamp) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)',
-        [newMsg.id, newMsg.room_id, newMsg.sender, newMsg.text, newMsg.file_url, newMsg.file_type, newMsg.reply_to_id, newMsg.reply_to_text, newMsg.reactions, newMsg.is_edited, newMsg.is_deleted, newMsg.is_pinned, newMsg.is_read, newMsg.disappear_at, newMsg.time, newMsg.timestamp]
+        [
+          newMsg.id,
+          newMsg.room_id,
+          newMsg.sender,
+          newMsg.text,
+          newMsg.file_url,
+          newMsg.file_type,
+          newMsg.reply_to_id,
+          newMsg.reply_to_text,
+          newMsg.reactions,
+          newMsg.is_edited,
+          newMsg.is_deleted,
+          newMsg.is_pinned,
+          newMsg.is_read,
+          newMsg.disappear_at,
+          newMsg.time,
+          newMsg.timestamp,
+        ]
       );
       io.emit('new-message', { roomId, msg: parseMsg(newMsg) });
     }
   });
 
-  socket.on('typing', async ({ to, isGroup, isTyping }) => {
+  socket.on('typing', async ({ to, isGroup, isTyping }: any) => {
     if (!currentUser) return;
     const roomId = isGroup ? `group__${to}` : getRoomId(currentUser, to);
     if (isGroup) {
       const { rows } = await pool.query('SELECT members FROM groups WHERE id=$1', [to]);
-      if (rows.length) JSON.parse(rows[0].members).forEach(m => {
-        if (m !== currentUser) {
-          const sockId = getSocketIdByUsername(m);
-          if (sockId) io.to(sockId).emit('typing', { roomId, username: currentUser, isTyping });
-        }
-      });
+      if (rows.length) {
+        JSON.parse(rows[0].members).forEach((m: string) => {
+          if (m !== currentUser) {
+            const sockId = getSocketIdByUsername(m);
+            if (sockId) io.to(sockId).emit('typing', { roomId, username: currentUser, isTyping });
+          }
+        });
+      }
     } else {
       const sockId = getSocketIdByUsername(to);
       if (sockId) io.to(sockId).emit('typing', { roomId, username: currentUser, isTyping });
     }
   });
 
-  // 🐛 رفع باگ read: آپدیت is_read بجای is_deleted
-  socket.on('read', async ({ roomId, msgId }) => {
+  socket.on('read', async ({ roomId, msgId }: any) => {
     if (!msgId) return;
     await pool.query('UPDATE messages SET is_read=1 WHERE id=$1', [msgId]);
     io.emit('read', { roomId, msgId });
   });
 
-  socket.on('update-status', async (status) => {
+  socket.on('update-status', async (status: string) => {
     if (!currentUser) return;
     await pool.query('UPDATE users SET status=$1 WHERE username=$2', [status, currentUser]);
     const { rows: contacts } = await pool.query('SELECT contact FROM contacts WHERE username=$1', [currentUser]);
-    contacts.forEach(({ contact }) => {
+    contacts.forEach(({ contact }: any) => {
       const sockId = getSocketIdByUsername(contact);
       if (sockId) io.to(sockId).emit('contact-status', { username: currentUser, status });
     });
@@ -717,7 +823,7 @@ io.on('connection', (socket) => {
     if (username) {
       await pool.query('UPDATE users SET last_seen=$1 WHERE username=$2', [new Date().toISOString(), username]);
       const { rows: contacts } = await pool.query('SELECT contact FROM contacts WHERE username=$1', [username]);
-      contacts.forEach(({ contact }) => {
+      contacts.forEach(({ contact }: any) => {
         const sockId = getSocketIdByUsername(contact);
         if (sockId) io.to(sockId).emit('contact-offline', username);
       });
@@ -725,16 +831,34 @@ io.on('connection', (socket) => {
   });
 });
 
-// ===== START SERVER =====
-async function start() {
+// ===== START SERVER + VITE MIDDLEWARE =====
+async function start(): Promise<void> {
   try {
     await init();
-  } catch (e) {
+  } catch (e: any) {
     console.warn('⚠️ اخطار در آماده‌سازی اولیه دیتابیس:', e.message);
   }
 
+  const distPath = path.join(process.cwd(), 'dist');
+  const isProd = process.env.NODE_ENV === 'production' && fs.existsSync(distPath);
+
+  if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static(distPath));
+    app.use(express.static(path.join(process.cwd(), 'public')));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
   server.listen(config.PORT, '0.0.0.0', () => {
-    console.log(`✅ سرور روی پورت ${config.PORT}`);
+    console.log(`✅ سرور TypeScript + React روی پورت ${config.PORT}`);
     console.log(`🌐 http://localhost:${config.PORT}`);
     console.log(`🔐 پنل ادمین: http://localhost:${config.PORT}${config.ADMIN_PATH}`);
     startBalePolling();
