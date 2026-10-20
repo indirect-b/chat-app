@@ -1,187 +1,242 @@
-# 💬 Persian Real-Time Web Messenger (`chat-app` v6.0 — Post-Quantum & VOPRF Edition)
+<div align="center">
 
-An enterprise-grade, full-stack **Real-Time Web Messenger** engineered with **React 19**, **TypeScript**, **Vite**, **Express**, **Socket.IO**, and a **Post-Quantum Hybrid Cryptographic Engine (`ML-KEM-768` + `ECDH P-256` Ratchet + `AES-GCM 256-bit`)**, **Blinded Identity Authentication (`Ristretto255-VOPRF` RFC 9497)**, and an **Atomic Group Epoch State Machine (`Group Epoch FSM`)**. Designed for zero-downtime cloud deployments, it features a **Dual-Mode Database Engine** (**PostgreSQL** + **Non-Blocking Debounced Atomic Disk Fallback** in `data/database.json`), **Hybrid Cloud-Safe Media Persistence**, **Cluster-Ready Socket Presence**, and **Timing-Safe Security Hardening**.
+# 💬 chat-app — Post-Quantum Encrypted Web Messenger
 
----
+**A real-time Persian web messenger with end-to-end encryption built for the post-quantum era.**
 
-## 🌟 Core Features & Enterprise Architecture (v6.0)
+Every message is protected by **PQ-MPRBA** — an original browser-native protocol combining a hybrid
+**ML-KEM-768 (FIPS 203) + ECDH P-256** ratchet with **Ristretto255-VOPRF** blinded authentication (RFC 9497).
+The server never sees plaintext, and never learns who is talking to whom.
 
-### 🛡️ 1. Post-Quantum Hybrid Ratchet (`ML-KEM-768` + `ECDH P-256`) & Out-of-Order Zeroization
-* **Lattice-Based Post-Quantum Key Encapsulation (`ML-KEM-768` / FIPS 203):** Protects against *"Store Now, Decrypt Later"* quantum attacks (Shor's algorithm) by combining NIST-standardized **CRYSTALS-Kyber (`ML-KEM-768`)** with classical **`ECDH P-256`** into a hybrid root secret via `HKDF-SHA256` (`src/utils/crypto.ts`).
-* **Out-of-Order Skipped Message Key Cache (`SkippedMessageKeys`):** Resilient against severe network packet reordering and jitter. If message `#3` arrives before message `#2`, the receiver's KDF chain advances, temporarily stores intermediate one-time keys in a bounded cache (`MAX_SKIP = 100`, `10-minute TTL`), and decrypts delayed packets seamlessly upon arrival.
-* **Immediate RAM Zeroization (`zeroizeBuffer`):** Every ephemeral message key (`mk`), ML-KEM shared secret, and consumed skipped key is immediately overwritten with zeros (`Uint8Array.fill(0)`) in memory right after encryption/decryption to guarantee strict **Forward Secrecy**.
-* **Blinded Identity Authentication (`Ristretto255-VOPRF` — RFC 9497):** Eliminates heavy RSA blind signatures in favor of ultra-fast prime-order **Ristretto255 Verifiable Oblivious Pseudorandom Functions (`ristretto255_oprf.voprf`)** with zero-knowledge **DLEQ proofs** (`POST /api/voprf/evaluate`). Clients blind their identity scalar before evaluation so the server verifies authenticity without linking blinding factors.
-* **Group Epoch State Machine (`Group Epoch FSM` + Grace Buffer):** Solves concurrent group membership changes over Socket.IO (`group-epoch-rotated`). Transitions group encryption through `STABLE -> ROTATING -> STABLE` states, queues outgoing messages during rotation, increments the cryptographic `Epoch #`, and retains a 3-epoch **Grace Buffer** to decrypt in-flight messages sent milliseconds before membership updates.
+[![Version](https://img.shields.io/badge/version-6.0.0-blue)](CHANGELOG.md)
+[![React](https://img.shields.io/badge/React-19-61dafb?logo=react&logoColor=white)](https://react.dev)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
+[![Node.js](https://img.shields.io/badge/Node.js-Express-339933?logo=nodedotjs&logoColor=white)](https://expressjs.com)
+[![Socket.IO](https://img.shields.io/badge/Socket.IO-4-010101?logo=socketdotio&logoColor=white)](https://socket.io)
+[![Crypto](https://img.shields.io/badge/crypto-ML--KEM--768%20%2B%20AES--256--GCM-purple)](#-the-pq-mprba-protocol)
+[![Stars](https://img.shields.io/github/stars/indirect-b/chat-app?style=social)](https://github.com/indirect-b/chat-app/stargazers)
 
-### 💾 2. Concurrency-Safe Dual-Mode Database (`PostgreSQL` + `Atomic Mutex Disk Fallback`)
-* **Primary Relational Engine (`PostgreSQL`):** Connects via `pg.Pool` when a valid `DATABASE_URL` is configured.
-* **Non-Blocking Debounced Write Mutex (`src/server/db.ts`):** When `DATABASE_URL` is omitted or unreachable, `PersistentFallbackDatabase` is activated automatically. Instead of synchronous `fs.writeFileSync` calls that block the Node.js event loop or corrupt JSON under concurrent writes, all mutations are coalesced via a **250ms Debounced Write Mutex (`isFlushing` + `flushPending` queue)**.
-* **Atomic Crash-Safe File Replacement:** Snapshots are written asynchronously (`fs.promises.writeFile`) to `data/database.json.tmp` and atomically renamed (`fs.promises.rename`) over `data/database.json`, preventing file corruption during concurrent messaging or unexpected server restarts.
-* **Automatic Storage Pruning:** Automatically caps fallback history at `MAX_STORED_MESSAGES = 5000` to prevent unbounded JSON file growth.
+**🚀 Live demo:** https://chatapp-server-1i2a.onrender.com &nbsp;·&nbsp; use **⚡ Quick Test Login** — no sign-up needed
+<br/><sub>(free-tier hosting: the first load may take ~30s while the server wakes up)</sub>
 
-### ☁️ 3. Hybrid Cloud-Safe Media Persistence (`media_blobs` + `/api/media/:id`)
-* **Ephemeral Container Resilience (Render / Railway / Docker):** Cloud platforms with ephemeral filesystems wipe local folders (`public/uploads/`) on container redeployments.
-* **Persistent Database Blob Storage (`STORAGE_MODE=hybrid`):** Voice notes (`.webm`), avatars, and images under `2MB` (`INLINE_MAX_BYTES`) are automatically persisted inside the `media_blobs` database table (`PostgreSQL` or `data/database.json`) and served with immutable cache headers via `GET /api/media/:id`. Files larger than `2MB` (up to `50MB`) stream directly from disk (`public/uploads/`).
+</div>
 
-### 🌐 4. Cluster-Ready Socket.IO Presence Layer (`src/server/presence.ts`)
-* **Decoupled Presence Manager:** Replaced scattered in-memory socket objects with a dedicated `PresenceManager` (`src/server/presence.ts`) providing $O(1)$ bidirectional lookup (`socketId <-> username`) and `REDIS_URL` cluster mode readiness for horizontal multi-instance scaling.
-
-### 🛡️ 5. Hardened Security & Zero Hardcoded Secrets (`src/server/config.ts`)
-* **Zero Leaked Credentials:** Removed all hardcoded passwords and secret admin URLs from `.env.example` and source code.
-* **Cryptographic Fallback Generation:** If `ADMIN_PASSWORD` is not provided in environment variables, `src/server/config.ts` generates a cryptographically secure random 32-character hex key (`crypto.randomBytes(16).toString('hex')`) at startup.
-* **Timing-Safe Verification:** All admin authentication checks use `crypto.timingSafeEqual` (`verifyAdminSecret`) to prevent timing side-channel attacks, and `ADMIN_PATH` is strictly isolated on the server side (`server.ts`) so it never appears in frontend bundles.
+| Login — Bale ID + OTP, E2EE notice | Chat — PQ-KEM badge, AES-256-GCM thread |
+| :---: | :---: |
+| ![Login screen](docs/screenshots/screenshot-login.png) | ![Chat thread](docs/screenshots/screenshot-chat.png) |
 
 ---
 
-## 📋 Architectural Evolution & Changelog
+## Why this exists
 
-### 🚀 v6.0 (Latest) — Invention & Full Implementation of the **Post-Quantum Multi-Party Ratchet with Blinded Authentication (`PQ-MPRBA`)**
-* **Groundbreaking Original Cryptographic Architecture (First-of-its-Kind Browser Protocol):**
-  * Conceived, architected, and engineered from scratch a **completely original, unprecedented client-side cryptographic protocol (`PQ-MPRBA`)** that did not previously exist in any web messenger—even major industry platforms (such as Signal or Telegram Web) have not deployed a unified, browser-native **Post-Quantum Lattice Multi-Party Ratchet combined with Zero-Knowledge Verifiable Oblivious Pseudorandom Blinded Authentication**.
-  * **Layer 1 — Hybrid Post-Quantum Key Encapsulation (`ML-KEM-768` + `ECDH P-256`):** Replaced vulnerable classical elliptic-curve-only ratchets with a hybrid **NIST FIPS 203 `ML-KEM-768` (CRYSTALS-Kyber)** lattice-based encapsulation + **`ECDH P-256`** coupled with a continuous `HKDF-SHA256` symmetric KDF chain (`src/utils/crypto.ts`), neutralizing *"Store Now, Decrypt Later"* quantum attacks (Shor's algorithm) without degrading browser responsiveness.
-  * **Layer 2 — Zero-Metadata Blinded Identity (`Ristretto255-VOPRF` RFC 9497):** Engineered a full client-server **Verifiable Oblivious Pseudorandom Function (`VOPRF`)** over prime-order `Ristretto255` curves with Schnorr **DLEQ Zero-Knowledge Proofs** (`POST /api/voprf/evaluate`). Clients blind their identity scalar locally, obtain a verifiable blind evaluation from the server, unblind it in the browser, and derive an unlinkable anonymous token—preventing metadata correlation.
+Most web messengers either skip end-to-end encryption entirely or bolt on a classical ECDH scheme
+that a future quantum computer will retroactively break (*"store now, decrypt later"*).
+chat-app was designed from the start for hostile networks and a post-quantum future:
 
-* **🔥 Critical Engineering Challenges Anticipated & Solved Within This Newly Invented Protocol:**
-  1. **Solved Challenge #1 — Severe Network Packet Reordering & Out-of-Order Decryption (`SkippedMessageKeys` + Immediate RAM Zeroization):**
-     * *The Problem:* Under unstable network conditions or severe packet jitter, if a sender transmits messages `#1`, `#2`, and `#3` sequentially and message `#3` arrives before `#2`, a standard ratchet advances its KDF chain to `#3` and permanently loses the ability to decrypt delayed message `#2`.
-     * *Our Engineered Solution:* Designed an in-memory **Out-of-Order Skipped Message Key Vault (`SkippedMessageKeys`)** inside `src/utils/crypto.ts`. When an ahead-of-sequence packet arrives, the ratchet deterministically fast-forwards through intermediate steps, caches the skipped one-time message keys in a bounded vault (`MAX_SKIP = 100`, `10-minute TTL`), and immediately overwrites every consumed message key (`mk`), ML-KEM secret, and chain state in RAM with zeros (`Uint8Array.fill(0)` — **Strict RAM Zeroization**) the instant decryption completes.
-  2. **Solved Challenge #2 — Browser Main-Thread Bottlenecks of Heavy RSA Blind Signatures (`Ristretto255-VOPRF` Optimization):**
-     * *The Problem:* Traditional `RSA-BSSA` blind signatures require massive key sizes (`2048–4096 bits`) and slow modular exponentiation that freeze browser UI threads on mobile devices.
-     * *Our Engineered Solution:* Replaced RSA blind signatures with prime-order **`Ristretto255-VOPRF` (RFC 9497)** + **DLEQ Zero-Knowledge Proof verification**, delivering **10x faster** non-blocking browser execution and compact `32-byte` group elements.
-  3. **Solved Challenge #3 — Concurrent Group Membership Changes & In-Flight Message Corruption (`Group Epoch FSM` + `Grace Buffer`):**
-     * *The Problem:* In multi-party group chats over WebSockets (`Socket.IO`), when a member joins or leaves (`Epoch Rotation`) at the exact millisecond another user sends a message, race conditions cause key mismatches and message corruption.
-     * *Our Engineered Solution:* Engineered a deterministic **Group Epoch Finite State Machine (`STABLE -> ROTATING -> STABLE`)** synchronized via `group-epoch-rotated` Socket.IO broadcasts, coupled with a **3-Epoch Cryptographic Grace Buffer (`MAX_EPOCH_HISTORY = 3`)** that retains recent epoch keys in memory just long enough to cleanly decrypt in-flight packets transmitted milliseconds prior to membership rotation.
+- 🔐 **Post-quantum by design** — hybrid key exchange, so recorded traffic stays safe even against Shor's algorithm.
+- 🙈 **Metadata-resistant** — blinded authentication means the server routes messages without linking identities.
+- ⚡ **Built for unstable networks** — out-of-order message recovery, group key rotation that doesn't corrupt in-flight messages.
+- 🧩 **Zero-knowledge server** — the backend is a forwarder of ciphertext, nothing more.
 
----
+## ✨ Features
 
-### 📦 Previous Architectural Milestones (v1.0 – v5.0)
-1. **v5.0 — Upgraded E2EE to Automatic Asymmetric Diffie-Hellman (`ECDH P-256`):**
-   * Added automatic key pair generation (`ensureUserECDHKeyPair`), public key directory endpoints (`POST /api/user/public-key`), real-time `peer-key-updated` socket synchronization, and `ECDH` shared secret derivation in `src/utils/crypto.ts`.
-2. **v4.0 — Engineered Non-Blocking Atomic Disk Fallback (`src/server/db.ts`):**
-   * Eliminated race conditions and event-loop blocking by implementing an async write mutex, `250ms` write debouncing, atomic `.tmp` rename replacement, and automatic 5,000-message pruning.
-3. **v3.0 — Added Hybrid Cloud-Safe Media Storage (`server.ts` & `src/server/db.ts`):**
-   * Created the `media_blobs` table and `GET /api/media/:id` endpoint so voice notes, avatars, and images survive container restarts on Render, Railway, and Docker.
-4. **v2.0 — Extracted Cluster-Ready Presence Service (`src/server/presence.ts`):**
-   * Centralized online user tracking, socket mapping, and targeted user event emission (`presence.emitToUser`).
-5. **v1.0 — Hardened Admin & Environment Security (`src/server/config.ts` & `.env.example`):**
-   * Replaced default credentials with dynamic cryptographic secret generation and `crypto.timingSafeEqual` verification.
+- Real-time direct & group messaging (Socket.IO, WebSocket + long-polling fallback)
+- End-to-end encryption: **AES-256-GCM**, keys derived per message via a hybrid post-quantum ratchet
+- Login with **Bale ID**: OTP codes delivered by a Bale bot (`src/server/bale.ts`), plus a 1-click quick test login
+- Blinded identity authentication via **Ristretto255-VOPRF** with DLEQ zero-knowledge proofs
+- **Group Epoch FSM** — membership changes rotate group keys without losing in-flight messages
+- Typing indicators, presence, reactions, message edit/delete/pin/forward, read receipts
+- Voice notes & file attachments up to **50 MB**, processed off the main thread in Web Workers
+- PBKDF2 room passphrases (100,000 iterations)
+- Stealth admin dashboard at an obfuscated, server-side-only path (timing-safe auth)
+- Dual-mode persistence: **PostgreSQL** when configured, otherwise an atomic, mutex-guarded JSON store
+- Hybrid media storage so uploads survive container redeploys on Render / Railway / Docker
 
+## 🔐 The PQ-MPRBA protocol
 
----
+**PQ-MPRBA** *(Post-Quantum Multi-Party Ratchet with Blinded Authentication)* runs entirely in the
+browser (`src/utils/crypto.ts`, Web Crypto API + `@noble/post-quantum` / `@noble/curves`).
 
-## 📂 Project Directory Structure & File-by-File Breakdown
+**Layer 1 — Hybrid post-quantum ratchet.**
+Each session combines **ML-KEM-768** (NIST FIPS 203, lattice-based) with classical **ECDH P-256**;
+both shared secrets feed **HKDF-SHA256** into a symmetric ratchet chain. Every message gets a fresh
+one-time **AES-256-GCM** key, giving forward secrecy and post-compromise recovery. Breaking a session
+requires breaking *both* the lattice problem and the elliptic-curve problem.
 
-```text
-/
-├── server.ts                       # Main Express + Socket.IO server, hybrid media endpoints & Vite integration
-├── index.html                      # Root SPA HTML entry point loading /src/main.tsx
-├── vite.config.ts                  # Vite bundler & React plugin configuration
-├── tsconfig.json                   # TypeScript compiler configuration
-├── package.json                    # Dependencies and scripts (dev, start, build)
-├── metadata.json                   # Application metadata
-├── .env.example                    # Clean, secret-free environment variables template
-├── data/                           # Auto-generated directory for persistent fallback database
-│   └── database.json               # Atomic, mutex-protected JSON snapshot when PostgreSQL is offline
-├── src/                            # TypeScript Source Code (Frontend + Backend Modules)
-│   ├── main.tsx                    # React 19 DOM root mounting <App />
-│   ├── App.tsx                     # Root component managing session, maintenance, blocked state & toasts
-│   ├── types.ts                    # Shared TypeScript interfaces (UserProfile, ChatMessage, RoomSummary, etc.)
-│   ├── utils/
-│   │   └── crypto.ts               # Web Crypto E2EE engine (Automatic ECDH P-256 + AES-GCM 256-bit + PBKDF2)
-│   ├── components/
-│   │   ├── AuthScreen.tsx          # 3-step Bale OTP login, 1-click Quick Test Login & Rules modal
-│   │   └── ChatApp.tsx             # Main messenger UI, ECDH key sync, voice recorder, modals & context menu
-│   └── server/
-│       ├── config.ts               # Security-hardened config & timing-safe admin secret verification
-│       ├── db.ts                   # Dual-mode database (PostgreSQL Pool + Atomic Mutex Disk Fallback)
-│       ├── presence.ts             # Cluster-ready Socket.IO presence manager (O(1) lookup + Redis readiness)
-│       └── bale.ts                 # TypeScript client for Bale Bot API (sendMessage, sendPhoto, getUpdates)
-└── public/                         # Static Assets & Stylesheets
-    ├── style.css                   # Master stylesheet importing modular CSS files
-    ├── admin.html                  # Standalone Admin Dashboard interface
-    ├── uploads/                    # Local stream directory for large file uploads
-    └── css/                        # Modular RTL Stylesheets
-        ├── base.css                # CSS variables, color tokens, Vazirmatn typography & Toast styles
-        ├── auth.css                # Login box, OTP input, and quick test login button styles
-        ├── chat.css                # Sidebar, chat header, message bubbles, reactions & voice recorder styles
-        └── modals.css              # Pop-up modals, context menu, maintenance & announcement overlay styles
+**Out-of-order recovery.** If message #3 arrives before #2, the ratchet fast-forwards and caches the
+skipped one-time keys in a bounded in-memory vault (`MAX_SKIP = 100` per room, 10-minute TTL).
+Consumed keys and ML-KEM secrets are **zeroized in RAM** (`Uint8Array.fill(0)`) immediately after use.
+
+**Layer 2 — Blinded authentication (Ristretto255-VOPRF, RFC 9497).**
+The client blinds its identity scalar locally, the server evaluates it with its secret key and returns
+a **DLEQ proof** (`POST /api/voprf/evaluate`), the client verifies the proof and unblinds the result to
+derive an unlinkable routing token. The server can authenticate users without ever seeing — or linking —
+their identities, replacing heavy RSA blind signatures with compact 32-byte group elements.
+
+**Group epochs.** Group keys rotate through a deterministic finite state machine
+(`STABLE → ROTATING → STABLE`, synced via the `group-epoch-rotated` socket event). Outgoing messages
+queue during rotation, and a 3-epoch grace buffer (`MAX_EPOCH_HISTORY = 3`) keeps messages sent
+milliseconds before a membership change decryptable.
+
+> ⚠️ **Honest status:** PQ-MPRBA is an original, experimental protocol written for this project.
+> It has **not** been independently audited. Treat it as research-grade cryptography, not a
+> replacement for audited messengers in high-risk situations.
+
+## 🏗️ Architecture
+
+```mermaid
+flowchart LR
+    subgraph Browser["Browser (all crypto happens here)"]
+        UI["React 19 + TypeScript SPA"]
+        CR["crypto.ts — PQ-MPRBA engine<br/>ML-KEM-768 + ECDH P-256 · AES-256-GCM · VOPRF"]
+        WK["Web Workers — media up to 50 MB"]
+        UI --> CR
+        UI --> WK
+    end
+    subgraph Server["Node.js server (zero-knowledge forwarder)"]
+        EX["Express + Socket.IO (server.ts)"]
+        PR["PresenceManager"]
+        DB["Dual-mode DB<br/>PostgreSQL · atomic JSON fallback"]
+        BL["Bale bot — OTP delivery"]
+        EX --> PR
+        EX --> DB
+        EX --> BL
+    end
+    UI <-->|"ciphertext + blinded tokens only"| EX
 ```
 
----
+| Layer | Technology |
+| :--- | :--- |
+| Frontend | React 19, TypeScript, Vite, modular RTL CSS (Vazirmatn) |
+| Crypto | Web Crypto API, `@noble/post-quantum`, `@noble/curves`, Web Workers |
+| Backend | Node.js, Express, Socket.IO, Helmet, CORS, express-rate-limit |
+| Auth | Bale OTP bot + Ristretto255-VOPRF blinded tokens |
+| Storage | PostgreSQL (`pg`) or atomic JSON fallback; hybrid `media_blobs` + disk |
 
-## 🔌 REST API & Socket.IO Event Reference
+Key engineering details:
 
-### REST API Endpoints
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `POST` | `/api/send-otp` | Generates a 6-digit OTP and sends it via Bale Bot (or returns a test OTP in dev mode). |
-| `POST` | `/api/verify-otp` | Validates the 6-digit OTP and checks if the user is new or existing. |
-| `POST` | `/api/register` | Registers a newly verified user in the database. |
-| `POST` | `/api/quick-login` | Instant passwordless test login; auto-creates user and links demo contacts. |
-| `POST` | `/api/voprf/evaluate` | Evaluates a Ristretto255-VOPRF blinded point and returns a zero-knowledge DLEQ proof (RFC 9497). |
-| `GET` | `/api/user/:username` | Retrieves a user's public profile and Hybrid Post-Quantum (`ML-KEM-768 + P-256`) `public_key`. |
-| `POST` | `/api/user/public-key` | Publishes the user's Hybrid `ML-KEM-768 + ECDH P-256` key bundle and notifies online contacts. |
-| `POST` | `/api/user/update` | Updates the authenticated user's bio, status, and avatar URL. |
-| `GET` | `/api/contacts/:username` | Lists all contacts with their avatars, online statuses, and `public_key`. |
-| `POST` | `/api/add-contact` | Adds a contact by username and returns their `public_key`. |
-| `GET` | `/api/messages/:roomId` | Fetches all non-deleted messages for a direct or group room. |
-| `GET` | `/api/groups/:username` | Lists all groups where the user is a member, including current cryptographic `epoch`. |
-| `POST` | `/api/upload` | Hybrid file upload (`<= 2MB` persisted in `media_blobs`, `> 2MB` streamed to disk). |
-| `GET` | `/api/media/:id` | Serves persistent cloud-safe media blobs with immutable caching and disk fallback. |
-| `POST` | `/api/report` | Submits a moderation report against a message or user. |
-| `GET` | `/api/settings/mode` | Returns current server mode (`normal` or `maintenance`). |
-| `GET` | `/api/settings/rules` | Returns platform rules text. |
+- **Atomic disk fallback** (`src/server/db.ts`) — mutations are coalesced through a 250 ms debounced
+  write mutex and persisted via write-to-`.tmp` + atomic rename; history is auto-pruned at 5,000 messages.
+- **Hybrid media persistence** — files ≤ 2 MB are stored as database blobs and served from
+  `GET /api/media/:id` with immutable caching; larger files (up to 50 MB) stream from disk, so media
+  survives ephemeral-container redeploys.
+- **Cluster-ready presence** (`src/server/presence.ts`) — O(1) bidirectional `socketId ↔ username`
+  lookup, with `REDIS_URL` hooks for horizontal scaling.
+- **No hardcoded secrets** (`src/server/config.ts`) — if `ADMIN_PASSWORD` is unset, a random
+  32-char hex secret is generated at boot; admin checks use `crypto.timingSafeEqual`, and the admin
+  path never appears in frontend bundles.
 
-### Socket.IO Events
-* **Client → Server:** `auth`, `send-message`, `edit-message`, `delete-message`, `pin-message`, `react`, `forward-message`, `typing`, `read`, `update-status`, `update-location`.
-* **Server → Client:** `auth-ok`, `new-message`, `msg-edited`, `msg-deleted`, `msg-pinned`, `msg-reaction`, `typing`, `read`, `contact-online`, `contact-offline`, `contact-status`, `peer-key-updated`, `new-group`, `group-epoch-rotated`, `blocked`, `kicked`, `server-maintenance`, `server-normal`, `announcement`.
+## 🚀 Quick start
 
----
+**Prerequisites:** Node.js 18+ or 22+, npm 9+. PostgreSQL is optional.
 
-## 🚀 Installation, Configuration & Activation Guide
-
-### Prerequisites
-* **Node.js**: `v18.x` or `v22.x`
-* **npm**: `v9.x` or higher
-* **PostgreSQL**: Optional (Automatically uses atomic persistent disk storage in `data/database.json` when not configured).
-
-### 1. Clone & Install Dependencies
 ```bash
 git clone https://github.com/indirect-b/chat-app.git
 cd chat-app
 npm install
+cp .env.example .env   # then fill in your secrets
+npm run dev            # full-stack dev server (Express + Vite + Socket.IO)
 ```
 
-### 2. Configure Environment Variables
-Copy `.env.example` to `.env` and set your custom secrets:
-```bash
-cp .env.example .env
+Open http://localhost:3000 — use **Quick Test Login** to explore instantly, or log in with a Bale ID.
+Production: `npm run build` then `npm start`.
+
+### Environment variables
+
+| Variable | Description |
+| :--- | :--- |
+| `PORT` | Server port (default `3000`) |
+| `ADMIN_PASSWORD` | Admin secret (auto-generated at boot if empty) |
+| `ADMIN_PATH` | Obfuscated admin dashboard path |
+| `BALE_API` | Bale Bot API base URL |
+| `BALE_BOT_TOKEN` | Bale bot token used to deliver OTP codes |
+| `DATABASE_URL` | PostgreSQL connection string (empty = JSON fallback) |
+| `REDIS_URL` | Redis URL for clustered presence (optional) |
+| `STORAGE_MODE` | Media storage mode (`hybrid` recommended) |
+| `MAX_FILE_SIZE` | Max upload size in bytes (default 50 MB) |
+| `OTP_EXPIRE` | OTP validity window in seconds |
+
+## 📂 Project structure
+
+```text
+server.ts                 # Express + Socket.IO server, media endpoints, Vite integration
+src/
+├── App.tsx               # Session, maintenance/blocked states, toasts
+├── components/
+│   ├── AuthScreen.tsx    # 3-step Bale OTP login + quick test login
+│   └── ChatApp.tsx       # Messenger UI, key sync, voice recorder, modals
+├── utils/crypto.ts       # PQ-MPRBA engine: hybrid ratchet, VOPRF, group epochs
+└── server/
+    ├── config.ts         # Hardened config, timing-safe admin verification
+    ├── db.ts             # PostgreSQL pool + atomic JSON fallback
+    ├── presence.ts       # Cluster-ready presence manager
+    └── bale.ts           # Bale Bot API client (OTP delivery)
+public/                   # Static assets, admin dashboard, modular CSS
+data/database.json        # Auto-generated fallback database snapshot
 ```
-```env
-PORT=3000
-ADMIN_PASSWORD=your_strong_admin_secret
-ADMIN_PATH=/admin-console
-BALE_API=https://tapi.bale.ai/bot
-BALE_BOT_TOKEN=
-DATABASE_URL=
-REDIS_URL=
-STORAGE_MODE=hybrid
-MAX_FILE_SIZE=52428800
-OTP_EXPIRE=120
-```
 
-### 3. Build & Run
-```bash
-# Start full-stack development server (TypeScript + Vite + Express)
-npm run dev
+## 🔌 API & realtime events
 
-# Build frontend production bundle
-npm run build
+<details>
+<summary><b>REST API</b></summary>
 
-# Start production server
-npm start
-```
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/api/send-otp` | Generate a 6-digit OTP and send it via the Bale bot |
+| `POST` | `/api/verify-otp` | Validate an OTP |
+| `POST` | `/api/register` | Register a verified user |
+| `POST` | `/api/quick-login` | Instant test login (auto-creates demo contacts) |
+| `POST` | `/api/voprf/evaluate` | Evaluate a blinded Ristretto255 point, return a DLEQ proof (RFC 9497) |
+| `GET` | `/api/user/:username` | Public profile + hybrid (ML-KEM-768 + P-256) public key |
+| `POST` | `/api/user/public-key` | Publish a hybrid key bundle |
+| `POST` | `/api/user/update` | Update bio, status, avatar |
+| `GET` | `/api/contacts/:username` | Contacts with presence + public keys |
+| `POST` | `/api/add-contact` | Add a contact by username |
+| `GET` | `/api/messages/:roomId` | Messages of a direct/group room |
+| `GET` | `/api/groups/:username` | Groups + current cryptographic epoch |
+| `POST` | `/api/upload` | Hybrid upload (≤ 2 MB → DB blob, > 2 MB → disk) |
+| `GET` | `/api/media/:id` | Serve a stored media blob |
+| `POST` | `/api/report` | Report a message or user |
+| `GET` | `/api/settings/mode` | Server mode (`normal` / `maintenance`) |
+| `GET` | `/api/settings/rules` | Platform rules text |
 
-### 4. Access the Messenger & Admin Panel
-* **Messenger UI:** Open `http://localhost:3000`
-* **Admin Dashboard:** Open `http://localhost:3000/admin-console` (or the custom path configured in `ADMIN_PATH`).
+</details>
+
+<details>
+<summary><b>Socket.IO events</b></summary>
+
+- **Client → Server:** `auth`, `send-message`, `edit-message`, `delete-message`, `pin-message`, `react`, `forward-message`, `typing`, `read`, `update-status`, `update-location`
+- **Server → Client:** `auth-ok`, `new-message`, `msg-edited`, `msg-deleted`, `msg-pinned`, `msg-reaction`, `typing`, `read`, `contact-online`, `contact-offline`, `contact-status`, `peer-key-updated`, `new-group`, `group-epoch-rotated`, `blocked`, `kicked`, `server-maintenance`, `server-normal`, `announcement`
+
+</details>
+
+## 📋 Version history
+
+Full details in [CHANGELOG.md](CHANGELOG.md).
+
+- **v6.0** — PQ-MPRBA: hybrid ML-KEM-768 + ECDH P-256 ratchet, Ristretto255-VOPRF blinded auth, Group Epoch FSM
+- **v5.0** — Automatic ECDH P-256 key exchange & public-key directory
+- **v4.0** — Non-blocking atomic disk fallback (debounced mutex, `.tmp` rename)
+- **v3.0** — Hybrid cloud-safe media storage (`media_blobs`)
+- **v2.0** — Cluster-ready presence service
+- **v1.0** — Admin & environment security hardening
+
+---
+
+## 🇮🇷 درباره پروژه (فارسی)
+
+**پیام‌رسان** یک پیام‌رسان تحت وب فارسی و بلادرنگ است که تمام پیام‌هایش با رمزنگاری سرتاسری
+**پساکوانتومی** محافظت می‌شود. پروتکل اختصاصی پروژه، **PQ-MPRBA**، ترکیبی از تبادل کلید هیبریدی
+**ML-KEM-768 + ECDH P-256** و احراز هویت کور **Ristretto255-VOPRF** است؛ یعنی سرور نه متن پیام‌ها
+را می‌بیند و نه می‌تواند هویت کاربران را به هم گره بزند. ورود با آیدی بله (کد تأیید از طریق ربات بله)
+انجام می‌شود و برای تست، ورود سریع بدون کد هم وجود دارد.
+
+**اجرای سریع:** `npm install` ← ساخت فایل `.env` از روی `.env.example` ← `npm run dev`
+
+---
+
+<div align="center">
+
+Built by [Mohammad Taha Azizi Ahad](https://github.com/indirect-b) — feedback, issues and stars are welcome ⭐
+
+</div>
