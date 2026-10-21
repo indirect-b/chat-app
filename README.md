@@ -94,23 +94,23 @@ milliseconds before a membership change decryptable.
 
 ## 🏗️ Architecture
 
-```mermaid
-flowchart LR
-  subgraph Browser["Browser (all crypto happens here)"]
-    UI["React 19 + TypeScript SPA"]
-    CR["crypto.ts — PQ-MPRBA engine<br/>ML-KEM-768 + ECDH P-256 · ML-DSA-65 · AES-256-GCM · VOPRF"]
-    WK["Web Workers — media up to 50 MB"]
-    UI --> CR
-    UI --> WK
-  end
-  subgraph Server["Node.js server (zero-knowledge forwarder)"]
-    EX["Express + Socket.IO (server.ts)"]
-    PR["PresenceManager"]
-    DB["Dual-mode DB<br/>PostgreSQL · atomic JSON fallback"]
-    BL["Bale bot — OTP delivery"]
-    EX --> PR
-    EX --> DB
-    EX --> BL
+  ```mermaid
+    flowchart LR
+      subgraph Browser["Browser (all crypto happens here)"]
+        UI["React 19 + TypeScript SPA"]
+        CR["crypto.ts — PQ-MPRBA engine<br/>ML-KEM-768 + ECDH P-256 · ML-DSA-65 · AES-256-GCM · VOPRF"]
+        WK["Web Workers — media up to 50 MB"]
+      UI --> CR
+      UI --> WK
+      end
+      subgraph Server["Node.js server (zero-knowledge forwarder)"]
+        EX["Express + Socket.IO (server.ts)"]
+        PR["PresenceManager"]
+        DB["Dual-mode DB<br/>PostgreSQL · atomic JSON fallback"]
+        BL["Bale bot — OTP delivery"]
+        EX --> PR
+      EX --> DB
+      EX --> BL
   end
   UI <-->|"ciphertext + blinded tokens only"| EX
 ```
@@ -124,15 +124,15 @@ flowchart LR
 | Storage | PostgreSQL (`pg`) or atomic JSON fallback; hybrid `media_blobs` + disk |
 
 Key engineering details:
-
+  
 - **Atomic disk fallback** (`src/server/db.ts`) — mutations are coalesced through a 250 ms debounced
-write mutex and persisted via write-to-`.tmp` + atomic rename; history is auto-pruned at 5,000 messages.
+  write mutex and persisted via write-to-`.tmp` + atomic rename; history is auto-pruned at 5,000 messages.
 - **Hybrid media persistence** — files ≤ 2 MB are stored as database blobs and served from
-`GET /api/media/:id` with immutable caching; larger files (up to 50 MB) stream from disk, so media
-survives ephemeral-container redeploys.
+  `GET /api/media/:id` with immutable caching; larger files (up to 50 MB) stream from disk, so media
+  survives ephemeral-container redeploys.
 - **Cluster-ready presence** (`src/server/presence.ts`) — O(1) bidirectional `socketId ↔ username`
 lookup, with `REDIS_URL` hooks for horizontal scaling.
-- **No hardcoded secrets** (`src/server/config.ts`) — if `ADMIN_PASSWORD` is unset, a random
+    - **No hardcoded secrets** (`src/server/config.ts`) — if `ADMIN_PASSWORD` is unset, a random
 32-char hex secret is generated at boot; admin checks use `crypto.timingSafeEqual`, and the admin
 path never appears in frontend bundles.
 
@@ -144,7 +144,7 @@ path never appears in frontend bundles.
 git clone https://github.com/indirect-b/chat-app.git
 cd chat-app
 npm install
-cp .env.example .env   # then fill in your secrets
+cp .env.exaple .env   # then fill in your secrets
 npm run dev             # full-stack dev server (Express + Vite + Socket.IO)
 ```
 
