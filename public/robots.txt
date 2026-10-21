@@ -2,7 +2,6 @@ User-agent: *
 Allow: /
 Disallow: /api/
 Disallow: /admin-login/
-Disallow: /panel-x9k2m7
 Disallow: /uploads/
 Disallow: /socket.io/
 

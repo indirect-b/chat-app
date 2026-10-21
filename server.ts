@@ -38,8 +38,7 @@ app.use(
         mediaSrc: ["'self'", 'data:', 'blob:'],
         connectSrc: [
           "'self'",
-          'ws:',
-          'wss:',
+          'wss://chatapp-server-1i2a.onrender.com',
           'https://fonts.googleapis.com',
           'https://fonts.gstatic.com',
         ],
@@ -422,20 +421,31 @@ app.get('/api/settings/rules', async (_req: Request, res: Response) => {
 
 app.get('/api/settings/mode', async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
-  const mode = (await getSetting('server_mode')) || 'normal';
 
   if (isAdmin(req)) {
+    const mode = (await getSetting('server_mode')) || 'normal';
     const msg = await getSetting('maintenance_msg');
     return res.status(200).json({ ok: true, mode, msg });
   }
 
+  const rawSessionUser = req.headers['x-session-user'];
+  const sessionUser = (Array.isArray(rawSessionUser) ? rawSessionUser[0] : rawSessionUser || '')
+    .trim()
+    .toLowerCase();
+
+  if (!sessionUser) {
+    return res.status(401).end();
+  }
+
+  const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [sessionUser]);
+  if (!rows.length) {
+    return res.status(401).end();
+  }
+
+  const mode = (await getSetting('server_mode')) || 'normal';
   if (mode === 'maintenance') {
     const msg = await getSetting('maintenance_msg');
     return res.status(503).json({ mode: 'maintenance', msg });
-  }
-
-  if (req.headers.authorization || req.headers['x-requested-with'] !== 'XMLHttpRequest') {
-    return res.status(401).json({ mode: 'normal' });
   }
 
   return res.status(200).json({ mode: 'normal' });
@@ -746,7 +756,6 @@ app.get('/robots.txt', (req: Request, res: Response) => {
       'Allow: /',
       'Disallow: /api/',
       'Disallow: /admin-login/',
-      `Disallow: ${config.ADMIN_PATH}`,
       'Disallow: /uploads/',
       'Disallow: /socket.io/',
       '',
@@ -1065,7 +1074,7 @@ async function start(): Promise<void> {
   const publicPath = path.join(process.cwd(), 'public');
   const assetsPath = path.join(distPath, 'assets');
   const isProd = process.env.NODE_ENV === 'production' && fs.existsSync(distPath);
-  const validClientRoutes = new Set(['/', '/index.html']);
+  const validClientRoutes = new Set(['/', '/index.html', '/terms']);
 
   const sendNotFound = (req: Request, res: Response) => {
     res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
@@ -1143,7 +1152,12 @@ async function start(): Promise<void> {
         return sendNotFound(req, res);
       }
       if (isAppRoute) {
-        res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+        res.setHeader('Cache-Control', 'public, max-age=60');
+        const origWriteHead = res.writeHead.bind(res);
+        res.writeHead = ((statusCode: number, ...args: any[]) => {
+          res.setHeader('Cache-Control', 'public, max-age=60');
+          return origWriteHead(statusCode, ...args);
+        }) as typeof res.writeHead;
       } else if (isStaticAsset && !reqPath.endsWith('.html')) {
         res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
       }
@@ -1156,7 +1170,7 @@ async function start(): Promise<void> {
         index: false,
         setHeaders: (res, filePath) => {
           if (filePath.endsWith('.html')) {
-            res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+            res.setHeader('Cache-Control', 'public, max-age=60');
           } else {
             res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
           }
@@ -1168,15 +1182,15 @@ async function start(): Promise<void> {
         index: false,
         setHeaders: (res, filePath) => {
           if (filePath.endsWith('.html')) {
-            res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+            res.setHeader('Cache-Control', 'public, max-age=60');
           } else {
             res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
           }
         },
       })
     );
-    app.get(['/', '/index.html'], (_req, res) => {
-      res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+    app.get(['/', '/index.html', '/terms'], (_req, res) => {
+      res.setHeader('Cache-Control', 'public, max-age=60');
       res.sendFile(path.join(distPath, 'index.html'));
     });
     app.use((req, res) => {

@@ -116,10 +116,20 @@
   border-top:1px solid rgba(255,255,255,.1);
   display:flex;
   align-items:center;
-  justify-content:space-between;
+  justify-content:center;
+  gap:16px;
   font-size:12px;
   color:var(--muted);
 }
+.auth-footer-group{
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:16px;
+  flex-wrap:wrap;
+}
+.auth-footer .link-btn,
+.auth-footer a.link-btn,
 .auth-footer button.link-btn{
   background:none!important;
   border:none!important;
@@ -129,6 +139,23 @@
   color:var(--al)!important;
   text-decoration:underline;
   cursor:pointer;
+}
+.field-error{
+  display:none;
+  font-size:12.5px;
+  color:#f87171;
+  background:rgba(239,68,68,.12);
+  border:1px solid rgba(239,68,68,.35);
+  border-radius:10px;
+  padding:8px 12px;
+  line-height:1.5;
+  text-align:right;
+}
+.field-error.visible{
+  display:block;
+}
+.auth-form input.input-invalid{
+  border-color:var(--red)!important;
 }
 .auth-msg{font-size:13px;color:var(--red);text-align:center;min-height:18px}
 .auth-msg.ok{color:var(--green)}
@@ -163,3 +190,52 @@
 .rules-check{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
 .rules-check input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent);cursor:pointer}
 .rules-link{color:var(--al);text-decoration:underline}
+.terms-screen{
+  position:fixed;
+  inset:0;
+  overflow-y:auto;
+  background:linear-gradient(135deg,#0f0f1a,#16213e,#0f3460);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:24px 16px;
+  z-index:999;
+}
+.terms-box{
+  width:100%;
+  max-width:540px;
+  padding:32px 28px;
+  background:rgba(255,255,255,.05);
+  border:1px solid rgba(255,255,255,.1);
+  border-radius:24px;
+  backdrop-filter:blur(20px);
+}
+.terms-list{
+  list-style:none;
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  margin:18px 0 24px;
+  font-size:13.5px;
+  line-height:1.75;
+  color:var(--text);
+}
+.terms-list li{
+  background:rgba(255,255,255,.04);
+  border:1px solid rgba(255,255,255,.08);
+  border-radius:12px;
+  padding:12px 14px;
+}
+.terms-back-link{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  width:100%;
+  background:linear-gradient(135deg,var(--accent),var(--a2));
+  color:#ffffff;
+  text-decoration:none;
+  padding:12px 20px;
+  border-radius:12px;
+  font-size:14px;
+  font-weight:600;
+}

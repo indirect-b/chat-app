@@ -8,10 +8,13 @@ const ChatApp = React.lazy(() =>
 );
 
 const SESSION_KEY = 'chat_session_user';
-const socketInstance: Socket = io();
+const socketInstance: Socket = io({ transports: ['websocket'] });
 
 function hasStoredSessionCandidate(): boolean {
   try {
+    if (typeof window !== 'undefined' && window.location.pathname === '/terms') {
+      return false;
+    }
     return Boolean(
       sessionStorage.getItem('adminLoginToken') || localStorage.getItem(SESSION_KEY)
     );
@@ -21,6 +24,8 @@ function hasStoredSessionCandidate(): boolean {
 }
 
 export const App: React.FC = () => {
+  const isTermsRoute =
+    typeof window !== 'undefined' && window.location.pathname === '/terms';
   const [initializing, setInitializing] = useState<boolean>(() => hasStoredSessionCandidate());
   const [username, setUsername] = useState<string>('');
   const [maintenance, setMaintenance] = useState<{ active: boolean; msg: string }>({
@@ -96,24 +101,9 @@ export const App: React.FC = () => {
   }, [handleLogout, showToast]);
 
   useEffect(() => {
-    async function bootstrap() {
-      try {
-        const res = await fetch('/api/settings/mode', {
-          headers: { 'X-Requested-With': 'XMLHttpRequest' },
-        });
-        const modeRes = await res.json().catch(() => ({}));
-        if (res.status === 503 || modeRes.mode === 'maintenance') {
-          setMaintenance({
-            active: true,
-            msg: modeRes.msg || 'سرور در حال به‌روزرسانی است.',
-          });
-          setInitializing(false);
-          return;
-        }
-      } catch {
-        // ignore
-      }
+    if (isTermsRoute) return;
 
+    async function bootstrap() {
       // ۱. بررسی ورود موقت ادمین (Login As)
       try {
         const adminTokenUser = sessionStorage.getItem('adminLoginToken');
@@ -131,6 +121,26 @@ export const App: React.FC = () => {
       try {
         const saved = localStorage.getItem(SESSION_KEY);
         if (saved) {
+          try {
+            const res = await fetch('/api/settings/mode', {
+              headers: {
+                'X-Requested-With': 'XMLHttpRequest',
+                'x-session-user': saved,
+              },
+            });
+            if (res.status === 503) {
+              const modeRes = await res.json().catch(() => ({}));
+              setMaintenance({
+                active: true,
+                msg: modeRes.msg || 'سرور در حال به‌روزرسانی است.',
+              });
+              setInitializing(false);
+              return;
+            }
+          } catch {
+            // ignore
+          }
+
           const check = await fetch('/api/user/' + encodeURIComponent(saved)).then(r =>
             r.json()
           );
@@ -150,13 +160,63 @@ export const App: React.FC = () => {
     }
 
     bootstrap();
-  }, [handleAuthenticated]);
+  }, [handleAuthenticated, isTermsRoute]);
 
   const skipLink = (
     <a href="#main-content" className="skip-link">
       پرش به محتوای اصلی
     </a>
   );
+
+  if (isTermsRoute) {
+    return (
+      <>
+        {skipLink}
+        <div className="terms-screen">
+          <div className="terms-box">
+            <header className="auth-logo">
+              <div className="logo-circle" aria-hidden="true">📋</div>
+              <h1>قوانین و مقررات پیام‌رسان</h1>
+              <p>لطفاً پیش از استفاده از سامانه، موارد زیر را مطالعه فرمایید</p>
+            </header>
+
+            <main id="main-content" tabIndex={-1}>
+              <ul className="terms-list">
+                <li>
+                  <strong>۱. احترام متقابل:</strong> رعایت ادب و احترام به سایر کاربران در تمامی گفتگوهای خصوصی و گروهی الزامی است و هرگونه توهین یا تهدید موجب مسدودیت حساب خواهد شد.
+                </li>
+                <li>
+                  <strong>۲. ممنوعیت هرزنامه (اسپم):</strong> ارسال پیام‌های تبلیغاتی ناخواسته، پیام‌های تکراری خودکار و ایجاد مزاحمت برای کاربران ممنوع است.
+                </li>
+                <li>
+                  <strong>۳. محتوای غیرقانونی و آسیب‌زا:</strong> انتشار هرگونه محتوای خلاف قوانین، بدافزار، فیشینگ، کلاهبرداری یا محتوای آسیب‌زا اکیداً ممنوع است.
+                </li>
+                <li>
+                  <strong>۴. حفاظت از حساب کاربری:</strong> مسئولیت حفظ امنیت حساب بر عهده کاربر است. هرگز کد تأیید یک‌بارمصرف (OTP) دریافتی در بله یا کلیدهای امنیتی خود را در اختیار دیگران قرار ندهید.
+                </li>
+                <li>
+                  <strong>۵. حریم خصوصی و رمزنگاری سرتاسری (E2EE):</strong> پیام‌های شما در این سامانه با رمزنگاری سرتاسری پساکوانتومی محافظت می‌شوند؛ به طوری که تنها فرستنده و گیرنده قادر به رمزگشایی و مطالعه محتوای پیام‌ها هستند.
+                </li>
+              </ul>
+
+              <a href="/" className="terms-back-link">
+                بازگشت به صفحه اصلی پیام‌رسان
+              </a>
+            </main>
+
+            <footer className="auth-footer">
+              <nav aria-label="پیوندهای پاصفحه" className="auth-footer-group">
+                <span>🔒 رمزنگاری سرتاسری</span>
+                <a href="/" className="link-btn">
+                  صفحه ورود
+                </a>
+              </nav>
+            </footer>
+          </div>
+        </div>
+      </>
+    );
+  }
 
   if (blocked) {
     const untilText =
@@ -212,14 +272,14 @@ export const App: React.FC = () => {
         <AuthScreen onAuthenticated={handleAuthenticated} />
       ) : (
         <Suspense fallback={<main id="main-content" className="auth-screen" tabIndex={-1} aria-busy="true" />}>
-          <div id="main-content" tabIndex={-1}>
+          <main id="main-content" tabIndex={-1}>
             <ChatApp
               myUsername={username}
               socket={socketInstance}
               onLogout={handleLogout}
               showToast={showToast}
             />
-          </div>
+          </main>
         </Suspense>
       )}
 
