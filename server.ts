@@ -1031,7 +1031,23 @@ async function start(): Promise<void> {
   }
 
   const distPath = path.join(process.cwd(), 'dist');
+  const publicPath = path.join(process.cwd(), 'public');
+  const assetsPath = path.join(distPath, 'assets');
   const isProd = process.env.NODE_ENV === 'production' && fs.existsSync(distPath);
+  const validClientRoutes = new Set(['/', '/index.html']);
+
+  if (fs.existsSync(assetsPath)) {
+    app.use(
+      '/assets',
+      express.static(assetsPath, {
+        maxAge: '1y',
+        immutable: true,
+        setHeaders: (res) => {
+          res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        },
+      })
+    );
+  }
 
   if (!isProd) {
     const { createServer: createViteServer } = await import('vite');
@@ -1039,12 +1055,63 @@ async function start(): Promise<void> {
       server: { middlewareMode: true },
       appType: 'spa',
     });
+    const isExistingFile = (baseDir: string, relPath: string): boolean => {
+      try {
+        const target = path.resolve(baseDir, '.' + relPath);
+        if (!target.startsWith(baseDir + path.sep)) return false;
+        return fs.existsSync(target) && fs.statSync(target).isFile();
+      } catch {
+        return false;
+      }
+    };
+
+    app.use((req, res, next) => {
+      const reqPath = req.path;
+      const isAppRoute = validClientRoutes.has(reqPath);
+      const isViteModule =
+        reqPath.startsWith('/@') ||
+        reqPath.startsWith('/__vite') ||
+        reqPath.startsWith('/src/') ||
+        reqPath.startsWith('/node_modules/');
+      const isStaticAsset =
+        isExistingFile(publicPath, reqPath) || isExistingFile(distPath, reqPath);
+
+      if (!isAppRoute && !isViteModule && !isStaticAsset) {
+        return res.status(404).send('Not Found');
+      }
+      if (isAppRoute) {
+        res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+      }
+      next();
+    });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(distPath));
-    app.use(express.static(path.join(process.cwd(), 'public')));
-    app.get('*', (_req, res) => {
+    app.use(
+      express.static(distPath, {
+        index: false,
+        setHeaders: (res, filePath) => {
+          if (filePath.endsWith('.html')) {
+            res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+          }
+        },
+      })
+    );
+    app.use(
+      express.static(publicPath, {
+        index: false,
+        setHeaders: (res, filePath) => {
+          if (filePath.endsWith('.html')) {
+            res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+          }
+        },
+      })
+    );
+    app.get(['/', '/index.html'], (_req, res) => {
+      res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
       res.sendFile(path.join(distPath, 'index.html'));
+    });
+    app.use((_req, res) => {
+      res.status(404).send('Not Found');
     });
   }
 

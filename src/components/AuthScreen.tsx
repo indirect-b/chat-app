@@ -159,12 +159,13 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
             <p>ورود با آیدی بله • مجهز به رمزنگاری E2EE</p>
           </div>
           <div className="auth-form">
-            <label>آیدی بله</label>
+            <label htmlFor="baleIdInput">آیدی بله</label>
             <div className="input-prefix">
               <span>@</span>
               <input
                 type="text"
                 id="baleIdInput"
+                aria-label="آیدی بله"
                 placeholder="your_id"
                 autoComplete="off"
                 value={baleId}
@@ -237,6 +238,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
             <input
               type="text"
               id="otpInput"
+              aria-label="کد تأیید"
               placeholder="● ● ● ● ● ●"
               maxLength={6}
               style={{ textAlign: 'center', letterSpacing: '10px', fontSize: '24px' }}
