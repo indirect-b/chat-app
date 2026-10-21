@@ -177,11 +177,6 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
             </span>
             <span className="auth-brand-name">سامانه پیام‌رسان</span>
           </div>
-          <nav aria-label="ناوبری بالای صفحه" className="auth-top-nav">
-            <a href="/terms" className="link-btn">
-              قوانین پیام‌رسان
-            </a>
-          </nav>
         </header>
 
         <main id="main-content" tabIndex={-1}>
@@ -403,9 +398,20 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                     onChange={e => setRulesChecked(e.target.checked)}
                   />
                   <label htmlFor="rulesCheck">
-                    <a href="/terms" onClick={handleOpenRules} className="rules-link">
+                    <button
+                      type="button"
+                      onClick={handleOpenRules}
+                      className="rules-link"
+                      style={{
+                        background: 'none',
+                        border: 'none',
+                        padding: 0,
+                        font: 'inherit',
+                        cursor: 'pointer',
+                      }}
+                    >
                       قوانین
-                    </a>{' '}
+                    </button>{' '}
                     را خواندم و می‌پذیرم
                   </label>
                 </div>
