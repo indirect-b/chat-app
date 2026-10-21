@@ -5,7 +5,8 @@
 **A real-time Persian web messenger with end-to-end encryption built for the post-quantum era.**
 
 Every message is protected by **PQ-MPRBA** — an original browser-native protocol combining a hybrid
-**ML-KEM-768 (FIPS 203) + ECDH P-256** ratchet with **Ristretto255-VOPRF** blinded authentication (RFC 9497).
+**ML-KEM-768 (FIPS 203) + ECDH P-256** ratchet with **Ristretto255-VOPRF** blinded authentication (RFC 9497)
+and **ML-DSA-65 (FIPS 204)** identity signatures.
 The server never sees plaintext, and never learns who is talking to whom.
 
 [![Version](https://img.shields.io/badge/version-6.0.0-blue)](CHANGELOG.md)
@@ -44,6 +45,7 @@ chat-app was designed from the start for hostile networks and a post-quantum fut
 - End-to-end encryption: **AES-256-GCM**, keys derived per message via a hybrid post-quantum ratchet
 - Login with **Bale ID**: OTP codes delivered by a Bale bot (`src/server/bale.ts`), plus a 1-click quick test login
 - Blinded identity authentication via **Ristretto255-VOPRF** with DLEQ zero-knowledge proofs
+- **ML-DSA-65 identity signatures (FIPS 204)** — key bundles and session handshakes are signed and verified; the PQ-KEM badge appears only for verified hybrid post-quantum sessions, a classical fallback shows a warning banner, and a forged signature triggers a man-in-the-middle warning
 - **Group Epoch FSM** — membership changes rotate group keys without losing in-flight messages
 - Typing indicators, presence, reactions, message edit/delete/pin/forward, read receipts
 - Voice notes & file attachments up to **50 MB**, processed off the main thread in Web Workers
@@ -73,6 +75,14 @@ a **DLEQ proof** (`POST /api/voprf/evaluate`), the client verifies the proof and
 derive an unlinkable routing token. The server can authenticate users without ever seeing — or linking —
 their identities, replacing heavy RSA blind signatures with compact 32-byte group elements.
 
+**Layer 3 — Post-quantum identity (ML-DSA-65, FIPS 204).**
+Each user holds an ML-DSA-65 keypair alongside the ML-KEM/ECDH bundle. Key bundles and session
+handshakes are signed with ML-DSA and verified on receipt, so a session's post-quantum claim is
+authenticated, not just asserted. The UI enforces this: the 🛡️ PQ-KEM badge appears only when
+ML-KEM-768 is present *and* the ML-DSA-65 signature verifies; a classical ECDH fallback shows a
+⚠️ classical warning banner instead of the badge, and a forged signature raises a
+⛔ man-in-the-middle warning.
+
 **Group epochs.** Group keys rotate through a deterministic finite state machine
 (`STABLE → ROTATING → STABLE`, synced via the `group-epoch-rotated` socket event). Outgoing messages
 queue during rotation, and a 3-epoch grace buffer (`MAX_EPOCH_HISTORY = 3`) keeps messages sent
@@ -86,23 +96,23 @@ milliseconds before a membership change decryptable.
 
 ```mermaid
 flowchart LR
-    subgraph Browser["Browser (all crypto happens here)"]
-        UI["React 19 + TypeScript SPA"]
-        CR["crypto.ts — PQ-MPRBA engine<br/>ML-KEM-768 + ECDH P-256 · AES-256-GCM · VOPRF"]
-        WK["Web Workers — media up to 50 MB"]
-        UI --> CR
-        UI --> WK
-    end
-    subgraph Server["Node.js server (zero-knowledge forwarder)"]
-        EX["Express + Socket.IO (server.ts)"]
-        PR["PresenceManager"]
-        DB["Dual-mode DB<br/>PostgreSQL · atomic JSON fallback"]
-        BL["Bale bot — OTP delivery"]
-        EX --> PR
-        EX --> DB
-        EX --> BL
-    end
-    UI <-->|"ciphertext + blinded tokens only"| EX
+  subgraph Browser["Browser (all crypto happens here)"]
+    UI["React 19 + TypeScript SPA"]
+    CR["crypto.ts — PQ-MPRBA engine<br/>ML-KEM-768 + ECDH P-256 · ML-DSA-65 · AES-256-GCM · VOPRF"]
+    WK["Web Workers — media up to 50 MB"]
+    UI --> CR
+    UI --> WK
+  end
+  subgraph Server["Node.js server (zero-knowledge forwarder)"]
+    EX["Express + Socket.IO (server.ts)"]
+    PR["PresenceManager"]
+    DB["Dual-mode DB<br/>PostgreSQL · atomic JSON fallback"]
+    BL["Bale bot — OTP delivery"]
+    EX --> PR
+    EX --> DB
+    EX --> BL
+  end
+  UI <-->|"ciphertext + blinded tokens only"| EX
 ```
 
 | Layer | Technology |
@@ -116,15 +126,15 @@ flowchart LR
 Key engineering details:
 
 - **Atomic disk fallback** (`src/server/db.ts`) — mutations are coalesced through a 250 ms debounced
-  write mutex and persisted via write-to-`.tmp` + atomic rename; history is auto-pruned at 5,000 messages.
+write mutex and persisted via write-to-`.tmp` + atomic rename; history is auto-pruned at 5,000 messages.
 - **Hybrid media persistence** — files ≤ 2 MB are stored as database blobs and served from
-  `GET /api/media/:id` with immutable caching; larger files (up to 50 MB) stream from disk, so media
-  survives ephemeral-container redeploys.
+`GET /api/media/:id` with immutable caching; larger files (up to 50 MB) stream from disk, so media
+survives ephemeral-container redeploys.
 - **Cluster-ready presence** (`src/server/presence.ts`) — O(1) bidirectional `socketId ↔ username`
-  lookup, with `REDIS_URL` hooks for horizontal scaling.
+lookup, with `REDIS_URL` hooks for horizontal scaling.
 - **No hardcoded secrets** (`src/server/config.ts`) — if `ADMIN_PASSWORD` is unset, a random
-  32-char hex secret is generated at boot; admin checks use `crypto.timingSafeEqual`, and the admin
-  path never appears in frontend bundles.
+32-char hex secret is generated at boot; admin checks use `crypto.timingSafeEqual`, and the admin
+path never appears in frontend bundles.
 
 ## 🚀 Quick start
 
@@ -135,7 +145,7 @@ git clone https://github.com/indirect-b/chat-app.git
 cd chat-app
 npm install
 cp .env.example .env   # then fill in your secrets
-npm run dev            # full-stack dev server (Express + Vite + Socket.IO)
+npm run dev             # full-stack dev server (Express + Vite + Socket.IO)
 ```
 
 Open http://localhost:3000 — use **Quick Test Login** to explore instantly, or log in with a Bale ID.
@@ -214,6 +224,7 @@ data/database.json        # Auto-generated fallback database snapshot
 
 Full details in [CHANGELOG.md](CHANGELOG.md).
 
+- **Latest (Oct 2026)** — ML-DSA-65 identity signatures (FIPS 204), anti-silent-downgrade indicators (verified-PQ badge gating, classical-fallback warning, forged-signature alert)
 - **v6.0** — PQ-MPRBA: hybrid ML-KEM-768 + ECDH P-256 ratchet, Ristretto255-VOPRF blinded auth, Group Epoch FSM
 - **v5.0** — Automatic ECDH P-256 key exchange & public-key directory
 - **v4.0** — Non-blocking atomic disk fallback (debounced mutex, `.tmp` rename)
@@ -227,7 +238,7 @@ Full details in [CHANGELOG.md](CHANGELOG.md).
 
 **پیام‌رسان** یک پیام‌رسان تحت وب فارسی و بلادرنگ است که تمام پیام‌هایش با رمزنگاری سرتاسری
 **پساکوانتومی** محافظت می‌شود. پروتکل اختصاصی پروژه، **PQ-MPRBA**، ترکیبی از تبادل کلید هیبریدی
-**ML-KEM-768 + ECDH P-256** و احراز هویت کور **Ristretto255-VOPRF** است؛ یعنی سرور نه متن پیام‌ها
+**ML-KEM-768 + ECDH P-256** و احراز هویت کور **Ristretto255-VOPRF** است و هویت‌ها با امضای **ML-DSA-65** تأیید می‌شوند؛ یعنی سرور نه متن پیام‌ها
 را می‌بیند و نه می‌تواند هویت کاربران را به هم گره بزند. ورود با آیدی بله (کد تأیید از طریق ربات بله)
 انجام می‌شود و برای تست، ورود سریع بدون کد هم وجود دارد.
 
