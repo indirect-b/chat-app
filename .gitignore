@@ -2,9 +2,15 @@
 node_modules/
 package-lock.json
 
-# دیتابیس محلی
+# خروجی بیلد فرانت‌اند (Vite)
+dist/
+
+# دیتابیس محلی و اسنپ‌شات‌های زمان اجرا (جلوگیری از لو رفتن دیتای کاربران در گیت‌هاب)
 chat.db
 chat.db-journal
+data/database.json
+data/database.json.tmp
+data/*.tmp
 
 # فایل‌های آپلود شده
 public/uploads/*

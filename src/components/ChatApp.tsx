@@ -116,6 +116,73 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   const [disappearModalOpen, setDisappearModalOpen] = useState(false);
   const [changelogModalOpen, setChangelogModalOpen] = useState(false);
 
+  // Group creation modal state
+  const [groupModalOpen, setGroupModalOpen] = useState(false);
+  const [groupNameInput, setGroupNameInput] = useState('');
+  const [groupMembersSelected, setGroupMembersSelected] = useState<string[]>([]);
+  const [extraMemberInput, setExtraMemberInput] = useState('');
+
+  // File upload hidden inputs refs (for reliable browser clicking)
+  const imageFileInputRef = useRef<HTMLInputElement | null>(null);
+  const docFileInputRef = useRef<HTMLInputElement | null>(null);
+  const avatarFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Time formatter with Asia/Tehran timezone
+  const formatMessageTime = useCallback((item?: { time?: string; timestamp?: number }): string => {
+    if (!item) return '';
+    if (item.timestamp) {
+      try {
+        return new Intl.DateTimeFormat('fa-IR', {
+          hour: '2-digit',
+          minute: '2-digit',
+          timeZone: 'Asia/Tehran',
+        }).format(new Date(item.timestamp));
+      } catch {
+        // fallback
+      }
+    }
+    return item.time || '';
+  }, []);
+
+  // Text search highlighter
+  const renderHighlightedText = useCallback((text: string, query: string) => {
+    if (!query || !query.trim() || !text) return text;
+    const q = query.trim();
+    const lowerText = text.toLowerCase();
+    const lowerQ = q.toLowerCase();
+    const firstMatch = lowerText.indexOf(lowerQ);
+    if (firstMatch === -1) return text;
+
+    const parts: React.ReactNode[] = [];
+    let curr = 0;
+    while (curr < text.length) {
+      const matchIdx = lowerText.indexOf(lowerQ, curr);
+      if (matchIdx === -1) {
+        parts.push(text.substring(curr));
+        break;
+      }
+      if (matchIdx > curr) {
+        parts.push(text.substring(curr, matchIdx));
+      }
+      parts.push(
+        <mark
+          key={matchIdx}
+          style={{
+            background: '#f59e0b',
+            color: '#111827',
+            padding: '1px 3px',
+            borderRadius: '3px',
+            fontWeight: 600,
+          }}
+        >
+          {text.substring(matchIdx, matchIdx + q.length)}
+        </mark>
+      );
+      curr = matchIdx + q.length;
+    }
+    return <>{parts}</>;
+  }, []);
+
   // Voice recording
   const [isRecording, setIsRecording] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -351,9 +418,56 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       );
     };
 
-    const onMsgDeleted = ({ roomId, msgId }: { roomId: string; msgId: string }) => {
-      if (roomId !== currentRoomRef.current) return;
-      setMessages(prev => prev.filter(m => m.id !== msgId));
+    const onMsgDeleted = async ({ roomId, msgId }: { roomId: string; msgId: string }) => {
+      const partnerId = roomId.startsWith('group__')
+        ? roomId.replace('group__', '')
+        : roomId.split('__').find(u => u !== myUsername);
+
+      if (roomId === currentRoomRef.current) {
+        setMessages(prev => prev.filter(m => m.id !== msgId));
+        setPinnedMessage(curr => (curr?.id === msgId ? null : curr));
+      }
+
+      // Refresh chat-list preview after delete
+      try {
+        const res = await fetch('/api/messages/' + encodeURIComponent(roomId)).then(r => r.json());
+        if (res.ok && Array.isArray(res.messages)) {
+          if (res.messages.length > 0) {
+            const lastMsg = res.messages[res.messages.length - 1];
+            const decLast = await processDecryption(lastMsg, roomId);
+            const previewStr =
+              decLast.decryptedText ||
+              (lastMsg.file_type === 'image'
+                ? '📷 عکس'
+                : lastMsg.file_type === 'voice'
+                ? '🎤 ویس'
+                : '📁 فایل');
+            setRooms(prev =>
+              prev.map(r =>
+                r.id === partnerId
+                  ? { ...r, preview: previewStr, time: formatMessageTime(lastMsg) }
+                  : r
+              )
+            );
+          } else {
+            setRooms(prev =>
+              prev.map(r =>
+                r.id === partnerId
+                  ? {
+                      ...r,
+                      preview: r.isGroup
+                        ? `گروه • Epoch #${r.epoch || 1}`
+                        : (r.online ? 'آنلاین' : 'آفلاین'),
+                      time: undefined,
+                    }
+                  : r
+              )
+            );
+          }
+        }
+      } catch {
+        // ignore
+      }
     };
 
     const onMsgPinned = ({ roomId, msgId }: { roomId: string; msgId: string }) => {
@@ -363,6 +477,14 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         if (found) setPinnedMessage(found);
         return prev.map(m => ({ ...m, is_pinned: m.id === msgId }));
       });
+    };
+
+    const onMsgUnpinned = ({ roomId, msgId }: { roomId: string; msgId?: string }) => {
+      if (roomId !== currentRoomRef.current) return;
+      setPinnedMessage(null);
+      setMessages(prev =>
+        prev.map(m => (!msgId || m.id === msgId ? { ...m, is_pinned: false } : m))
+      );
     };
 
     const onMsgReaction = ({
@@ -487,6 +609,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     socket.on('msg-edited', onMsgEdited);
     socket.on('msg-deleted', onMsgDeleted);
     socket.on('msg-pinned', onMsgPinned);
+    socket.on('msg-unpinned', onMsgUnpinned);
     socket.on('msg-reaction', onMsgReaction);
     socket.on('typing', onTyping);
     socket.on('contact-online', onContactOnline);
@@ -502,6 +625,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       socket.off('msg-edited', onMsgEdited);
       socket.off('msg-deleted', onMsgDeleted);
       socket.off('msg-pinned', onMsgPinned);
+      socket.off('msg-unpinned', onMsgUnpinned);
       socket.off('msg-reaction', onMsgReaction);
       socket.off('typing', onTyping);
       socket.off('contact-online', onContactOnline);
@@ -511,7 +635,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       socket.off('group-epoch-rotated', onGroupEpochRotated);
       socket.off('peer-key-updated', onPeerKeyUpdated);
     };
-  }, [myUsername, socket, processDecryption, scrollBottom, getPeerKeyForRoom, showToast]);
+  }, [myUsername, socket, processDecryption, scrollBottom, getPeerKeyForRoom, showToast, formatMessageTime]);
 
   const handleOpenChat = async (room: RoomSummary) => {
     const roomId = room.isGroup
@@ -713,6 +837,55 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     }
   };
 
+  const handleCreateGroup = async () => {
+    const trimmedName = groupNameInput.trim();
+    if (!trimmedName) {
+      showToast('لطفاً نام گروه را وارد کنید');
+      return;
+    }
+    const extra = extraMemberInput
+      .split(/[,،\s]+/)
+      .map(s => s.replace('@', '').trim())
+      .filter(Boolean);
+    const members = Array.from(new Set([...groupMembersSelected, ...extra])).filter(
+      u => u !== myUsername
+    );
+
+    try {
+      const res = await fetch('/api/create-group', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: trimmedName,
+          members,
+          creator: myUsername,
+        }),
+      }).then(r => r.json());
+
+      if (res.ok && res.group) {
+        setGroupModalOpen(false);
+        setGroupNameInput('');
+        setGroupMembersSelected([]);
+        setExtraMemberInput('');
+        showToast('✅ گروه با موفقیت ساخته شد');
+        setActiveTab('groups');
+        await loadRoomList('groups');
+        handleOpenChat({
+          id: res.group.id,
+          name: res.group.name,
+          isGroup: true,
+          preview: `گروه • Epoch #1`,
+          epoch: 1,
+          members: res.group.members,
+        });
+      } else {
+        showToast(res.msg || 'خطا در ایجاد گروه');
+      }
+    } catch {
+      showToast('خطا در برقراری ارتباط با سرور');
+    }
+  };
+
   const handleUploadAvatar = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -724,6 +897,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     if (res.ok) {
       setAvatarPreview(res.fileUrl);
     }
+    e.target.value = '';
   };
 
   const handleSaveProfile = async () => {
@@ -827,9 +1001,13 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     showToast('🚨 گزارش ارسال شد');
   };
 
-  const filteredRooms = rooms.filter(r =>
-    r.name.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const filteredRooms = rooms.filter(r => {
+    const q = searchQuery.toLowerCase().trim();
+    if (!q) return true;
+    const nameMatch = r.name.toLowerCase().includes(q);
+    const previewMatch = r.preview ? r.preview.toLowerCase().includes(q) : false;
+    return nameMatch || previewMatch;
+  });
 
   return (
     <div id="app" className="app">
@@ -884,8 +1062,14 @@ export const ChatApp: React.FC<ChatAppProps> = ({
             <button
               type="button"
               className="icon-btn"
-              onClick={() => setContactModalOpen(true)}
-              title="افزودن مخاطب"
+              onClick={() => {
+                if (activeTab === 'groups') {
+                  setGroupModalOpen(true);
+                } else {
+                  setContactModalOpen(true);
+                }
+              }}
+              title={activeTab === 'groups' ? 'ایجاد گروه جدید' : 'افزودن مخاطب'}
             >
               <svg
                 width="21"
@@ -905,7 +1089,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
             <div id="searchBar" className="search-bar">
               <input
                 type="text"
-                placeholder="جستجو..."
+                placeholder="جستجو در مخاطبان و پیام‌ها..."
                 id="searchInput"
                 value={searchQuery}
                 onChange={e => setSearchQuery(e.target.value)}
@@ -938,32 +1122,92 @@ export const ChatApp: React.FC<ChatAppProps> = ({
           </button>
         </div>
 
-        <div className="chat-list" id="chatList">
-          {filteredRooms.map(room => (
-            <div
-              key={room.id}
-              className={`chat-item ${currentPartner === room.id ? 'active' : ''}`}
-              onClick={() => handleOpenChat(room)}
+        {activeTab === 'groups' && (
+          <div style={{ padding: '8px 12px 2px' }}>
+            <button
+              type="button"
+              onClick={() => setGroupModalOpen(true)}
+              style={{
+                width: '100%',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '8px',
+                padding: '9px 12px',
+                borderRadius: '10px',
+                background: 'rgba(124, 58, 237, 0.16)',
+                border: '1px dashed rgba(124, 58, 237, 0.45)',
+                color: '#c4b5fd',
+                fontSize: '12.5px',
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
             >
-              <div className={`ci-avatar ${room.online ? 'online' : ''}`}>
-                {room.avatar ? (
-                  <img src={room.avatar} alt="" />
-                ) : (
-                  room.name[0]?.toUpperCase()
-                )}
-              </div>
-              <div className="ci-info">
-                <div className="ci-top">
-                  <span className="ci-name">
-                    {room.name}
-                    {room.isGroup && <span className="group-tag">گروه</span>}
-                  </span>
-                  <span className="ci-time">{room.time || ''}</span>
+              <span>➕</span>
+              <span>ایجاد گروه / روم جدید</span>
+            </button>
+          </div>
+        )}
+
+        <div className="chat-list" id="chatList">
+          {filteredRooms.length === 0 ? (
+            <div style={{ textAlign: 'center', padding: '36px 16px', color: '#9ca3af', fontSize: '13px' }}>
+              {activeTab === 'groups' ? (
+                <div>
+                  <div style={{ fontSize: '32px', marginBottom: '8px' }}>👥</div>
+                  <p style={{ margin: '0 0 10px' }}>هنوز عضوی در گروهی نیستید</p>
+                  <button
+                    type="button"
+                    onClick={() => setGroupModalOpen(true)}
+                    style={{
+                      padding: '7px 16px',
+                      borderRadius: '8px',
+                      background: 'var(--primary, #7c3aed)',
+                      color: '#fff',
+                      border: 'none',
+                      cursor: 'pointer',
+                      fontSize: '12px',
+                    }}
+                  >
+                    ساخت گروه جدید
+                  </button>
                 </div>
-                <div className="ci-preview">{room.preview || ''}</div>
-              </div>
+              ) : (
+                <div>
+                  <div style={{ fontSize: '32px', marginBottom: '8px' }}>💬</div>
+                  <p style={{ margin: 0 }}>مخاطبی یافت نشد</p>
+                </div>
+              )}
             </div>
-          ))}
+          ) : (
+            filteredRooms.map(room => (
+              <div
+                key={room.id}
+                className={`chat-item ${currentPartner === room.id ? 'active' : ''}`}
+                onClick={() => handleOpenChat(room)}
+              >
+                <div className={`ci-avatar ${room.online ? 'online' : ''}`}>
+                  {room.avatar ? (
+                    <img src={room.avatar} alt="" />
+                  ) : (
+                    room.name[0]?.toUpperCase()
+                  )}
+                </div>
+                <div className="ci-info">
+                  <div className="ci-top">
+                    <span className="ci-name">
+                      {renderHighlightedText(room.name, searchQuery)}
+                      {room.isGroup && <span className="group-tag">گروه</span>}
+                    </span>
+                    <span className="ci-time">{formatMessageTime(room)}</span>
+                  </div>
+                  <div className="ci-preview">
+                    {renderHighlightedText(room.preview || '', searchQuery)}
+                  </div>
+                </div>
+              </div>
+            ))
+          )}
         </div>
 
         <div className="sidebar-footer">
@@ -1109,14 +1353,79 @@ export const ChatApp: React.FC<ChatAppProps> = ({
             </div>
 
             {pinnedMessage && (
-              <div className="pinned-bar" id="pinnedBar">
-                📌{' '}
-                <span id="pinnedText">
-                  {(pinnedMessage.decryptedText || pinnedMessage.text || '').substring(
-                    0,
-                    50
-                  )}
-                </span>
+              <div
+                className="pinned-bar"
+                id="pinnedBar"
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: '8px',
+                  cursor: 'pointer',
+                  userSelect: 'none',
+                }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                    overflow: 'hidden',
+                    flex: 1,
+                  }}
+                  onClick={() => {
+                    const el = document.querySelector(`[data-id="${pinnedMessage.id}"]`);
+                    if (el) {
+                      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                      el.classList.add('highlight-pinned');
+                      setTimeout(() => el.classList.remove('highlight-pinned'), 1800);
+                    } else {
+                      showToast('پیام پین‌شده در این صفحه یافت نشد');
+                    }
+                  }}
+                  title="پرش به پیام پین‌شده"
+                >
+                  <span style={{ flexShrink: 0 }}>📌</span>
+                  <span
+                    id="pinnedText"
+                    style={{
+                      textOverflow: 'ellipsis',
+                      overflow: 'hidden',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {(pinnedMessage.decryptedText || pinnedMessage.text || (pinnedMessage.file_type ? 'فایل پیوست' : '')).substring(0, 55)}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={e => {
+                    e.stopPropagation();
+                    socket.emit('unpin-message', {
+                      msgId: pinnedMessage.id,
+                      roomId: currentRoom,
+                    });
+                    setPinnedMessage(null);
+                    setMessages(prev =>
+                      prev.map(m => (m.id === pinnedMessage.id ? { ...m, is_pinned: false } : m))
+                    );
+                    showToast('📌 پین پیام برداشته شد');
+                  }}
+                  title="برداشتن پین"
+                  style={{
+                    background: 'rgba(255,255,255,0.08)',
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    color: '#e5e7eb',
+                    cursor: 'pointer',
+                    fontSize: '11px',
+                    padding: '2px 8px',
+                    borderRadius: '5px',
+                    flexShrink: 0,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  برداشتن پین ✕
+                </button>
               </div>
             )}
 
@@ -1180,7 +1489,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                             </a>
                           </div>
                         ) : (
-                          <span>{displayText}</span>
+                          <span>{renderHighlightedText(displayText || '', searchQuery)}</span>
                         )}
 
                         {msg.is_edited && (
@@ -1230,7 +1539,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                               : '🔒'}
                           </span>
                         )}
-                        <span className="msg-time">{msg.time}</span>
+                        <span className="msg-time">{formatMessageTime(msg)}</span>
                         {isOut && (
                           <span
                             className={`msg-ticks ${msg.is_read ? 'read' : ''}`}
@@ -1328,25 +1637,32 @@ export const ChatApp: React.FC<ChatAppProps> = ({
 
             {attachOpen && (
               <div className="attach-menu" id="attachMenu">
-                <label className="attach-item">
-                  📷 عکس
-                  <input
-                    type="file"
-                    accept="image/*"
-                    onChange={e => handleUploadFile(e, 'image')}
-                    hidden
-                  />
-                </label>
-                <label className="attach-item">
-                  📁 فایل
-                  <input
-                    type="file"
-                    onChange={e => handleUploadFile(e, 'file')}
-                    hidden
-                  />
-                </label>
                 <div
                   className="attach-item"
+                  role="button"
+                  style={{ cursor: 'pointer' }}
+                  onClick={() => {
+                    setAttachOpen(false);
+                    imageFileInputRef.current?.click();
+                  }}
+                >
+                  📷 عکس
+                </div>
+                <div
+                  className="attach-item"
+                  role="button"
+                  style={{ cursor: 'pointer' }}
+                  onClick={() => {
+                    setAttachOpen(false);
+                    docFileInputRef.current?.click();
+                  }}
+                >
+                  📁 فایل
+                </div>
+                <div
+                  className="attach-item"
+                  role="button"
+                  style={{ cursor: 'pointer' }}
                   onClick={() => {
                     setAttachOpen(false);
                     setDisappearModalOpen(true);
@@ -1356,6 +1672,21 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 </div>
               </div>
             )}
+
+            {/* Hidden file inputs mounted outside menu and triggered via ref */}
+            <input
+              ref={imageFileInputRef}
+              type="file"
+              accept="image/*"
+              style={{ position: 'fixed', top: '-10000px', left: '-10000px', opacity: 0, pointerEvents: 'none' }}
+              onChange={e => handleUploadFile(e, 'image')}
+            />
+            <input
+              ref={docFileInputRef}
+              type="file"
+              style={{ position: 'fixed', top: '-10000px', left: '-10000px', opacity: 0, pointerEvents: 'none' }}
+              onChange={e => handleUploadFile(e, 'file')}
+            />
           </div>
         )}
       </div>
@@ -1422,18 +1753,38 @@ export const ChatApp: React.FC<ChatAppProps> = ({
           >
             ↗️ فوروارد
           </div>
-          <div
-            className="ctx-item"
-            onClick={() => {
-              socket.emit('pin-message', {
-                msgId: ctxMenu.msgId,
-                roomId: currentRoom,
-              });
-              setCtxMenu(prev => ({ ...prev, visible: false }));
-            }}
-          >
-            📌 پین
-          </div>
+          {pinnedMessage?.id === ctxMenu.msgId || messages.find(m => m.id === ctxMenu.msgId)?.is_pinned ? (
+            <div
+              className="ctx-item"
+              onClick={() => {
+                socket.emit('unpin-message', {
+                  msgId: ctxMenu.msgId,
+                  roomId: currentRoom,
+                });
+                setPinnedMessage(prev => (prev?.id === ctxMenu.msgId ? null : prev));
+                setMessages(prev =>
+                  prev.map(m => (m.id === ctxMenu.msgId ? { ...m, is_pinned: false } : m))
+                );
+                setCtxMenu(prev => ({ ...prev, visible: false }));
+                showToast('📌 پین پیام برداشته شد');
+              }}
+            >
+              📌 برداشتن پین
+            </div>
+          ) : (
+            <div
+              className="ctx-item"
+              onClick={() => {
+                socket.emit('pin-message', {
+                  msgId: ctxMenu.msgId,
+                  roomId: currentRoom,
+                });
+                setCtxMenu(prev => ({ ...prev, visible: false }));
+              }}
+            >
+              📌 پین
+            </div>
+          )}
           <div
             className="ctx-item"
             onClick={() => {
@@ -1597,15 +1948,20 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                   myUsername[0]?.toUpperCase()
                 )}
               </div>
-              <label style={{ fontSize: '12px', color: '#9ca3af', cursor: 'pointer' }}>
+              <input
+                ref={avatarFileInputRef}
+                type="file"
+                accept="image/*"
+                style={{ position: 'fixed', top: '-10000px', left: '-10000px', opacity: 0, pointerEvents: 'none' }}
+                onChange={handleUploadAvatar}
+              />
+              <div
+                role="button"
+                onClick={() => avatarFileInputRef.current?.click()}
+                style={{ fontSize: '12px', color: '#9ca3af', cursor: 'pointer' }}
+              >
                 📷 تغییر عکس پروفایل
-                <input
-                  type="file"
-                  accept="image/*"
-                  onChange={handleUploadAvatar}
-                  hidden
-                />
-              </label>
+              </div>
             </div>
             <label style={{ fontSize: '13px', color: '#9ca3af' }}>بیوگرافی</label>
             <input
@@ -1987,6 +2343,117 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 style={{ width: '100%' }}
               >
                 بستن پنجره چنج‌لاگ
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CREATE GROUP MODAL */}
+      {groupModalOpen && (
+        <div className="modal" id="groupModal">
+          <div className="modal-box">
+            <h3>👥 ایجاد گروه جدید</h3>
+            <p style={{ fontSize: '12px', color: '#9ca3af', marginBottom: '12px' }}>
+              نام گروه را وارد کنید و اعضای مورد نظر را انتخاب یا تایپ کنید:
+            </p>
+
+            <label style={{ fontSize: '13px', color: '#9ca3af', display: 'block', marginBottom: '4px' }}>
+              نام گروه
+            </label>
+            <input
+              type="text"
+              placeholder="مثال: تیم توسعه یا دوستان..."
+              value={groupNameInput}
+              onChange={e => setGroupNameInput(e.target.value)}
+              autoFocus
+              style={{ marginBottom: '12px', width: '100%' }}
+            />
+
+            <label style={{ fontSize: '13px', color: '#9ca3af', display: 'block', marginBottom: '6px' }}>
+              انتخاب اعضا از میان مخاطبان:
+            </label>
+            <div
+              style={{
+                maxHeight: '140px',
+                overflowY: 'auto',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '6px',
+                background: 'rgba(255,255,255,0.03)',
+                padding: '8px',
+                borderRadius: '8px',
+                border: '1px solid var(--border)',
+                marginBottom: '12px',
+              }}
+            >
+              {rooms.filter(r => !r.isGroup).length === 0 ? (
+                <div style={{ fontSize: '12px', color: '#6b7280', textAlign: 'center', padding: '6px' }}>
+                  مخاطبی در لیست وجود ندارد. می‌توانید آیدی اعضا را در کادر زیر بنویسید.
+                </div>
+              ) : (
+                rooms
+                  .filter(r => !r.isGroup)
+                  .map(c => {
+                    const isSelected = groupMembersSelected.includes(c.id);
+                    return (
+                      <label
+                        key={c.id}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '8px',
+                          fontSize: '13px',
+                          cursor: 'pointer',
+                          padding: '4px 6px',
+                          borderRadius: '6px',
+                          background: isSelected ? 'rgba(124, 58, 237, 0.15)' : 'transparent',
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={e => {
+                            if (e.target.checked) {
+                              setGroupMembersSelected(prev => [...prev, c.id]);
+                            } else {
+                              setGroupMembersSelected(prev => prev.filter(id => id !== c.id));
+                            }
+                          }}
+                        />
+                        <span>@{c.name}</span>
+                      </label>
+                    );
+                  })
+              )}
+            </div>
+
+            <label style={{ fontSize: '13px', color: '#9ca3af', display: 'block', marginBottom: '4px' }}>
+              افزودن آیدی‌های دیگر (با فاصله یا ویرگول جدا کنید):
+            </label>
+            <input
+              type="text"
+              placeholder="@کاربر_۱, @کاربر_۲ ..."
+              value={extraMemberInput}
+              onChange={e => setExtraMemberInput(e.target.value)}
+              style={{ marginBottom: '16px', width: '100%' }}
+            />
+
+            <div className="modal-btns">
+              <button type="button" onClick={handleCreateGroup}>
+                ایجاد گروه
+              </button>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={() => {
+                  setGroupModalOpen(false);
+                  setGroupNameInput('');
+                  setGroupMembersSelected([]);
+                  setExtraMemberInput('');
+                }}
+              >
+                انصراف
               </button>
             </div>
           </div>

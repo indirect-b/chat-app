@@ -185,6 +185,10 @@
   flex-shrink:0;
   cursor:pointer;
 }
+.msg-wrap.highlight-pinned .bubble{
+  box-shadow:0 0 0 3px #f59e0b, 0 0 18px rgba(245,158,11,.45);
+  transition:box-shadow .3s ease;
+}
 .messages-container{
   flex:1;
   overflow-y:auto;

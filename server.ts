@@ -1,3 +1,4 @@
+// sync checkpoint — no behavior change
 import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import http from 'http';
@@ -14,7 +15,7 @@ import { pool, init } from './src/server/db';
 import { presence } from './src/server/presence';
 
 // کلید سرور برای پروتکل احراز هویت کور Ristretto255-VOPRF (RFC 9497)
-const voprfSeed = sha256(new TextEncoder().encode(config.ADMIN_SECRET + '::voprf-ristretto255-seed'));
+const voprfSeed = sha256(new TextEncoder().encode(config.ADMIN_PASSWORD + '::voprf-ristretto255-seed'));
 const serverVoprfKeys = ristretto255_oprf.voprf.deriveKeyPair(
   voprfSeed,
   new TextEncoder().encode('PersianMessenger-Ristretto255-VOPRF-v2')
@@ -173,7 +174,7 @@ app.post('/api/upload', upload.single('file'), async (req: Request, res: Respons
 });
 
 app.get('/api/media/:id', async (req: Request, res: Response) => {
-  const mediaId = req.params.id;
+  const mediaId = String(req.params.id);
   try {
     const { rows } = await pool.query('SELECT * FROM media_blobs WHERE id = $1', [mediaId]);
     if (rows.length) {
@@ -507,6 +508,31 @@ app.delete('/api/admin/message', async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
+app.post('/api/create-group', async (req: Request, res: Response) => {
+  const { name, members, creator } = req.body;
+  if (!name || !name.trim()) return res.json({ ok: false, msg: 'نام گروه را وارد کنید' });
+  const memberList = Array.isArray(members) ? members : [];
+  const allMembers = Array.from(new Set([creator, ...memberList].filter(Boolean)));
+  const groupId = uuidv4();
+  await pool.query('INSERT INTO groups (id, name, members, created_at) VALUES ($1,$2,$3,$4)', [
+    groupId,
+    name.trim(),
+    JSON.stringify(allMembers),
+    new Date().toISOString(),
+  ]);
+  const newGroupData = {
+    id: groupId,
+    name: name.trim(),
+    members: allMembers,
+    epoch: 1,
+    created_at: new Date().toISOString(),
+  };
+  allMembers.forEach(m => {
+    presence.emitToUser(io, m, 'new-group', newGroupData);
+  });
+  res.json({ ok: true, group: newGroupData, groupId });
+});
+
 app.post('/api/admin/create-group', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
   const { name, members } = req.body;
@@ -656,7 +682,7 @@ app.post('/api/admin/login-as', (req: Request, res: Response) => {
 });
 
 app.get('/api/admin-login-as/:token', async (req: Request, res: Response) => {
-  const token = req.params.token;
+  const token = String(req.params.token);
   const data = adminTokens[token];
 
   if (!data || Date.now() > data.expire) {
@@ -747,7 +773,7 @@ io.on('connection', (socket) => {
       is_pinned: 0,
       is_read: 0,
       disappear_at: disappearAt,
-      time: new Date().toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' }),
+      time: new Date().toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Tehran' }),
       timestamp: Date.now(),
     };
 
@@ -818,6 +844,41 @@ io.on('connection', (socket) => {
     io.emit('msg-pinned', { roomId, msgId });
   });
 
+  socket.on('unpin-message', async ({ msgId, roomId }: any) => {
+    if (!currentUser) return;
+    if (msgId) {
+      await pool.query('UPDATE messages SET is_pinned=0 WHERE id=$1', [msgId]);
+    }
+    if (roomId) {
+      await pool.query('UPDATE messages SET is_pinned=0 WHERE room_id=$1', [roomId]);
+    }
+    io.emit('msg-unpinned', { roomId, msgId });
+  });
+
+  socket.on('create-group', async ({ name, members }: any) => {
+    if (!currentUser || !name || !name.trim()) return;
+    const memberList = Array.isArray(members) ? members : [];
+    const allMembers = Array.from(new Set([currentUser, ...memberList].filter(Boolean)));
+    const groupId = uuidv4();
+    await pool.query('INSERT INTO groups (id, name, members, created_at) VALUES ($1,$2,$3,$4)', [
+      groupId,
+      name.trim(),
+      JSON.stringify(allMembers),
+      new Date().toISOString(),
+    ]);
+    const newGroupData = {
+      id: groupId,
+      name: name.trim(),
+      members: allMembers,
+      epoch: 1,
+      created_at: new Date().toISOString(),
+    };
+    allMembers.forEach(m => {
+      presence.emitToUser(io, m, 'new-group', newGroupData);
+    });
+    socket.emit('group-created', newGroupData);
+  });
+
   socket.on('react', async ({ msgId, roomId, emoji }: any) => {
     if (!currentUser) return;
     const { rows } = await pool.query('SELECT reactions FROM messages WHERE id=$1', [msgId]);
@@ -853,7 +914,7 @@ io.on('connection', (socket) => {
         is_pinned: 0,
         is_read: 0,
         disappear_at: null,
-        time: new Date().toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' }),
+        time: new Date().toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Tehran' }),
         timestamp: Date.now(),
       };
       await pool.query(

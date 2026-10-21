@@ -432,6 +432,15 @@ export class PersistentFallbackDatabase {
       }
       return { rows: [] };
     }
+    if (lower.includes('update messages set is_pinned=0 where id=$1')) {
+      const id = params[0];
+      const m = this.messages.find(msg => msg.id === id);
+      if (m) {
+        m.is_pinned = 0;
+        this.scheduleSave();
+      }
+      return { rows: [] };
+    }
     if (lower.includes('update messages set is_pinned=0 where room_id=$1')) {
       const roomId = params[0];
       this.messages.forEach(m => {
