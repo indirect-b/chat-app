@@ -18,5 +18,20 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules/react-dom')) {
+            return 'vendor-react-dom';
+          }
+          if (id.includes('node_modules/react/') || id.includes('node_modules/scheduler')) {
+            return 'vendor-react';
+          }
+          if (id.includes('node_modules/@noble')) {
+            return 'vendor-crypto';
+          }
+        },
+      },
+    },
   },
 });

@@ -1,14 +1,48 @@
 import React, { useState, useEffect, useCallback, Suspense } from 'react';
-import { io, Socket } from 'socket.io-client';
-import { AuthScreen } from './components/AuthScreen';
+import type { Socket } from 'socket.io-client';
 import { BlockedInfo } from './types';
 
+const AuthScreen = React.lazy(() =>
+  import('./components/AuthScreen').then(m => ({ default: m.AuthScreen }))
+);
+const TermsScreen = React.lazy(() =>
+  import('./components/TermsScreen').then(m => ({ default: m.TermsScreen }))
+);
 const ChatApp = React.lazy(() =>
   import('./components/ChatApp').then(m => ({ default: m.ChatApp }))
 );
 
 const SESSION_KEY = 'chat_session_user';
-const socketInstance: Socket = io({ transports: ['websocket'] });
+
+const ROUTE_META: Record<string, { title: string; description: string }> = {
+  '/': {
+    title: 'پیام‌رسان',
+    description:
+      'پیام‌رسان امن و سریع با رمزنگاری سرتاسری برای گفت‌وگوی خصوصی و بلادرنگ با دوستان و خانواده.',
+  },
+  '/login': {
+    title: 'ورود به حساب | پیام‌رسان',
+    description:
+      'ورود امن به پیام‌رسان با آیدی بله و کد تأیید یک‌بارمصرف؛ گفت‌وگوی خصوصی با رمزنگاری سرتاسری.',
+  },
+  '/terms': {
+    title: 'قوانین پیام‌رسان | پیام‌رسان',
+    description:
+      'قوانین و مقررات پیام‌رسان را بخوانید؛ شرایط استفاده، حریم خصوصی، حقوق داده و حذف حساب کاربری را بدانید.',
+  },
+};
+
+function updateDocumentMeta(pathname: string) {
+  if (typeof document === 'undefined') return;
+  const meta = ROUTE_META[pathname] || ROUTE_META['/'];
+  document.title = meta.title;
+  const descEl = document.querySelector('meta[name="description"]');
+  if (descEl) descEl.setAttribute('content', meta.description);
+  const ogTitleEl = document.querySelector('meta[property="og:title"]');
+  if (ogTitleEl) ogTitleEl.setAttribute('content', meta.title);
+  const ogDescEl = document.querySelector('meta[property="og:description"]');
+  if (ogDescEl) ogDescEl.setAttribute('content', meta.description);
+}
 
 function hasStoredSessionCandidate(): boolean {
   try {
@@ -24,10 +58,15 @@ function hasStoredSessionCandidate(): boolean {
 }
 
 export const App: React.FC = () => {
-  const isTermsRoute =
-    typeof window !== 'undefined' && window.location.pathname === '/terms';
+  const [pathname, setPathname] = useState<string>(() => {
+    const p = typeof window !== 'undefined' ? window.location.pathname : '/';
+    updateDocumentMeta(p);
+    return p;
+  });
+  const isTermsRoute = pathname === '/terms';
   const [initializing, setInitializing] = useState<boolean>(() => hasStoredSessionCandidate());
   const [username, setUsername] = useState<string>('');
+  const [socket, setSocket] = useState<Socket | null>(null);
   const [maintenance, setMaintenance] = useState<{ active: boolean; msg: string }>({
     active: false,
     msg: '',
@@ -39,6 +78,28 @@ export const App: React.FC = () => {
   } | null>(null);
   const [toasts, setToasts] = useState<{ id: number; text: string }[]>([]);
 
+  const handleNavigate = useCallback((nextPath: string) => {
+    if (typeof window !== 'undefined' && window.location.pathname !== nextPath) {
+      window.history.pushState({}, '', nextPath);
+    }
+    updateDocumentMeta(nextPath);
+    setPathname(nextPath);
+  }, []);
+
+  useEffect(() => {
+    updateDocumentMeta(pathname);
+  }, [pathname]);
+
+  useEffect(() => {
+    const onPopState = () => {
+      const p = window.location.pathname;
+      updateDocumentMeta(p);
+      setPathname(p);
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
   const showToast = useCallback((text: string) => {
     const id = Date.now() + Math.random();
     setToasts(prev => [...prev, { id, text }]);
@@ -47,18 +108,25 @@ export const App: React.FC = () => {
     }, 2800);
   }, []);
 
-  const handleAuthenticated = useCallback((user: string) => {
-    try {
-      localStorage.setItem(SESSION_KEY, user);
-    } catch {
-      // ignore
-    }
-    setUsername(user);
-  }, []);
+  const handleAuthenticated = useCallback(
+    (user: string) => {
+      try {
+        localStorage.setItem(SESSION_KEY, user);
+      } catch {
+        // ignore
+      }
+      setUsername(user);
+      if (pathname === '/login') {
+        handleNavigate('/');
+      }
+    },
+    [handleNavigate, pathname]
+  );
 
   const handleLogout = useCallback(() => {
     try {
       localStorage.removeItem(SESSION_KEY);
+      localStorage.removeItem('chat_session_token');
     } catch {
       // ignore
     }
@@ -67,6 +135,10 @@ export const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    if (isTermsRoute) return;
+    let activeSocket: Socket | null = null;
+    let cancelled = false;
+
     const onBlocked = (data: BlockedInfo) => setBlocked(data || {});
     const onKicked = () => {
       showToast('شما از سرور اخراج شدید!');
@@ -85,20 +157,29 @@ export const App: React.FC = () => {
       setAnnouncement(data);
     };
 
-    socketInstance.on('blocked', onBlocked);
-    socketInstance.on('kicked', onKicked);
-    socketInstance.on('server-maintenance', onServerMaint);
-    socketInstance.on('server-normal', onServerNormal);
-    socketInstance.on('announcement', onAnnouncement);
+    import('socket.io-client').then(({ io }) => {
+      if (cancelled) return;
+      activeSocket = io({ transports: ['websocket'] });
+      activeSocket.on('blocked', onBlocked);
+      activeSocket.on('kicked', onKicked);
+      activeSocket.on('server-maintenance', onServerMaint);
+      activeSocket.on('server-normal', onServerNormal);
+      activeSocket.on('announcement', onAnnouncement);
+      setSocket(activeSocket);
+    });
 
     return () => {
-      socketInstance.off('blocked', onBlocked);
-      socketInstance.off('kicked', onKicked);
-      socketInstance.off('server-maintenance', onServerMaint);
-      socketInstance.off('server-normal', onServerNormal);
-      socketInstance.off('announcement', onAnnouncement);
+      cancelled = true;
+      if (activeSocket) {
+        activeSocket.off('blocked', onBlocked);
+        activeSocket.off('kicked', onKicked);
+        activeSocket.off('server-maintenance', onServerMaint);
+        activeSocket.off('server-normal', onServerNormal);
+        activeSocket.off('announcement', onAnnouncement);
+        activeSocket.disconnect();
+      }
     };
-  }, [handleLogout, showToast]);
+  }, [handleLogout, showToast, isTermsRoute]);
 
   useEffect(() => {
     if (isTermsRoute) return;
@@ -172,48 +253,15 @@ export const App: React.FC = () => {
     return (
       <>
         {skipLink}
-        <div className="terms-screen">
-          <div className="terms-box">
-            <header className="auth-logo">
-              <div className="logo-circle" aria-hidden="true">📋</div>
+        <Suspense
+          fallback={
+            <main id="main-content" className="terms-screen" tabIndex={-1} aria-busy="true">
               <h1>قوانین و مقررات پیام‌رسان</h1>
-              <p>لطفاً پیش از استفاده از سامانه، موارد زیر را مطالعه فرمایید</p>
-            </header>
-
-            <main id="main-content" tabIndex={-1}>
-              <ul className="terms-list">
-                <li>
-                  <strong>۱. احترام متقابل:</strong> رعایت ادب و احترام به سایر کاربران در تمامی گفتگوهای خصوصی و گروهی الزامی است و هرگونه توهین یا تهدید موجب مسدودیت حساب خواهد شد.
-                </li>
-                <li>
-                  <strong>۲. ممنوعیت هرزنامه (اسپم):</strong> ارسال پیام‌های تبلیغاتی ناخواسته، پیام‌های تکراری خودکار و ایجاد مزاحمت برای کاربران ممنوع است.
-                </li>
-                <li>
-                  <strong>۳. محتوای غیرقانونی و آسیب‌زا:</strong> انتشار هرگونه محتوای خلاف قوانین، بدافزار، فیشینگ، کلاهبرداری یا محتوای آسیب‌زا اکیداً ممنوع است.
-                </li>
-                <li>
-                  <strong>۴. حفاظت از حساب کاربری:</strong> مسئولیت حفظ امنیت حساب بر عهده کاربر است. هرگز کد تأیید یک‌بارمصرف (OTP) دریافتی در بله یا کلیدهای امنیتی خود را در اختیار دیگران قرار ندهید.
-                </li>
-                <li>
-                  <strong>۵. حریم خصوصی و رمزنگاری سرتاسری (E2EE):</strong> پیام‌های شما در این سامانه با رمزنگاری سرتاسری پساکوانتومی محافظت می‌شوند؛ به طوری که تنها فرستنده و گیرنده قادر به رمزگشایی و مطالعه محتوای پیام‌ها هستند.
-                </li>
-              </ul>
-
-              <a href="/" className="terms-back-link">
-                بازگشت به صفحه اصلی پیام‌رسان
-              </a>
             </main>
-
-            <footer className="auth-footer">
-              <nav aria-label="پیوندهای پاصفحه" className="auth-footer-group">
-                <span>🔒 رمزنگاری سرتاسری</span>
-                <a href="/" className="link-btn">
-                  صفحه ورود
-                </a>
-              </nav>
-            </footer>
-          </div>
-        </div>
+          }
+        >
+          <TermsScreen onNavigate={handleNavigate} />
+        </Suspense>
       </>
     );
   }
@@ -231,7 +279,9 @@ export const App: React.FC = () => {
         {skipLink}
         <main id="main-content" className="full-screen" tabIndex={-1}>
           <div className="maint-box">
-            <div style={{ fontSize: '60px' }} aria-hidden="true">🚫</div>
+            <div style={{ fontSize: '60px' }} aria-hidden="true">
+              🚫
+            </div>
             <h1>حساب مسدود شد</h1>
             <p>علت: {blocked.block_reason || 'تخلف'}</p>
             <p>{untilText}</p>
@@ -247,7 +297,9 @@ export const App: React.FC = () => {
         {skipLink}
         <main id="main-content" className="full-screen" tabIndex={-1}>
           <div className="maint-box">
-            <div style={{ fontSize: '60px' }} aria-hidden="true">🔧</div>
+            <div style={{ fontSize: '60px' }} aria-hidden="true">
+              🔧
+            </div>
             <h1>در حال به‌روزرسانی</h1>
             <p id="maintMsg">{maintenance.msg}</p>
           </div>
@@ -268,19 +320,33 @@ export const App: React.FC = () => {
   return (
     <>
       {skipLink}
-      {!username ? (
-        <AuthScreen onAuthenticated={handleAuthenticated} />
-      ) : (
-        <Suspense fallback={<main id="main-content" className="auth-screen" tabIndex={-1} aria-busy="true" />}>
+      {!username || pathname === '/login' ? (
+        <Suspense
+          fallback={
+            <main id="main-content" className="auth-screen" tabIndex={-1} aria-busy="true">
+              <h1>پیام‌رسان</h1>
+            </main>
+          }
+        >
+          <AuthScreen onAuthenticated={handleAuthenticated} />
+        </Suspense>
+      ) : socket ? (
+        <Suspense
+          fallback={
+            <main id="main-content" className="auth-screen" tabIndex={-1} aria-busy="true" />
+          }
+        >
           <main id="main-content" tabIndex={-1}>
             <ChatApp
               myUsername={username}
-              socket={socketInstance}
+              socket={socket}
               onLogout={handleLogout}
               showToast={showToast}
             />
           </main>
         </Suspense>
+      ) : (
+        <main id="main-content" className="auth-screen" tabIndex={-1} aria-busy="true" />
       )}
 
       {announcement && (

@@ -125,6 +125,14 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
       return;
     }
 
+    if (res.sessionToken) {
+      try {
+        localStorage.setItem('chat_session_token', res.sessionToken);
+      } catch {
+        // ignore
+      }
+    }
+
     if (!res.isNew) {
       setMsg({ text: '✅ خوش آمدی!', isOk: true });
       setTimeout(() => onAuthenticated(res.username), 400);
@@ -162,235 +170,272 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   return (
     <div id="authScreen" className="auth-screen">
       <div id={`step${step}`} className="auth-box">
-        {step === 1 && (
-          <header className="auth-logo">
-            <div className="logo-circle" aria-hidden="true">💬</div>
-            <h1>پیام‌رسان</h1>
-            <p>ورود با آیدی بله • مجهز به رمزنگاری E2EE</p>
-          </header>
-        )}
-
-        {step === 2 && (
-          <header className="auth-logo">
-            <div
-              className="logo-circle"
-              style={{ background: 'linear-gradient(135deg,#06b6d4,#7c3aed)' }}
-              aria-hidden="true"
-            >
-              🔐
-            </div>
-            <h1>کد تأیید</h1>
-            <p id="step2desc">{step2Desc}</p>
-          </header>
-        )}
-
-        {step === 3 && (
-          <header className="auth-logo">
-            <div
-              className="logo-circle"
-              style={{ background: 'linear-gradient(135deg,#22c55e,#06b6d4)' }}
-              aria-hidden="true"
-            >
-              👋
-            </div>
-            <h1>خوش آمدی!</h1>
-            <p>قبل از ورود قوانین را بخوانید</p>
-          </header>
-        )}
+        <header className="auth-banner">
+          <div className="auth-brand">
+            <span className="auth-brand-icon" aria-hidden="true">
+              💬
+            </span>
+            <span className="auth-brand-name">سامانه پیام‌رسان</span>
+          </div>
+          <nav aria-label="ناوبری بالای صفحه" className="auth-top-nav">
+            <a href="/terms" className="link-btn">
+              قوانین پیام‌رسان
+            </a>
+          </nav>
+        </header>
 
         <main id="main-content" tabIndex={-1}>
           {step === 1 && (
-            <form
-              className="auth-form"
-              noValidate
-              onSubmit={e => {
-                e.preventDefault();
-                handleSendOTP();
-              }}
-            >
-              <label htmlFor="baleIdInput">
-                آیدی بله <span aria-hidden="true">*</span>
-              </label>
-              <div className={`input-prefix ${isBaleIdInvalid ? 'input-invalid' : ''}`}>
-                <span aria-hidden="true">@</span>
+            <>
+              <div className="auth-logo">
+                <div className="logo-circle" aria-hidden="true">
+                  💬
+                </div>
+                <h1>پیام‌رسان</h1>
+                <p>ورود با آیدی بله • مجهز به رمزنگاری E2EE</p>
+              </div>
+              <form
+                className="auth-form"
+                noValidate
+                onSubmit={e => {
+                  e.preventDefault();
+                  handleSendOTP();
+                }}
+              >
+                <label htmlFor="baleIdInput">
+                  آیدی بله <span aria-hidden="true">*</span>
+                </label>
+                <div className={`input-prefix ${isBaleIdInvalid ? 'input-invalid' : ''}`}>
+                  <span aria-hidden="true">@</span>
+                  <input
+                    type="text"
+                    id="baleIdInput"
+                    name="baleId"
+                    aria-label="آیدی بله"
+                    required
+                    aria-required="true"
+                    aria-invalid={isBaleIdInvalid ? 'true' : 'false'}
+                    aria-describedby="baleIdHint baleIdError"
+                    placeholder="username123"
+                    dir="ltr"
+                    autoComplete="username"
+                    value={baleId}
+                    onChange={e => {
+                      setBaleId(e.target.value);
+                      if (baleIdError) setBaleIdError('');
+                    }}
+                  />
+                </div>
+                <p
+                  id="baleIdError"
+                  role="alert"
+                  aria-live="assertive"
+                  className={`field-error ${baleIdError ? 'visible' : ''}`}
+                >
+                  {baleIdError}
+                </p>
+                <p id="baleIdHint" className="input-hint">
+                  آیدی بله خود را بدون <bdi dir="ltr">@</bdi> وارد کنید (مثال:{' '}
+                  <bdi dir="ltr">username123</bdi>)
+                </p>
+                <button type="submit">دریافت کد تأیید</button>
+
+                <div className="test-login-divider" role="separator" aria-label="یا">
+                  <span className="divider-line" aria-hidden="true" />
+                  <span className="divider-text">یا</span>
+                  <span className="divider-line" aria-hidden="true" />
+                </div>
+
+                <a
+                  href="https://ble.ir/Optcodebot"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="auth-bot-link"
+                >
+                  🤖 فعال‌سازی ربات کد تأیید در بله (<bdi dir="ltr">@Optcodebot</bdi>)
+                </a>
+
+                <p className="bale-signup-note">
+                  «بله» پیام‌رسان ایرانی است که کد تأیید ورود به آن ارسال می‌شود. اگر حساب بله
+                  ندارید، در{' '}
+                  <a
+                    href="https://ble.ir"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="rules-link"
+                  >
+                    وب‌سایت رسمی بله (ble.ir)
+                  </a>{' '}
+                  ثبت‌نام کنید.
+                </p>
+
+                {msg.html ? (
+                  <p
+                    id="msg1"
+                    role="alert"
+                    className={`auth-msg ${msg.isOk ? 'ok' : ''}`}
+                    dangerouslySetInnerHTML={{ __html: msg.text }}
+                  />
+                ) : (
+                  <p
+                    id="msg1"
+                    role="status"
+                    aria-live="polite"
+                    className={`auth-msg ${msg.isOk ? 'ok' : ''}`}
+                  >
+                    {msg.isOk ? msg.text : ''}
+                  </p>
+                )}
+              </form>
+            </>
+          )}
+
+          {step === 2 && (
+            <>
+              <div className="auth-logo">
+                <div
+                  className="logo-circle"
+                  style={{ background: 'linear-gradient(135deg,#06b6d4,#7c3aed)' }}
+                  aria-hidden="true"
+                >
+                  🔐
+                </div>
+                <h1>کد تأیید</h1>
+                <p id="step2desc">{step2Desc}</p>
+              </div>
+              <form
+                className="auth-form"
+                noValidate
+                onSubmit={e => {
+                  e.preventDefault();
+                  handleVerifyOTP();
+                }}
+              >
+                <label htmlFor="otpInput">
+                  کد تأیید ۶ رقمی <span aria-hidden="true">*</span>
+                </label>
                 <input
                   type="text"
-                  id="baleIdInput"
-                  name="baleId"
-                  aria-label="آیدی بله"
+                  id="otpInput"
+                  name="otp"
+                  aria-label="کد تأیید ۶ رقمی"
                   required
                   aria-required="true"
-                  aria-invalid={isBaleIdInvalid ? 'true' : 'false'}
-                  aria-describedby="baleIdHint baleIdError"
-                  placeholder="مثال: username123"
-                  autoComplete="username"
-                  value={baleId}
+                  aria-invalid={isOtpInvalid ? 'true' : 'false'}
+                  aria-describedby="otpError"
+                  className={isOtpInvalid ? 'input-invalid' : ''}
+                  placeholder="● ● ● ● ● ●"
+                  maxLength={6}
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  style={{ textAlign: 'center', letterSpacing: '10px', fontSize: '24px' }}
+                  value={otp}
                   onChange={e => {
-                    setBaleId(e.target.value);
-                    if (baleIdError) setBaleIdError('');
+                    setOtp(e.target.value);
+                    if (otpError) setOtpError('');
                   }}
                 />
-              </div>
-              <p
-                id="baleIdError"
-                role="alert"
-                aria-live="assertive"
-                className={`field-error ${baleIdError ? 'visible' : ''}`}
-              >
-                {baleIdError}
-              </p>
-              <p id="baleIdHint" className="input-hint">
-                آیدی بله خود را بدون @ وارد کنید (مثال: username123)
-              </p>
-              <button type="submit">دریافت کد تأیید</button>
-
-              <div className="test-login-divider" role="separator" aria-label="یا">
-                <span className="divider-line" aria-hidden="true" />
-                <span className="divider-text">یا</span>
-                <span className="divider-line" aria-hidden="true" />
-              </div>
-
-              <a
-                href="https://ble.ir/Optcodebot"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="auth-bot-link"
-              >
-                🤖 فعال‌سازی ربات کد تأیید در بله (@Optcodebot)
-              </a>
-
-              {msg.html ? (
                 <p
-                  id="msg1"
+                  id="otpError"
                   role="alert"
-                  className={`auth-msg ${msg.isOk ? 'ok' : ''}`}
-                  dangerouslySetInnerHTML={{ __html: msg.text }}
-                />
-              ) : (
+                  aria-live="assertive"
+                  className={`field-error ${otpError ? 'visible' : ''}`}
+                >
+                  {otpError}
+                </p>
+                <button type="submit">تأیید</button>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  disabled={resendTimer > 0}
+                  onClick={() => {
+                    handleSendOTP();
+                    startTimer();
+                  }}
+                >
+                  {resendTimer > 0 ? `ارسال مجدد (${resendTimer})` : 'ارسال مجدد کد'}
+                </button>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  onClick={() => {
+                    setMsg({ text: '', isOk: false });
+                    setOtpError('');
+                    setStep(1);
+                  }}
+                >
+                  برگشت
+                </button>
                 <p
-                  id="msg1"
+                  id="msg2"
                   role="status"
                   aria-live="polite"
                   className={`auth-msg ${msg.isOk ? 'ok' : ''}`}
                 >
                   {msg.isOk ? msg.text : ''}
                 </p>
-              )}
-            </form>
-          )}
-
-          {step === 2 && (
-            <form
-              className="auth-form"
-              noValidate
-              onSubmit={e => {
-                e.preventDefault();
-                handleVerifyOTP();
-              }}
-            >
-              <label htmlFor="otpInput">
-                کد تأیید ۶ رقمی <span aria-hidden="true">*</span>
-              </label>
-              <input
-                type="text"
-                id="otpInput"
-                name="otp"
-                aria-label="کد تأیید ۶ رقمی"
-                required
-                aria-required="true"
-                aria-invalid={isOtpInvalid ? 'true' : 'false'}
-                aria-describedby="otpError"
-                className={isOtpInvalid ? 'input-invalid' : ''}
-                placeholder="● ● ● ● ● ●"
-                maxLength={6}
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                style={{ textAlign: 'center', letterSpacing: '10px', fontSize: '24px' }}
-                value={otp}
-                onChange={e => {
-                  setOtp(e.target.value);
-                  if (otpError) setOtpError('');
-                }}
-              />
-              <p
-                id="otpError"
-                role="alert"
-                aria-live="assertive"
-                className={`field-error ${otpError ? 'visible' : ''}`}
-              >
-                {otpError}
-              </p>
-              <button type="submit">تأیید</button>
-              <button
-                type="button"
-                className="btn-ghost"
-                disabled={resendTimer > 0}
-                onClick={() => {
-                  handleSendOTP();
-                  startTimer();
-                }}
-              >
-                {resendTimer > 0 ? `ارسال مجدد (${resendTimer})` : 'ارسال مجدد کد'}
-              </button>
-              <button
-                type="button"
-                className="btn-ghost"
-                onClick={() => {
-                  setMsg({ text: '', isOk: false });
-                  setOtpError('');
-                  setStep(1);
-                }}
-              >
-                برگشت
-              </button>
-              <p id="msg2" role="status" aria-live="polite" className={`auth-msg ${msg.isOk ? 'ok' : ''}`}>
-                {msg.isOk ? msg.text : ''}
-              </p>
-            </form>
+              </form>
+            </>
           )}
 
           {step === 3 && (
-            <div className="auth-form">
-              <div className="id-preview" id="idPreview">
-                @{verifiedBaleId}
+            <>
+              <div className="auth-logo">
+                <div
+                  className="logo-circle"
+                  style={{ background: 'linear-gradient(135deg,#22c55e,#06b6d4)' }}
+                  aria-hidden="true"
+                >
+                  👋
+                </div>
+                <h1>خوش آمدی!</h1>
+                <p>قبل از ورود قوانین را بخوانید</p>
               </div>
-              <div className="rules-check">
-                <input
-                  type="checkbox"
-                  id="rulesCheck"
-                  checked={rulesChecked}
-                  onChange={e => setRulesChecked(e.target.checked)}
-                />
-                <label htmlFor="rulesCheck">
-                  <a href="/terms" onClick={handleOpenRules} className="rules-link">
-                    قوانین
-                  </a>{' '}
-                  را خواندم و می‌پذیرم
-                </label>
+              <div className="auth-form">
+                <div className="id-preview" id="idPreview">
+                  <bdi dir="ltr">@{verifiedBaleId}</bdi>
+                </div>
+                <div className="rules-check">
+                  <input
+                    type="checkbox"
+                    id="rulesCheck"
+                    checked={rulesChecked}
+                    onChange={e => setRulesChecked(e.target.checked)}
+                  />
+                  <label htmlFor="rulesCheck">
+                    <a href="/terms" onClick={handleOpenRules} className="rules-link">
+                      قوانین
+                    </a>{' '}
+                    را خواندم و می‌پذیرم
+                  </label>
+                </div>
+                <button
+                  type="button"
+                  id="regBtn"
+                  onClick={handleRegister}
+                  disabled={!rulesChecked}
+                  className={!rulesChecked ? 'btn-disabled' : ''}
+                >
+                  ورود به پیام‌رسان
+                </button>
+                <p id="msg3" className={`auth-msg ${msg.isOk ? 'ok' : ''}`}>
+                  {msg.text}
+                </p>
               </div>
-              <button
-                type="button"
-                id="regBtn"
-                onClick={handleRegister}
-                disabled={!rulesChecked}
-                className={!rulesChecked ? 'btn-disabled' : ''}
-              >
-                ورود به پیام‌رسان
-              </button>
-              <p id="msg3" className={`auth-msg ${msg.isOk ? 'ok' : ''}`}>
-                {msg.text}
-              </p>
-            </div>
+            </>
           )}
         </main>
 
         <footer className="auth-footer">
-          <nav aria-label="پیوندهای پاصفحه" className="auth-footer-group">
-            <span>🔒 رمزنگاری سرتاسری</span>
+          <nav aria-label="پیوندهای پاصفحه" className="auth-footer-nav">
             <a href="/terms" className="link-btn">
               قوانین پیام‌رسان
             </a>
           </nav>
+          <span className="footer-sep" role="separator" aria-hidden="true">
+            |
+          </span>
+          <span className="footer-badge">🔒 رمزنگاری سرتاسری</span>
         </footer>
       </div>
 

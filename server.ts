@@ -51,7 +51,7 @@ app.use(
     strictTransportSecurity: {
       maxAge: 31536000,
       includeSubDomains: true,
-      preload: false,
+      preload: true,
     },
     frameguard: {
       action: 'deny',
@@ -84,6 +84,24 @@ const upload = multer({ storage, limits: { fileSize: config.MAX_FILE_SIZE } });
 // متغیرهای درون‌حافظه‌ای کدهای تایید و توکن‌های موقت
 const otps: Record<string, any> = {};
 const adminTokens: Record<string, { username: string; expire: number; adminAt: number }> = {};
+const userSessions: Record<string, { username: string; expire: number }> = {};
+
+function getSessionUsername(req: Request): string | null {
+  const authHeader = req.headers.authorization;
+  const raw = Array.isArray(authHeader) ? authHeader[0] : authHeader;
+  if (!raw || typeof raw !== 'string') return null;
+  const match = raw.match(/^Bearer\s+(.+)$/i);
+  if (!match) return null;
+  const token = match[1].trim();
+  if (!token) return null;
+  const session = userSessions[token];
+  if (!session) return null;
+  if (Date.now() > session.expire) {
+    delete userSessions[token];
+    return null;
+  }
+  return session.username;
+}
 
 async function getSetting(key: string): Promise<string | null> {
   const { rows } = await pool.query('SELECT value FROM settings WHERE key = $1', [key]);
@@ -270,8 +288,14 @@ app.post('/api/verify-otp', async (req: Request, res: Response) => {
   if (otp.code !== code) return res.json({ ok: false, msg: 'کد اشتباه است' });
   delete otps[key];
 
+  const sessionToken = uuidv4();
+  userSessions[sessionToken] = {
+    username: key,
+    expire: Date.now() + 7 * 24 * 60 * 60 * 1000,
+  };
+
   const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [key]);
-  res.json({ ok: true, isNew: rows.length === 0, username: key });
+  res.json({ ok: true, isNew: rows.length === 0, username: key, sessionToken });
 });
 
 app.post('/api/register', async (req: Request, res: Response) => {
@@ -411,6 +435,72 @@ app.post('/api/report', async (req: Request, res: Response) => {
     [uuidv4(), reporter, reportedUser, messageId || null, messageText || null, reason, new Date().toISOString()]
   );
   res.json({ ok: true });
+});
+
+// ===== ACCOUNT DATA EXPORT & ERASURE (DATA RIGHTS) =====
+app.get('/api/account/export', async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
+  const username = getSessionUsername(req);
+  if (!username) return res.status(401).json({ ok: false });
+
+  const { rows: userRows } = await pool.query(
+    'SELECT username, bio, status, joined_at, last_seen FROM users WHERE username = $1',
+    [username]
+  );
+  if (!userRows.length) return res.status(401).json({ ok: false });
+
+  const { rows: contacts } = await pool.query(
+    'SELECT contact FROM contacts WHERE username = $1',
+    [username]
+  );
+  const { rows: messages } = await pool.query(
+    'SELECT id, room_id, sender, text, file_url, file_type, time, timestamp FROM messages WHERE sender = $1 AND is_deleted = 0 ORDER BY timestamp ASC',
+    [username]
+  );
+
+  return res.json({
+    exportedAt: new Date().toISOString(),
+    account: userRows[0],
+    contacts: contacts.map((c: any) => c.contact),
+    sentMessages: messages,
+  });
+});
+
+app.post('/api/account/delete', async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
+  const username = getSessionUsername(req);
+  if (!username) return res.status(401).json({ ok: false, msg: 'ابتدا وارد حساب کاربری شوید.' });
+
+  const submittedOtp = String(req.body?.otp ?? req.body?.code ?? '').trim();
+  const otpRecord = otps[username];
+  if (!otpRecord) {
+    return res.status(403).json({ ok: false });
+  }
+  if (Date.now() > otpRecord.expire) {
+    delete otps[username];
+    return res.status(403).json({ ok: false });
+  }
+  if (!submittedOtp || otpRecord.code !== submittedOtp) {
+    return res.status(403).json({ ok: false });
+  }
+  delete otps[username];
+
+  const { rows: userRows } = await pool.query('SELECT username FROM users WHERE username = $1', [
+    username,
+  ]);
+  if (!userRows.length) return res.status(404).json({ ok: false, msg: 'حساب کاربری یافت نشد.' });
+
+  await pool.query('DELETE FROM messages WHERE sender = $1', [username]);
+  await pool.query('DELETE FROM contacts WHERE username = $1 OR contact = $1', [username]);
+  await pool.query('DELETE FROM users WHERE username = $1', [username]);
+
+  for (const [tok, sess] of Object.entries(userSessions)) {
+    if (sess.username === username) {
+      delete userSessions[tok];
+    }
+  }
+
+  return res.json({ ok: true });
 });
 
 // ===== SETTINGS =====
@@ -1074,7 +1164,48 @@ async function start(): Promise<void> {
   const publicPath = path.join(process.cwd(), 'public');
   const assetsPath = path.join(distPath, 'assets');
   const isProd = process.env.NODE_ENV === 'production' && fs.existsSync(distPath);
-  const validClientRoutes = new Set(['/', '/index.html', '/terms']);
+  const validClientRoutes = new Set(['/', '/index.html', '/terms', '/login']);
+
+  const routeMetaMap: Record<string, { title: string; description: string }> = {
+    '/': {
+      title: 'پیام‌رسان',
+      description:
+        'پیام‌رسان امن و سریع با رمزنگاری سرتاسری برای گفت‌وگوی خصوصی و بلادرنگ با دوستان و خانواده.',
+    },
+    '/index.html': {
+      title: 'پیام‌رسان',
+      description:
+        'پیام‌رسان امن و سریع با رمزنگاری سرتاسری برای گفت‌وگوی خصوصی و بلادرنگ با دوستان و خانواده.',
+    },
+    '/login': {
+      title: 'ورود به حساب | پیام‌رسان',
+      description:
+        'ورود امن به پیام‌رسان با آیدی بله و کد تأیید یک‌بارمصرف؛ گفت‌وگوی خصوصی با رمزنگاری سرتاسری.',
+    },
+    '/terms': {
+      title: 'قوانین پیام‌رسان | پیام‌رسان',
+      description:
+        'قوانین و مقررات پیام‌رسان را بخوانید؛ شرایط استفاده، حریم خصوصی، حقوق داده و حذف حساب کاربری را بدانید.',
+    },
+  };
+
+  const applyHtmlMeta = (html: string, reqPath: string): string => {
+    const meta = routeMetaMap[reqPath] || routeMetaMap['/'];
+    return html
+      .replace(/<title>.*?<\/title>/, `<title>${meta.title}</title>`)
+      .replace(
+        /<meta name="description" content="[^"]*"\/>/,
+        `<meta name="description" content="${meta.description}"/>`
+      )
+      .replace(
+        /<meta property="og:title" content="[^"]*"\/>/,
+        `<meta property="og:title" content="${meta.title}"/>`
+      )
+      .replace(
+        /<meta property="og:description" content="[^"]*"\/>/,
+        `<meta property="og:description" content="${meta.description}"/>`
+      );
+  };
 
   const sendNotFound = (req: Request, res: Response) => {
     res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
@@ -1137,7 +1268,7 @@ async function start(): Promise<void> {
       }
     };
 
-    app.use((req, res, next) => {
+    app.use(async (req, res, next) => {
       const reqPath = req.path;
       const isAppRoute = validClientRoutes.has(reqPath);
       const isViteModule =
@@ -1152,12 +1283,15 @@ async function start(): Promise<void> {
         return sendNotFound(req, res);
       }
       if (isAppRoute) {
-        res.setHeader('Cache-Control', 'public, max-age=60');
-        const origWriteHead = res.writeHead.bind(res);
-        res.writeHead = ((statusCode: number, ...args: any[]) => {
-          res.setHeader('Cache-Control', 'public, max-age=60');
-          return origWriteHead(statusCode, ...args);
-        }) as typeof res.writeHead;
+        try {
+          const rawHtml = await fs.promises.readFile(path.join(process.cwd(), 'index.html'), 'utf-8');
+          const transformed = await vite.transformIndexHtml(req.originalUrl, applyHtmlMeta(rawHtml, reqPath));
+          res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8');
+          res.setHeader('Cache-Control', 'public, max-age=60, must-revalidate');
+          return res.end(transformed);
+        } catch (err) {
+          return next(err);
+        }
       } else if (isStaticAsset && !reqPath.endsWith('.html')) {
         res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
       }
@@ -1170,7 +1304,7 @@ async function start(): Promise<void> {
         index: false,
         setHeaders: (res, filePath) => {
           if (filePath.endsWith('.html')) {
-            res.setHeader('Cache-Control', 'public, max-age=60');
+            res.setHeader('Cache-Control', 'public, max-age=60, must-revalidate');
           } else {
             res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
           }
@@ -1182,16 +1316,18 @@ async function start(): Promise<void> {
         index: false,
         setHeaders: (res, filePath) => {
           if (filePath.endsWith('.html')) {
-            res.setHeader('Cache-Control', 'public, max-age=60');
+            res.setHeader('Cache-Control', 'public, max-age=60, must-revalidate');
           } else {
             res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
           }
         },
       })
     );
-    app.get(['/', '/index.html', '/terms'], (_req, res) => {
-      res.setHeader('Cache-Control', 'public, max-age=60');
-      res.sendFile(path.join(distPath, 'index.html'));
+    app.get(['/', '/index.html', '/terms', '/login'], async (req, res) => {
+      res.setHeader('Cache-Control', 'public, max-age=60, must-revalidate');
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      const rawHtml = await fs.promises.readFile(path.join(distPath, 'index.html'), 'utf-8');
+      return res.send(applyHtmlMeta(rawHtml, req.path));
     });
     app.use((req, res) => {
       return sendNotFound(req, res);
