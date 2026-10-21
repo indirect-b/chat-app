@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Socket } from 'socket.io-client';
 import { ChatMessage, RoomSummary, UserProfile } from '../types';
 import {
@@ -14,6 +14,9 @@ import {
   setRoomSecret,
   isE2EEPayload,
   VoprfBlindTokenRecord,
+  getRoomPQStatus,
+  parsePeerKeyBundle,
+  getMyMLDSAPublicKey,
 } from '../utils/crypto';
 
 interface ChatAppProps {
@@ -29,6 +32,7 @@ interface DecryptedChatMessage extends ChatMessage {
   e2eeMode?: 'PQ-MLKEM-RATCHET' | 'GROUP-EPOCH-FSM' | 'ECDH' | 'PBKDF2';
   ratchetStep?: number;
   epoch?: number;
+  mldsaVerified?: boolean;
   decryptFailed?: boolean;
 }
 
@@ -215,15 +219,30 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     [myUsername]
   );
 
+  const currentPQStatus = useMemo(() => {
+    if (!currentRoom) return null;
+    return getRoomPQStatus({
+      roomId: currentRoom,
+      isGroup: currentIsGroup,
+      e2eeActive,
+      myUsername,
+      peerPublicKey: !currentIsGroup ? getPeerKeyForRoom(currentRoom) : undefined,
+      peerUsername: !currentIsGroup && currentPartner ? currentPartner : undefined,
+      customSecret: getRoomSecret(currentRoom),
+    });
+  }, [currentRoom, currentIsGroup, e2eeActive, myUsername, getPeerKeyForRoom, currentPartner]);
+
   const processDecryption = useCallback(
     async (msg: ChatMessage, roomId: string): Promise<DecryptedChatMessage> => {
       const peerPublicKey = getPeerKeyForRoom(roomId);
+      const partner = roomId.startsWith('group__') ? undefined : roomId.split('__').find(u => u !== myUsername);
       const gId = roomId.startsWith('group__') ? roomId.replace('group__', '') : '';
       const groupMembers = gId ? groupMembersRef.current[gId] || [] : undefined;
 
       const dec = await decryptMessageText(msg.text || '', roomId, {
         myUsername,
         peerPublicKey,
+        peerUsername: partner,
         sender: msg.sender,
         groupMembers,
       });
@@ -232,6 +251,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         const rDec = await decryptMessageText(msg.reply_to_text, roomId, {
           myUsername,
           peerPublicKey,
+          peerUsername: partner,
           sender: msg.sender,
           groupMembers,
         });
@@ -245,6 +265,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         e2eeMode: dec.mode,
         ratchetStep: dec.ratchetStep,
         epoch: dec.epoch,
+        mldsaVerified: dec.mldsaVerified,
         decryptFailed: dec.failed,
       };
     },
@@ -693,7 +714,8 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       ? await encryptMessageText(trimmed, currentRoom, {
           myUsername,
           peerPublicKey: getPeerKeyForRoom(currentRoom),
-          groupMembers: currentIsGroup ? groupMembersRef.current[currentPartner] || [] : undefined,
+          peerUsername: !currentIsGroup && currentPartner ? currentPartner : undefined,
+          groupMembers: currentIsGroup && currentPartner ? groupMembersRef.current[currentPartner] || [] : undefined,
         })
       : trimmed;
 
@@ -964,6 +986,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       ? await encryptMessageText(trimmed, currentRoom, {
           myUsername,
           peerPublicKey: getPeerKeyForRoom(currentRoom),
+          peerUsername: !currentIsGroup && currentPartner ? currentPartner : undefined,
         })
       : trimmed;
     socket.emit('edit-message', {
@@ -1304,22 +1327,45 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 className="icon-btn"
                 onClick={handleToggleE2EE}
                 title={
-                  e2eeActive
-                    ? 'رمزنگاری پساکوانتومی ML-KEM-768 + Ratchet فعال است'
+                  currentPQStatus
+                    ? currentPQStatus.tooltip
+                    : e2eeActive
+                    ? 'رمزنگاری پساکوانتومی فعال است'
                     : 'رمزنگاری سرتاسری غیرفعال است'
                 }
                 style={{
                   fontSize: '12px',
                   padding: '5px 10px',
                   borderRadius: '14px',
-                  background: e2eeActive
+                  background: !e2eeActive
+                    ? 'rgba(255,255,255,0.06)'
+                    : currentPQStatus?.isPQ
                     ? 'rgba(34,197,94,0.18)'
-                    : 'rgba(255,255,255,0.06)',
-                  color: e2eeActive ? '#22c55e' : '#9ca3af',
+                    : currentPQStatus?.reason === 'INVALID_MLDSA_SIGNATURE'
+                    ? 'rgba(239,68,68,0.2)'
+                    : 'rgba(234,179,8,0.18)',
+                  color: !e2eeActive
+                    ? '#9ca3af'
+                    : currentPQStatus?.isPQ
+                    ? '#22c55e'
+                    : currentPQStatus?.reason === 'INVALID_MLDSA_SIGNATURE'
+                    ? '#ef4444'
+                    : '#facc15',
+                  border: currentPQStatus && !currentPQStatus.isPQ && e2eeActive
+                    ? currentPQStatus.reason === 'INVALID_MLDSA_SIGNATURE'
+                      ? '1px solid rgba(239,68,68,0.45)'
+                      : '1px solid rgba(234,179,8,0.4)'
+                    : 'none',
                   gap: '4px',
                 }}
               >
-                {e2eeActive ? (currentIsGroup ? `🔒 Epoch #${currentGroupEpoch}` : '🛡️ PQ-KEM') : '🔓 ساده'}
+                {e2eeActive
+                  ? currentIsGroup
+                    ? `🔒 Epoch #${currentGroupEpoch}`
+                    : currentPQStatus?.isPQ
+                    ? '🛡️ PQ-KEM'
+                    : currentPQStatus?.badge || '⚠️ غیر کوانتومی'
+                  : '🔓 ساده'}
               </button>
 
               <button
@@ -1351,6 +1397,50 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 </svg>
               </button>
             </div>
+
+            {/* ANTI-DOWNGRADE WARNING BANNER */}
+            {currentPQStatus && !currentPQStatus.isPQ && e2eeActive && (
+              <div
+                className="pq-downgrade-warning-banner"
+                style={{
+                  background:
+                    currentPQStatus.reason === 'INVALID_MLDSA_SIGNATURE'
+                      ? 'linear-gradient(90deg, rgba(239,68,68,0.22), rgba(185,28,28,0.14))'
+                      : 'linear-gradient(90deg, rgba(234,179,8,0.18), rgba(245,158,11,0.10))',
+                  borderBottom:
+                    currentPQStatus.reason === 'INVALID_MLDSA_SIGNATURE'
+                      ? '1px solid rgba(239,68,68,0.45)'
+                      : '1px solid rgba(234,179,8,0.35)',
+                  padding: '9px 16px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '10px',
+                  color:
+                    currentPQStatus.reason === 'INVALID_MLDSA_SIGNATURE' ? '#fca5a5' : '#fef08a',
+                  fontSize: '12px',
+                  direction: 'rtl',
+                }}
+              >
+                <span style={{ fontSize: '18px', flexShrink: 0 }}>
+                  {currentPQStatus.reason === 'INVALID_MLDSA_SIGNATURE' ? '⛔' : '⚠️'}
+                </span>
+                <div style={{ flex: 1, lineHeight: 1.5 }}>
+                  <b
+                    style={{
+                      color:
+                        currentPQStatus.reason === 'INVALID_MLDSA_SIGNATURE'
+                          ? '#f87171'
+                          : '#fde047',
+                    }}
+                  >
+                    {currentPQStatus.reason === 'INVALID_MLDSA_SIGNATURE'
+                      ? 'خطای امنیتی جعل هویت:'
+                      : 'هشدار امنیتی (نبود امنیت پساکوانتومی):'}
+                  </b>{' '}
+                  {currentPQStatus.warningText}
+                </div>
+              </div>
+            )}
 
             {pinnedMessage && (
               <div
@@ -1525,17 +1615,32 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                           <span
                             title={
                               msg.e2eeMode === 'PQ-MLKEM-RATCHET'
-                                ? `رمزنگاری پساکوانتومی ML-KEM-768 + Ratchet (گام #${msg.ratchetStep ?? 0})`
+                                ? `رمزنگاری تماماً پساکوانتومی ML-KEM-768 + Ratchet (گام #${msg.ratchetStep ?? 0})${
+                                    msg.mldsaVerified ? ' • امضای هویت FIPS 204 ML-DSA تأیید شد ✓' : ''
+                                  }`
                                 : msg.e2eeMode === 'GROUP-EPOCH-FSM'
                                 ? `ماشین وضعیت اپوک گروه (Epoch #${msg.epoch ?? 1})`
-                                : 'رمزنگاری سرتاسری (AES-256-GCM)'
+                                : msg.e2eeMode === 'ECDH'
+                                ? 'رمزنگاری کلاسیک ECDH P-256 (فاقد امنیت پساکوانتومی)'
+                                : 'رمزنگاری سرتاسری دستی (PBKDF2)'
                             }
-                            style={{ fontSize: '10px', opacity: 0.85, color: '#a78bfa' }}
+                            style={{
+                              fontSize: '10px',
+                              opacity: 0.9,
+                              color:
+                                msg.e2eeMode === 'PQ-MLKEM-RATCHET'
+                                  ? '#a78bfa'
+                                  : msg.e2eeMode === 'ECDH'
+                                  ? '#facc15'
+                                  : '#38bdf8',
+                            }}
                           >
                             {msg.e2eeMode === 'PQ-MLKEM-RATCHET'
-                              ? `🛡️PQ#${msg.ratchetStep ?? 0}`
+                              ? `🛡️PQ#${msg.ratchetStep ?? 0}${msg.mldsaVerified ? ' ✓DSA' : ''}`
                               : msg.e2eeMode === 'GROUP-EPOCH-FSM'
                               ? `🔄Ep#${msg.epoch ?? 1}`
+                              : msg.e2eeMode === 'ECDH'
+                              ? '⚠️ECDH'
                               : '🔒'}
                           </span>
                         )}
@@ -1815,7 +1920,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       {e2eeModalOpen && (
         <div className="modal">
           <div className="modal-box">
-            <h3>🛡️ پروتکل پساکوانتومی ML-KEM-768 + احراز هویت کور VOPRF</h3>
+            <h3>🛡️ معماری تماماً پساکوانتومی (FIPS 203 ML-KEM + FIPS 204 ML-DSA)</h3>
             <div
               style={{
                 background: 'rgba(124,58,237,0.12)',
@@ -1829,12 +1934,20 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               }}
             >
               <div>
-                ✅ <b>لایه ۱ (Post-Quantum Ratchet):</b> کپسوله‌سازی هیبریدی{' '}
+                ✅ <b>لایه ۱ (Session Ratchet پساکوانتومی):</b> کپسوله‌سازی هیبریدی{' '}
                 <code>ML-KEM-768 (FIPS 203) + ECDH P-256</code> به همراه کش کلیدهای پرش‌خورده
                 (Out-of-Order Skipped Keys) و پاک‌سازی فوری حافظه (Zeroization).
               </div>
               <div style={{ marginTop: '4px' }}>
-                ✅ <b>لایه ۲ (Blinded Identity - RFC 9497):</b> توکن کور{' '}
+                ✅ <b>لایه ۲ (امضای دیجیتال هویت FIPS 204):</b> امضای هویت کاربر و تصدیق نشست با{' '}
+                <code>ML-DSA-65 (NIST Level 3)</code> برای حفاظت کامل در برابر حملات جعل هویت و الگوریتم شور.
+              </div>
+              <div style={{ marginTop: '4px' }}>
+                ✅ <b>لایه ۳ (محافظت در برابر تنزل خاموش):</b> تضمین عدم نمایش نشان PQ-KEM هنگام فقدان
+                کلیدهای معتبر پساکوانتومی و نمایش بنر هشدار در چت‌های تنزل‌یافته به کلاسیک.
+              </div>
+              <div style={{ marginTop: '4px' }}>
+                ✅ <b>لایه ۴ (احراز هویت کور - RFC 9497):</b> توکن کور{' '}
                 <code>Ristretto255-VOPRF</code> با اثبات دانایی صفر DLEQ:{' '}
                 <code style={{ color: '#22c55e' }}>
                   {voprfToken?.anonymousTokenId || 'در حال صدور...'}
@@ -1842,7 +1955,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               </div>
               {currentIsGroup && (
                 <div style={{ marginTop: '4px' }}>
-                  ✅ <b>لایه ۳ (Group Epoch FSM):</b> اپوک فعلی گروه:{' '}
+                  ✅ <b>لایه ۵ (Group Epoch FSM):</b> اپوک فعلی گروه:{' '}
                   <code style={{ color: '#38bdf8' }}>Epoch #{currentGroupEpoch}</code> (مجهز به
                   Grace Buffer برای پیام‌های همزمان)
                 </div>
@@ -2044,6 +2157,68 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 }}
               >
                 {contactProfileModal.user.bio}
+              </div>
+            )}
+            {!currentIsGroup && (
+              <div
+                style={{
+                  background: 'rgba(255,255,255,0.04)',
+                  border: '1px solid rgba(255,255,255,0.08)',
+                  borderRadius: '10px',
+                  padding: '10px 12px',
+                  marginBottom: '14px',
+                  fontSize: '11.5px',
+                  textAlign: 'right',
+                  lineHeight: '1.6',
+                }}
+              >
+                {(() => {
+                  const b = parsePeerKeyBundle(
+                    contactProfileModal.user?.public_key,
+                    contactProfileModal.user?.username
+                  );
+                  if (b.isFullyPostQuantum) {
+                    return (
+                      <div>
+                        <div style={{ color: '#4ade80', fontWeight: 700, marginBottom: '2px' }}>
+                          🛡️ هویت پساکوانتومی تأیید شده (Fully PQ)
+                        </div>
+                        <div style={{ color: '#9ca3af', fontSize: '11px' }}>
+                          مجهز به کپسوله‌سازی ML-KEM-768 و امضای هویت FIPS 204 ML-DSA-65 معتبر.
+                        </div>
+                      </div>
+                    );
+                  }
+                  if (b.isMldsaSignatureInvalid) {
+                    return (
+                      <div>
+                        <div style={{ color: '#f87171', fontWeight: 700, marginBottom: '2px' }}>
+                          ⛔ خطر جعل هویت / امضای نامعتبر
+                        </div>
+                        <div style={{ color: '#fca5a5', fontSize: '11px' }}>
+                          امضای دیجیتال هویت ML-DSA با کلیدهای اعلامی مطابقت ندارد!
+                        </div>
+                      </div>
+                    );
+                  }
+                  if (b.ecdhJwk) {
+                    return (
+                      <div>
+                        <div style={{ color: '#facc15', fontWeight: 700, marginBottom: '2px' }}>
+                          ⚠️ رمزنگاری کلاسیک (ECDH P-256)
+                        </div>
+                        <div style={{ color: '#9ca3af', fontSize: '11px' }}>
+                          مخاطب فاقد کلیدهای پساکوانتومی است؛ ارتباطات در برابر الگوریتم شور ایمن نیستند.
+                        </div>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div style={{ color: '#9ca3af' }}>
+                      ⚠️ فاقد کلید رمزنگاری عمومی منتشرشده در سامانه
+                    </div>
+                  );
+                })()}
               </div>
             )}
             <div className="modal-btns">
@@ -2260,11 +2435,18 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               </p>
               <ul style={{ margin: '0', paddingRight: '18px', color: '#d1d5db' }}>
                 <li>
-                  <b>لایه ۱ (راتچت هیبریدی پساکوانتومی ML-KEM-768 + ECDH P-256):</b> ترکیب الگوریتم مشبک‌بندی شده{' '}
-                  <code>CRYSTALS-Kyber (ML-KEM-768 / FIPS 203)</code> با منحنی بیضی <code>P-256</code> و زنجیره مشتق‌سازی کلید <code>HKDF-SHA256</code> برای ایمنی کامل در برابر حملات کوانتومی <i>Store Now, Decrypt Later</i>.
+                  <b>لایه ۱ (راتچت هیبریدی پساکوانتومی ML-KEM-768 + ECDH P-256):</b> کپسوله‌سازی کلید سشن با الگوریتم مشبک{' '}
+                  <code>CRYSTALS-Kyber (ML-KEM-768 / FIPS 203)</code> و منحنی بیضی <code>P-256</code> به همراه راتچت متقارن <code>HKDF-SHA256</code> برای ایمنی کامل در برابر حملات <i>Store Now, Decrypt Later</i>.
                 </li>
                 <li>
-                  <b>لایه ۲ (احراز هویت کور بدون افشای متادیتا با Ristretto255-VOPRF):</b> پیاده‌سازی تابع شبه‌تصادفی ناآگاهانه اثبات‌پذیر (<code>RFC 9497</code>) به همراه اثبات دانایی صفر <code>DLEQ</code> که هویت و متادیتای کاربر را حتی از دید سرور مخفی می‌کند.
+                  <b>لایه ۲ (امضای دیجیتال هویت FIPS 204 ML-DSA-65):</b> امضای هویت دیجیتال، باندل کلید و تصدیق نشست با الگوریتم{' '}
+                  <code>CRYSTALS-Dilithium (ML-DSA-65)</code> جهت مصونیت کامل لایه هویت در برابر الگوریتم شور و حملات جعل هویت کوانتومی.
+                </li>
+                <li>
+                  <b>لایه ۳ (سیستم ضد تنزل خاموش - Anti-Downgrade Protection):</b> جلوگیری مطلق از نمایش نشان <code>PQ-KEM</code> در گفتگوهای فاقد کلید تأییدشده و نمایش بنر هشدار واضح برای آگاهی کاربر.
+                </li>
+                <li>
+                  <b>لایه ۴ (احراز هویت کور بدون افشای متادیتا با Ristretto255-VOPRF):</b> پیاده‌سازی تابع شبه‌تصادفی ناآگاهانه اثبات‌پذیر (<code>RFC 9497</code>) به همراه اثبات دانایی صفر <code>DLEQ</code> که هویت و متادیتای کاربر را حتی از دید سرور مخفی می‌کند.
                 </li>
               </ul>
             </div>

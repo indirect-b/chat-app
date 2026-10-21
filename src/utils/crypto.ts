@@ -1,8 +1,10 @@
-// سیستم پیشرفته رمزنگاری پساکوانتومی چندطرفه (Post-Quantum Hybrid ML-KEM-768 + ECDH P-256)
+// سیستم پیشرفته رمزنگاری تماماً پساکوانتومی (Fully Post-Quantum Hybrid ML-KEM-768 + ML-DSA-65 + ECDH P-256)
 // به همراه زنجیره راتچت مقاوم در برابر پیام‌های خارج از نوبت (Out-of-Order Symmetric Ratchet + Zeroization)
+// امضای دیجیتال هویت FIPS 204 (ML-DSA-65) برای مقابله با الگوریتم شور و جلوگیری قطعی از Downgrade خاموش
 // احراز هویت کور مبتنی بر Ristretto255-VOPRF (RFC 9497) و ماشین وضعیت چرخش اپوک گروه (Group Epoch FSM)
 
 import { ml_kem768 } from '@noble/post-quantum/ml-kem.js';
+import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js';
 import { ristretto255_oprf } from '@noble/curves/ed25519.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { hkdf } from '@noble/hashes/hkdf.js';
@@ -16,6 +18,7 @@ const ROOM_KEY_STORAGE_PREFIX = 'chat_e2ee_pass_';
 const E2EE_ENABLED_STORAGE_KEY = 'chat_e2ee_enabled';
 const ECDH_KEYPAIR_PREFIX = 'chat_ecdh_kp_';
 const MLKEM_KEYPAIR_PREFIX = 'chat_mlkem768_kp_';
+const MLDSA_KEYPAIR_PREFIX = 'chat_mldsa65_kp_';
 const RATCHET_STATE_PREFIX = 'chat_pq_ratchet_';
 const GROUP_EPOCH_PREFIX = 'chat_group_epoch_';
 const VOPRF_TOKEN_PREFIX = 'chat_voprf_token_';
@@ -34,11 +37,19 @@ interface StoredMLKEMKeyPair {
   secretKeyB64: string;
 }
 
+interface StoredMLDSAKeyPair {
+  publicKeyB64: string;
+  secretKeyB64: string;
+}
+
 export interface HybridPublicKeyBundle {
   v: 2;
-  alg: 'ML-KEM-768+P-256';
+  alg: 'ML-KEM-768+P-256+ML-DSA-65' | 'ML-KEM-768+P-256';
+  username?: string;
   ecdhJwk: JsonWebKey;
   mlkemPubB64: string;
+  mldsaPubB64?: string; // کلید عمومی هویت پساکوانتومی FIPS 204
+  mldsaSigB64?: string; // امضای دیجیتال باندل با ML-DSA
   voprfProofTag?: string;
 }
 
@@ -124,12 +135,63 @@ function kdfChainStep(chainKey: Uint8Array): { nextChainKey: Uint8Array; message
 }
 
 /**
- * تولید یا بازیابی باندل کلید عمومی ترکیبی پساکوانتومی (ML-KEM-768 + ECDH P-256)
+ * سریال‌سازی قطعی فیلدهای باندل کلید عمومی جهت امضای دیجیتال ML-DSA-65 (FIPS 204)
+ */
+export function serializeBundleForSigning(bundle: {
+  username?: string;
+  ecdhJwk: JsonWebKey;
+  mlkemPubB64: string;
+}): Uint8Array {
+  const ecdhStr = `${bundle.ecdhJwk.crv || 'P-256'}:${bundle.ecdhJwk.x || ''}:${bundle.ecdhJwk.y || ''}`;
+  const data = `MLDSA-BUNDLE-v2:${bundle.username || ''}:${ecdhStr}:${bundle.mlkemPubB64}`;
+  return new TextEncoder().encode(data);
+}
+
+/**
+ * سریال‌سازی پیام جهت امضای دیجیتال هویت و جلسه اولیه (Session-Init / Message Signature) با ML-DSA-65
+ */
+export function serializeMessageForSigning(params: {
+  roomId: string;
+  step: number;
+  kemCipherB64: string;
+  ivB64: string;
+  cipherB64: string;
+}): Uint8Array {
+  const data = `MLDSA-MSG-v2:${params.roomId}:${params.step}:${params.kemCipherB64}:${params.ivB64}:${params.cipherB64}`;
+  return new TextEncoder().encode(data);
+}
+
+export function getMyMLDSASecretKey(myUsername: string): Uint8Array | null {
+  try {
+    const raw = localStorage.getItem(`${MLDSA_KEYPAIR_PREFIX}${myUsername}`);
+    if (!raw) return null;
+    const parsed: StoredMLDSAKeyPair = JSON.parse(raw);
+    return parsed.secretKeyB64 ? base64ToBuf(parsed.secretKeyB64) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function getMyMLDSAPublicKey(myUsername: string): string | null {
+  try {
+    const raw = localStorage.getItem(`${MLDSA_KEYPAIR_PREFIX}${myUsername}`);
+    if (!raw) return null;
+    const parsed: StoredMLDSAKeyPair = JSON.parse(raw);
+    return parsed.publicKeyB64 || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * تولید یا بازیابی باندل کلید عمومی ترکیبی تماماً پساکوانتومی
+ * (ML-KEM-768 + ECDH P-256 + امضای دیجیتال هویت FIPS 204 ML-DSA-65)
  */
 export async function ensureUserHybridKeyPair(username: string): Promise<string | null> {
   if (!username || !window.crypto?.subtle) return null;
   const ecdhStorageKey = `${ECDH_KEYPAIR_PREFIX}${username}`;
   const pqStorageKey = `${MLKEM_KEYPAIR_PREFIX}${username}`;
+  const dsaStorageKey = `${MLDSA_KEYPAIR_PREFIX}${username}`;
 
   try {
     let publicJwk: JsonWebKey | null = null;
@@ -169,12 +231,52 @@ export async function ensureUserHybridKeyPair(username: string): Promise<string 
       zeroizeBuffer(pqKeys.secretKey);
     }
 
+    // تولید یا بازیابی کلیدهای امضای هویت پساکوانتومی ML-DSA-65 (FIPS 204)
+    let mldsaPubB64 = '';
+    let mldsaSec: Uint8Array | null = null;
+    const existingDsa = localStorage.getItem(dsaStorageKey);
+    if (existingDsa) {
+      try {
+        const parsedDsa: StoredMLDSAKeyPair = JSON.parse(existingDsa);
+        if (parsedDsa.publicKeyB64 && parsedDsa.secretKeyB64) {
+          mldsaPubB64 = parsedDsa.publicKeyB64;
+          mldsaSec = base64ToBuf(parsedDsa.secretKeyB64);
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    if (!mldsaPubB64 || !mldsaSec) {
+      const dsaKeys = ml_dsa65.keygen();
+      mldsaPubB64 = bufToBase64(dsaKeys.publicKey);
+      const secretKeyB64 = bufToBase64(dsaKeys.secretKey);
+      localStorage.setItem(dsaStorageKey, JSON.stringify({ publicKeyB64: mldsaPubB64, secretKeyB64 }));
+      mldsaSec = dsaKeys.secretKey;
+    }
+
+    // امضای محتوای باندل کلید توسط کلید خصوصی ML-DSA-65 هویت کاربر
+    let mldsaSigB64 = '';
+    if (mldsaSec) {
+      const signTarget = serializeBundleForSigning({
+        username,
+        ecdhJwk: publicJwk,
+        mlkemPubB64,
+      });
+      const sig = ml_dsa65.sign(signTarget, mldsaSec);
+      mldsaSigB64 = bufToBase64(sig);
+      zeroizeBuffer(mldsaSec);
+    }
+
     const voprfRec = getStoredVoprfToken(username);
     const bundle: HybridPublicKeyBundle = {
       v: 2,
-      alg: 'ML-KEM-768+P-256',
+      alg: 'ML-KEM-768+P-256+ML-DSA-65',
+      username,
       ecdhJwk: publicJwk,
       mlkemPubB64,
+      mldsaPubB64,
+      mldsaSigB64,
       voprfProofTag: voprfRec?.anonymousTokenId,
     };
 
@@ -189,25 +291,193 @@ export async function ensureUserECDHKeyPair(username: string): Promise<string | 
   return ensureUserHybridKeyPair(username);
 }
 
-function parsePeerKeyBundle(peerPublicKeyStr: string): {
+export interface ParsedPeerKeyBundle {
   ecdhJwk: JsonWebKey | null;
   mlkemPub: Uint8Array | null;
-} {
+  mldsaPub: Uint8Array | null;
+  mldsaSigB64: string | null;
+  username?: string;
+  hasMLKEM: boolean;
+  hasMLDSA: boolean;
+  isMldsaVerified: boolean;
+  isMldsaSignatureInvalid: boolean;
+  isFullyPostQuantum: boolean; // هم کلید ML-KEM موجود است و هم امضای ML-DSA هویت معتبر است
+}
+
+export function parsePeerKeyBundle(
+  peerPublicKeyStr: string | null | undefined,
+  expectedPeerUsername?: string
+): ParsedPeerKeyBundle {
+  const result: ParsedPeerKeyBundle = {
+    ecdhJwk: null,
+    mlkemPub: null,
+    mldsaPub: null,
+    mldsaSigB64: null,
+    username: undefined,
+    hasMLKEM: false,
+    hasMLDSA: false,
+    isMldsaVerified: false,
+    isMldsaSignatureInvalid: false,
+    isFullyPostQuantum: false,
+  };
+
+  if (!peerPublicKeyStr) return result;
+
   try {
     const parsed = JSON.parse(peerPublicKeyStr);
-    if (parsed && parsed.v === 2 && parsed.ecdhJwk && parsed.mlkemPubB64) {
-      return {
-        ecdhJwk: parsed.ecdhJwk,
-        mlkemPub: base64ToBuf(parsed.mlkemPubB64),
-      };
+    if (parsed && parsed.v === 2 && parsed.ecdhJwk) {
+      result.ecdhJwk = parsed.ecdhJwk;
+      result.username = parsed.username;
+
+      if (parsed.mlkemPubB64) {
+        result.mlkemPub = base64ToBuf(parsed.mlkemPubB64);
+        result.hasMLKEM = true;
+      }
+
+      if (parsed.mldsaPubB64) {
+        result.mldsaPub = base64ToBuf(parsed.mldsaPubB64);
+        result.hasMLDSA = true;
+      }
+
+      if (parsed.mldsaSigB64) {
+        result.mldsaSigB64 = parsed.mldsaSigB64;
+      }
+
+      // اعتبارسنجی امضای دیجیتال هویت با الگوریتم FIPS 204 ML-DSA-65
+      if (result.hasMLKEM && result.hasMLDSA && result.mldsaSigB64 && result.mldsaPub) {
+        try {
+          const sigBytes = base64ToBuf(result.mldsaSigB64);
+          const uName = parsed.username || expectedPeerUsername || '';
+          const target = serializeBundleForSigning({
+            username: uName,
+            ecdhJwk: result.ecdhJwk,
+            mlkemPubB64: parsed.mlkemPubB64,
+          });
+
+          let valid = ml_dsa65.verify(sigBytes, target, result.mldsaPub);
+          if (!valid && !parsed.username && expectedPeerUsername) {
+            const fallbackTarget = serializeBundleForSigning({
+              username: '',
+              ecdhJwk: result.ecdhJwk,
+              mlkemPubB64: parsed.mlkemPubB64,
+            });
+            valid = ml_dsa65.verify(sigBytes, fallbackTarget, result.mldsaPub);
+          }
+
+          if (valid) {
+            result.isMldsaVerified = true;
+            result.isFullyPostQuantum = true;
+          } else {
+            result.isMldsaSignatureInvalid = true;
+          }
+        } catch {
+          result.isMldsaSignatureInvalid = true;
+        }
+      }
+      return result;
     }
+
     if (parsed && parsed.kty === 'EC') {
-      return { ecdhJwk: parsed, mlkemPub: null };
+      result.ecdhJwk = parsed;
+      return result;
     }
   } catch {
     // ignore
   }
-  return { ecdhJwk: null, mlkemPub: null };
+  return result;
+}
+
+export interface RoomPQSecurityStatus {
+  isPQ: boolean;
+  type: 'PQ_HYBRID_VERIFIED' | 'GROUP_EPOCH' | 'NOT_POST_QUANTUM' | 'DISABLED';
+  reason?: 'CLASSICAL_ECDH' | 'MISSING_PEER_KEYS' | 'INVALID_MLDSA_SIGNATURE' | 'MANUAL_PBKDF2';
+  badge: string;
+  tooltip: string;
+  warningText?: string;
+}
+
+/**
+ * تعیین وضعیت دقیق امنیتی اتاق و جلوگیری قطعی از تنزل خاموش (Silent Downgrade Protection)
+ */
+export function getRoomPQStatus(options: {
+  roomId: string;
+  isGroup: boolean;
+  e2eeActive: boolean;
+  myUsername: string;
+  peerPublicKey?: string | null;
+  peerUsername?: string;
+  customSecret?: string;
+}): RoomPQSecurityStatus {
+  if (!options.e2eeActive) {
+    return {
+      isPQ: false,
+      type: 'DISABLED',
+      badge: '🔓 ساده',
+      tooltip: 'رمزنگاری سرتاسری برای این گفتگو غیرفعال است',
+    };
+  }
+
+  if (options.isGroup) {
+    return {
+      isPQ: true,
+      type: 'GROUP_EPOCH',
+      badge: '🔒 Epoch',
+      tooltip: 'رمزنگاری گروهی مبتنی بر ماشین وضعیت اپوک (Group Epoch FSM)',
+    };
+  }
+
+  if (options.customSecret) {
+    return {
+      isPQ: false,
+      type: 'NOT_POST_QUANTUM',
+      reason: 'MANUAL_PBKDF2',
+      badge: '⚠️ رمز دستی',
+      tooltip: 'رمزنگاری با رمز دستی متقارن (PBKDF2) - فاقد امنیت پساکوانتومی',
+      warningText: 'این گفتگو با رمز دستی سفارشی متقارن رمزنگاری شده و در برابر کامپیوترهای کوانتومی ایمن نیست.',
+    };
+  }
+
+  if (!options.peerPublicKey) {
+    return {
+      isPQ: false,
+      type: 'NOT_POST_QUANTUM',
+      reason: 'MISSING_PEER_KEYS',
+      badge: '⚠️ بدون کلید',
+      tooltip: 'مخاطب هنوز کلیدهای پساکوانتومی خود را منتشر نکرده است',
+      warningText: 'مخاطب هنوز کلیدهای عمومی پساکوانتومی خود را منتشر نکرده است. تا زمان انتشار کلیدها، پیام‌ها بدون امنیت پساکوانتومی مبادله می‌شوند.',
+    };
+  }
+
+  const bundle = parsePeerKeyBundle(options.peerPublicKey, options.peerUsername);
+
+  if (bundle.isMldsaSignatureInvalid) {
+    return {
+      isPQ: false,
+      type: 'NOT_POST_QUANTUM',
+      reason: 'INVALID_MLDSA_SIGNATURE',
+      badge: '⛔ امضای جعلی',
+      tooltip: 'امضای هویت پساکوانتومی (ML-DSA-65) مخاطب نامعتبر است!',
+      warningText: 'خطر امنیتی جدی: امضای دیجیتال هویت پساکوانتومی مخاطب (FIPS 204 ML-DSA) تأیید نشد! کلیدها ممکن است دستکاری شده باشند.',
+    };
+  }
+
+  if (!bundle.isFullyPostQuantum) {
+    return {
+      isPQ: false,
+      type: 'NOT_POST_QUANTUM',
+      reason: 'CLASSICAL_ECDH',
+      badge: '⚠️ کلاسیک (ECDH)',
+      tooltip: 'مخاطب فاقد کلیدهای پساکوانتومی است - مکالمه به رمزنگاری کلاسیک ECDH تنزل یافته است',
+      warningText: 'مخاطب فاقد کلید تأییدشده‌ی ML-KEM-768 و امضای هویت ML-DSA-65 (FIPS 204) است. این گفتگو در برابر الگوریتم شور ایمن نیست و با ECDH کلاسیک تبادل می‌شود.',
+    };
+  }
+
+  return {
+    isPQ: true,
+    type: 'PQ_HYBRID_VERIFIED',
+    badge: '🛡️ PQ-KEM',
+    tooltip: 'رمزنگاری تماماً پساکوانتومی ترکیبی (ML-KEM-768 + ECDH P-256) با امضای هویت تأییدشده‌ی ML-DSA-65 (FIPS 204)',
+  };
 }
 
 /**
@@ -326,13 +596,24 @@ async function ensurePQRatchetSession(
   myUsername: string,
   roomId: string,
   peerPublicKeyStr: string,
-  incomingKemCipherB64?: string
+  incomingKemCipherB64?: string,
+  peerUsername?: string
 ): Promise<RatchetSessionState | null> {
-  const { ecdhJwk, mlkemPub } = parsePeerKeyBundle(peerPublicKeyStr);
-  if (!ecdhJwk || !mlkemPub) return null;
-
-  const peerFingerprint = bufToBase64(sha256(mlkemPub)).slice(0, 16);
+  const bundle = parsePeerKeyBundle(peerPublicKeyStr, peerUsername);
+  const { ecdhJwk, mlkemPub } = bundle;
   const existing = loadRatchetState(myUsername, roomId);
+
+  // برای راه‌اندازی نشست پساکوانتومی، الزامی است که کلیدهای کپسوله‌سازی و مشتق‌سازی حاضر باشند
+  if (!bundle.ecdhJwk || !bundle.mlkemPub) {
+    return existing || null;
+  }
+
+  // جلوگیری قطعی از تنزل خاموش: در غیاب امضای معتبر هویت ML-DSA (FIPS 204)، نشست جدید ایجاد نمی‌گردد
+  if (!bundle.isFullyPostQuantum && !existing) {
+    return null;
+  }
+
+  const peerFingerprint = bufToBase64(sha256(bundle.mlkemPub)).slice(0, 16);
 
   // اگر کپسول جدیدی از سمت مقابل آمده که نیاز به Decapsulation دارد
   if (incomingKemCipherB64 && (!existing || existing.kemCipherTextB64 !== incomingKemCipherB64)) {
@@ -790,6 +1071,7 @@ export async function encryptMessageText(
   options?: {
     myUsername?: string;
     peerPublicKey?: string | null;
+    peerUsername?: string;
     customSecret?: string;
     groupMembers?: string[];
   }
@@ -839,49 +1121,80 @@ export async function encryptMessageText(
       }
     }
 
-    // ۲. اگر چت خصوصی است و کلید عمومی ترکیبی (ML-KEM-768 + P-256) مخاطب موجود است، از راتچت پساکوانتومی استفاده کن
+    // ۲. اگر چت خصوصی است و کلید عمومی تماماً پساکوانتومی (ML-KEM-768 + P-256 + ML-DSA-65) مخاطب موجود است
     if (!manualSecret && options?.myUsername && options?.peerPublicKey) {
-      const ratchetState = await ensurePQRatchetSession(
-        options.myUsername,
-        roomId,
-        options.peerPublicKey
-      );
+      const peerBundle = parsePeerKeyBundle(options.peerPublicKey, options.peerUsername);
 
-      if (ratchetState) {
-        const currentSendChain = base64ToBuf(ratchetState.sendChainKeyB64);
-        const { nextChainKey, messageKey } = kdfChainStep(currentSendChain);
-        zeroizeBuffer(currentSendChain);
-
-        const stepIndex = ratchetState.sendStep;
-        ratchetState.sendChainKeyB64 = bufToBase64(nextChainKey);
-        ratchetState.sendStep = stepIndex + 1;
-        zeroizeBuffer(nextChainKey);
-
-        const aesKey = await window.crypto.subtle.importKey(
-          'raw',
-          messageKey as unknown as BufferSource,
-          { name: 'AES-GCM', length: 256 },
-          false,
-          ['encrypt']
+      // ایجاد و ادامه نشست راتچت پساکوانتومی تنها در صورتی که مخاطب کلید تأییدشده ML-KEM و امضای ML-DSA داشته باشد
+      if (peerBundle.isFullyPostQuantum) {
+        const ratchetState = await ensurePQRatchetSession(
+          options.myUsername,
+          roomId,
+          options.peerPublicKey,
+          undefined,
+          options.peerUsername
         );
 
-        const cipherBuffer = await window.crypto.subtle.encrypt(
-          { name: 'AES-GCM', iv },
-          aesKey,
-          encoded
-        );
-        // Zeroization فوری کلید پیام پس از رمزنگاری
-        zeroizeBuffer(messageKey);
+        if (ratchetState) {
+          const currentSendChain = base64ToBuf(ratchetState.sendChainKeyB64);
+          const { nextChainKey, messageKey } = kdfChainStep(currentSendChain);
+          zeroizeBuffer(currentSendChain);
 
-        const payload = `${E2EE_PQ_RATCHET_PREFIX}${stepIndex}:${ratchetState.kemCipherTextB64}:${bufToBase64(iv)}:${bufToBase64(cipherBuffer)}`;
-        const payloadHashKey = bufToBase64(sha256(new TextEncoder().encode(payload))).slice(0, 24);
-        ratchetState.decryptedCache[payloadHashKey] = plainText;
-        saveRatchetState(options.myUsername, roomId, ratchetState);
+          const stepIndex = ratchetState.sendStep;
+          ratchetState.sendChainKeyB64 = bufToBase64(nextChainKey);
+          ratchetState.sendStep = stepIndex + 1;
+          zeroizeBuffer(nextChainKey);
 
-        return payload;
+          const aesKey = await window.crypto.subtle.importKey(
+            'raw',
+            messageKey as unknown as BufferSource,
+            { name: 'AES-GCM', length: 256 },
+            false,
+            ['encrypt']
+          );
+
+          const cipherBuffer = await window.crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv },
+            aesKey,
+            encoded
+          );
+          // Zeroization فوری کلید پیام پس از رمزنگاری
+          zeroizeBuffer(messageKey);
+
+          const ivB64 = bufToBase64(iv);
+          const cipherB64 = bufToBase64(cipherBuffer);
+          const kemCipherB64 = ratchetState.kemCipherTextB64;
+
+          // امضای دیجیتال پساکوانتومی پیام و پیام اولیه نشست (Session-Init) با ML-DSA-65
+          let msgSigB64 = '';
+          const myDsaSec = getMyMLDSASecretKey(options.myUsername);
+          if (myDsaSec) {
+            try {
+              const signTarget = serializeMessageForSigning({
+                roomId,
+                step: stepIndex,
+                kemCipherB64,
+                ivB64,
+                cipherB64,
+              });
+              const sig = ml_dsa65.sign(signTarget, myDsaSec);
+              msgSigB64 = bufToBase64(sig);
+            } finally {
+              zeroizeBuffer(myDsaSec);
+            }
+          }
+
+          const payload = `${E2EE_PQ_RATCHET_PREFIX}${stepIndex}:${kemCipherB64}:${ivB64}:${cipherB64}${msgSigB64 ? `:${msgSigB64}` : ''}`;
+          const payloadHashKey = bufToBase64(sha256(new TextEncoder().encode(payload))).slice(0, 24);
+          ratchetState.decryptedCache[payloadHashKey] = plainText;
+          saveRatchetState(options.myUsername, roomId, ratchetState);
+
+          return payload;
+        }
       }
 
-      // Fallback به ECDH کلاسیک اگر طرف مقابل هنوز باندل نسخه ۲ نداشت
+      // تنزل صریح (نه خاموش) به ECDH کلاسیک در صورت فقدان کلیدهای پساکوانتومی مخاطب
+      // توجه: در UI نشان PQ-KEM حذف شده و بنر هشدار غیر کوانتومی بودن نمایش داده می‌شود
       const ecdhKey = await deriveECDHSharedAesKey(options.myUsername, options.peerPublicKey);
       if (ecdhKey) {
         const cipherBuffer = await window.crypto.subtle.encrypt(
@@ -912,6 +1225,7 @@ export async function decryptMessageText(
   options?: {
     myUsername?: string;
     peerPublicKey?: string | null;
+    peerUsername?: string;
     customSecret?: string;
     sender?: string;
     groupMembers?: string[];
@@ -922,6 +1236,7 @@ export async function decryptMessageText(
   mode?: 'PQ-MLKEM-RATCHET' | 'GROUP-EPOCH-FSM' | 'ECDH' | 'PBKDF2';
   epoch?: number;
   ratchetStep?: number;
+  mldsaVerified?: boolean;
   failed?: boolean;
 }> {
   if (!isE2EEPayload(payload)) {
@@ -929,14 +1244,14 @@ export async function decryptMessageText(
   }
 
   try {
-    // ۱. رمزگشایی پیام‌های راتچت پساکوانتومی (ML-KEM-768 + Out-of-Order Ratchet)
+    // ۱. رمزگشایی پیام‌های راتچت پساکوانتومی (ML-KEM-768 + Out-of-Order Ratchet + FIPS 204 ML-DSA Verification)
     if (payload.startsWith(E2EE_PQ_RATCHET_PREFIX)) {
       const raw = payload.slice(E2EE_PQ_RATCHET_PREFIX.length);
       const parts = raw.split(':');
-      if (parts.length !== 4) {
+      if (parts.length < 4 || parts.length > 5) {
         return { text: payload, isEncrypted: true, failed: true };
       }
-      const [stepStr, kemCipherB64, ivB64, cipherB64] = parts;
+      const [stepStr, kemCipherB64, ivB64, cipherB64, maybeSigB64] = parts;
       const msgStep = parseInt(stepStr, 10);
       const iv = base64ToBuf(ivB64);
       const cipherBytes = base64ToBuf(cipherB64);
@@ -944,11 +1259,31 @@ export async function decryptMessageText(
 
       if (options?.myUsername && options?.peerPublicKey) {
         const isIncoming = options.sender && options.sender !== options.myUsername;
+        const peerBundle = parsePeerKeyBundle(options.peerPublicKey, options.peerUsername);
+
+        // اعتبارسنجی امضای هویت دیجیتال پساکوانتومی پیام با کلید عمومی ML-DSA-65 مخاطب
+        let mldsaVerified = false;
+        if (maybeSigB64 && peerBundle.mldsaPub) {
+          try {
+            const signData = serializeMessageForSigning({
+              roomId,
+              step: msgStep,
+              kemCipherB64,
+              ivB64,
+              cipherB64,
+            });
+            mldsaVerified = ml_dsa65.verify(base64ToBuf(maybeSigB64), signData, peerBundle.mldsaPub);
+          } catch {
+            mldsaVerified = false;
+          }
+        }
+
         const ratchetState = await ensurePQRatchetSession(
           options.myUsername,
           roomId,
           options.peerPublicKey,
-          isIncoming ? kemCipherB64 : undefined
+          isIncoming ? kemCipherB64 : undefined,
+          options.peerUsername
         );
 
         if (ratchetState) {
@@ -959,6 +1294,7 @@ export async function decryptMessageText(
               isEncrypted: true,
               mode: 'PQ-MLKEM-RATCHET',
               ratchetStep: msgStep,
+              mldsaVerified,
               failed: false,
             };
           }
@@ -979,6 +1315,7 @@ export async function decryptMessageText(
               isEncrypted: true,
               mode: 'PQ-MLKEM-RATCHET',
               ratchetStep: msgStep,
+              mldsaVerified,
               failed: false,
             };
           }
