@@ -88,3 +88,26 @@ select{
   from{opacity:0;transform:translateY(-10px)}
   to{opacity:1;transform:translateY(0)}
 }
+
+/* Skip to main content link */
+.skip-link{
+  position:fixed;
+  top:-100px;
+  right:16px;
+  z-index:100000;
+  background:var(--accent);
+  color:#ffffff;
+  padding:10px 18px;
+  border-radius:10px;
+  font-size:14px;
+  font-weight:600;
+  text-decoration:none;
+  box-shadow:0 4px 16px rgba(0,0,0,.45);
+  transition:top .15s ease;
+}
+.skip-link:focus,
+.skip-link:focus-visible{
+  top:16px;
+  outline:2px solid #ffffff;
+  outline-offset:2px;
+}

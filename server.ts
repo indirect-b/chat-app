@@ -36,7 +36,13 @@ app.use(
         fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
         imgSrc: ["'self'", 'data:', 'blob:'],
         mediaSrc: ["'self'", 'data:', 'blob:'],
-        connectSrc: ["'self'", 'ws:', 'wss:'],
+        connectSrc: [
+          "'self'",
+          'ws:',
+          'wss:',
+          'https://fonts.googleapis.com',
+          'https://fonts.gstatic.com',
+        ],
         objectSrc: ["'none'"],
         baseUri: ["'self'"],
         formAction: ["'self'"],
@@ -284,42 +290,9 @@ app.post('/api/register', async (req: Request, res: Response) => {
   res.json({ ok: true, username: key });
 });
 
-app.post('/api/quick-login', async (req: Request, res: Response) => {
-  let { username } = req.body;
-  if (!username) username = 'کاربر_۱';
-  const key = String(username).toLowerCase().replace('@', '').trim();
-  if (!key) return res.json({ ok: false, msg: 'نام کاربری نامعتبر است' });
-
-  const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [key]);
-  if (!rows.length) {
-    await pool.query('INSERT INTO users (username, bale_chat_id, joined_at) VALUES ($1, $2, $3)', [
-      key,
-      null,
-      new Date().toISOString(),
-    ]);
-  }
-
-  if (key === 'کاربر_۱' || key === 'کاربر_۲') {
-    const other = key === 'کاربر_۱' ? 'کاربر_۲' : 'کاربر_۱';
-    const { rows: otherRows } = await pool.query('SELECT username FROM users WHERE username = $1', [other]);
-    if (!otherRows.length) {
-      await pool.query('INSERT INTO users (username, bale_chat_id, joined_at) VALUES ($1, $2, $3)', [
-        other,
-        null,
-        new Date().toISOString(),
-      ]);
-    }
-    await pool.query('INSERT INTO contacts (username, contact) VALUES ($1, $2) ON CONFLICT DO NOTHING', [
-      key,
-      other,
-    ]);
-    await pool.query('INSERT INTO contacts (username, contact) VALUES ($1, $2) ON CONFLICT DO NOTHING', [
-      other,
-      key,
-    ]);
-  }
-
-  res.json({ ok: true, username: key });
+app.post('/api/quick-login', (_req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
+  return res.status(403).json({ ok: false, msg: 'ورود سریع تستی غیرفعال شده است' });
 });
 
 // ===== RISTRETTO255-VOPRF BLINDED IDENTITY EVALUATION (RFC 9497) =====
@@ -443,15 +416,29 @@ app.post('/api/report', async (req: Request, res: Response) => {
 
 // ===== SETTINGS =====
 app.get('/api/settings/rules', async (_req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
   res.json({ ok: true, rules: await getSetting('rules') });
 });
 
-app.get('/api/settings/mode', async (_req: Request, res: Response) => {
-  res.json({
-    ok: true,
-    mode: await getSetting('server_mode'),
-    msg: await getSetting('maintenance_msg'),
-  });
+app.get('/api/settings/mode', async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
+  const mode = (await getSetting('server_mode')) || 'normal';
+
+  if (isAdmin(req)) {
+    const msg = await getSetting('maintenance_msg');
+    return res.status(200).json({ ok: true, mode, msg });
+  }
+
+  if (mode === 'maintenance') {
+    const msg = await getSetting('maintenance_msg');
+    return res.status(503).json({ mode: 'maintenance', msg });
+  }
+
+  if (req.headers.authorization || req.headers['x-requested-with'] !== 'XMLHttpRequest') {
+    return res.status(401).json({ mode: 'normal' });
+  }
+
+  return res.status(200).json({ mode: 'normal' });
 });
 
 // ===== ADMIN =====
@@ -743,12 +730,56 @@ app.get('/api/admin-login-as/:token', async (req: Request, res: Response) => {
 
 // مسیر پنل مدیریت فقط در سمت سرور تعریف شده و هیچ اثری از آن در باندل فرانت‌اند وجود ندارد
 app.get(config.ADMIN_PATH, (_req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
   res.sendFile(path.join(process.cwd(), 'public', 'admin.html'));
 });
 
+app.get('/robots.txt', (req: Request, res: Response) => {
+  const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'https';
+  const host = req.get('host') || 'localhost:3000';
+  const baseUrl = `${proto.split(',')[0].trim()}://${host}`;
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.send(
+    [
+      'User-agent: *',
+      'Allow: /',
+      'Disallow: /api/',
+      'Disallow: /admin-login/',
+      `Disallow: ${config.ADMIN_PATH}`,
+      'Disallow: /uploads/',
+      'Disallow: /socket.io/',
+      '',
+      `Sitemap: ${baseUrl}/sitemap.xml`,
+      '',
+    ].join('\n')
+  );
+});
+
+app.get('/sitemap.xml', (req: Request, res: Response) => {
+  const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'https';
+  const host = req.get('host') || 'localhost:3000';
+  const baseUrl = `${proto.split(',')[0].trim()}://${host}`;
+  res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.send(
+    `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url>\n    <loc>${baseUrl}/</loc>\n    <changefreq>weekly</changefreq>\n    <priority>1.0</priority>\n  </url>\n</urlset>\n`
+  );
+});
+
 // ===== SOCKET.IO =====
-io.on('connection', (socket) => {
+io.on('connection', async (socket) => {
   let currentUser: string | null = null;
+
+  try {
+    const mode = await getSetting('server_mode');
+    if (mode === 'maintenance') {
+      const msg = await getSetting('maintenance_msg');
+      socket.emit('server-maintenance', { msg });
+    }
+  } catch {
+    // ignore
+  }
 
   socket.on('auth', async (username: string) => {
     if (await isUserBlocked(username)) {
@@ -1036,6 +1067,38 @@ async function start(): Promise<void> {
   const isProd = process.env.NODE_ENV === 'production' && fs.existsSync(distPath);
   const validClientRoutes = new Set(['/', '/index.html']);
 
+  const sendNotFound = (req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
+    if (req.path.startsWith('/api/')) {
+      return res.status(404).json({ ok: false, error: 'Not Found' });
+    }
+    res.status(404).setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.send(`<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>۴۰۴ - صفحه یافت نشد | پیام‌رسان</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{font-family:'Vazirmatn',system-ui,sans-serif;background:linear-gradient(135deg,#0f0f1a,#16213e,#0f3460);color:#f0f0f0;min-height:100vh;display:flex;align-items:center;justify-content:center;direction:rtl;padding:20px}
+    main{max-width:400px;width:100%;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);border-radius:24px;padding:36px 28px;text-align:center}
+    h1{font-size:22px;margin:12px 0 8px}
+    p{font-size:14px;color:#9ca3af;margin-bottom:24px;line-height:1.7}
+    a.home-link{display:inline-block;background:linear-gradient(135deg,#7c3aed,#06b6d4);color:#ffffff;text-decoration:none;padding:12px 24px;border-radius:12px;font-weight:600;font-size:14px}
+  </style>
+</head>
+<body>
+  <main id="main-content">
+    <div style="font-size:48px" aria-hidden="true">🔍</div>
+    <h1>۴۰۴ - صفحه مورد نظر یافت نشد</h1>
+    <p>آدرسی که وارد کرده‌اید در پیام‌رسان وجود ندارد یا جابه‌جا شده است.</p>
+    <a href="/" class="home-link">بازگشت به صفحه اصلی پیام‌رسان</a>
+  </main>
+</body>
+</html>`);
+  };
+
   if (fs.existsSync(assetsPath)) {
     app.use(
       '/assets',
@@ -1077,10 +1140,12 @@ async function start(): Promise<void> {
         isExistingFile(publicPath, reqPath) || isExistingFile(distPath, reqPath);
 
       if (!isAppRoute && !isViteModule && !isStaticAsset) {
-        return res.status(404).send('Not Found');
+        return sendNotFound(req, res);
       }
       if (isAppRoute) {
         res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+      } else if (isStaticAsset && !reqPath.endsWith('.html')) {
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
       }
       next();
     });
@@ -1092,6 +1157,8 @@ async function start(): Promise<void> {
         setHeaders: (res, filePath) => {
           if (filePath.endsWith('.html')) {
             res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+          } else {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
           }
         },
       })
@@ -1102,6 +1169,8 @@ async function start(): Promise<void> {
         setHeaders: (res, filePath) => {
           if (filePath.endsWith('.html')) {
             res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+          } else {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
           }
         },
       })
@@ -1110,8 +1179,8 @@ async function start(): Promise<void> {
       res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
       res.sendFile(path.join(distPath, 'index.html'));
     });
-    app.use((_req, res) => {
-      res.status(404).send('Not Found');
+    app.use((req, res) => {
+      return sendNotFound(req, res);
     });
   }
 

@@ -42,31 +42,16 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
     }, 1000);
   };
 
-  const handleQuickTestLogin = async (targetUser?: string) => {
-    const cleanInput = baleId.trim().replace('@', '');
-    const username = targetUser || cleanInput || 'کاربر_۱';
-    setMsg({ text: 'در حال ورود سریع...', isOk: true });
-    try {
-      const res = await fetch('/api/quick-login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username }),
-      }).then(r => r.json());
-
-      if (res.ok) {
-        setMsg({ text: '✅ با موفقیت وارد شدید!', isOk: true });
-        setTimeout(() => onAuthenticated(res.username), 150);
-      } else {
-        setMsg({ text: res.msg || 'خطا در ورود تستی', isOk: false });
-      }
-    } catch {
-      setMsg({ text: 'خطا در برقراری ارتباط با سرور', isOk: false });
-    }
-  };
+  const [baleIdInvalid, setBaleIdInvalid] = useState(false);
 
   const handleSendOTP = async () => {
     const clean = baleId.trim().replace('@', '');
-    if (!clean) return;
+    if (!clean) {
+      setBaleIdInvalid(true);
+      setMsg({ text: 'لطفاً آیدی بله خود را وارد کنید', isOk: false });
+      return;
+    }
+    setBaleIdInvalid(false);
     const res = await fetch('/api/send-otp', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -77,7 +62,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
       setVerifiedBaleId(clean);
       if (res.needStart) {
         setMsg({
-          text: '⚠️ ابتدا <a href="https://ble.ir/Optcodebot" target="_blank" style="color:#9d5cff">@Optcodebot</a> را در بله استارت کن',
+          text: '⚠️ ابتدا <a href="https://ble.ir/Optcodebot" target="_blank" rel="noopener noreferrer" style="color:#9d5cff">@Optcodebot</a> را در بله استارت کن',
           isOk: false,
           html: true,
         });
@@ -97,6 +82,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
         }, 600);
       }
     } else {
+      setBaleIdInvalid(true);
       setMsg({ text: res.msg, isOk: false });
     }
   };
@@ -149,96 +135,106 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
     setRulesModalOpen(true);
   };
 
+  const isBaleIdInvalid = baleIdInvalid || Boolean(msg.text && !msg.isOk);
+
   return (
-    <div id="authScreen" className="auth-screen">
+    <main id="main-content" className="auth-screen" tabIndex={-1}>
       {step === 1 && (
         <div id="step1" className="auth-box">
-          <div className="auth-logo">
-            <div className="logo-circle">💬</div>
+          <header className="auth-logo">
+            <div className="logo-circle" aria-hidden="true">💬</div>
             <h1>پیام‌رسان</h1>
             <p>ورود با آیدی بله • مجهز به رمزنگاری E2EE</p>
-          </div>
+          </header>
           <div className="auth-form">
-            <label htmlFor="baleIdInput">آیدی بله</label>
-            <div className="input-prefix">
-              <span>@</span>
+            <label htmlFor="baleIdInput">
+              آیدی بله <span aria-hidden="true">*</span>
+            </label>
+            <div className={`input-prefix ${isBaleIdInvalid ? 'input-invalid' : ''}`}>
+              <span aria-hidden="true">@</span>
               <input
                 type="text"
                 id="baleIdInput"
                 aria-label="آیدی بله"
-                placeholder="your_id"
-                autoComplete="off"
+                required
+                aria-required="true"
+                aria-invalid={isBaleIdInvalid ? 'true' : 'false'}
+                aria-describedby="baleIdHint msg1"
+                placeholder="مثال: username123"
+                autoComplete="username"
                 value={baleId}
-                onChange={e => setBaleId(e.target.value)}
+                onChange={e => {
+                  setBaleId(e.target.value);
+                  if (baleIdInvalid) setBaleIdInvalid(false);
+                }}
                 onKeyDown={e => e.key === 'Enter' && handleSendOTP()}
               />
             </div>
+            <p id="baleIdHint" className="input-hint">
+              آیدی بله خود را بدون @ وارد کنید (مثال: username123)
+            </p>
             <button type="button" onClick={handleSendOTP}>
               دریافت کد تأیید
             </button>
 
-            <div className="test-login-divider">
-              <span>یا</span>
+            <div className="test-login-divider" role="separator" aria-label="یا">
+              <span className="divider-line" aria-hidden="true" />
+              <span className="divider-text">یا</span>
+              <span className="divider-line" aria-hidden="true" />
             </div>
 
-            <button
-              type="button"
-              className="btn-test"
-              onClick={() => handleQuickTestLogin()}
-              title="ورود فوری بدون نیاز به کد تأیید"
+            <a
+              href="https://ble.ir/Optcodebot"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="auth-bot-link"
             >
-              ⚡ ورود سریع تستی (بدون نیاز به کد)
-            </button>
-
-            <div className="test-accounts-row">
-              <button
-                type="button"
-                className="btn-ghost"
-                onClick={() => handleQuickTestLogin('کاربر_۱')}
-              >
-                👤 اکانت ۱
-              </button>
-              <button
-                type="button"
-                className="btn-ghost"
-                onClick={() => handleQuickTestLogin('کاربر_۲')}
-              >
-                👤 اکانت ۲
-              </button>
-            </div>
+              🤖 فعال‌سازی ربات کد تأیید در بله (@Optcodebot)
+            </a>
 
             {msg.html ? (
               <p
                 id="msg1"
+                role="alert"
                 className={`auth-msg ${msg.isOk ? 'ok' : ''}`}
                 dangerouslySetInnerHTML={{ __html: msg.text }}
               />
             ) : (
-              <p id="msg1" className={`auth-msg ${msg.isOk ? 'ok' : ''}`}>
+              <p id="msg1" role="status" aria-live="polite" className={`auth-msg ${msg.isOk ? 'ok' : ''}`}>
                 {msg.text}
               </p>
             )}
           </div>
+          <footer className="auth-footer">
+            <span>🔒 رمزنگاری سرتاسری</span>
+            <button type="button" className="link-btn" onClick={handleOpenRules}>
+              قوانین پیام‌رسان
+            </button>
+          </footer>
         </div>
       )}
 
       {step === 2 && (
         <div id="step2" className="auth-box">
-          <div className="auth-logo">
+          <header className="auth-logo">
             <div
               className="logo-circle"
               style={{ background: 'linear-gradient(135deg,#06b6d4,#7c3aed)' }}
+              aria-hidden="true"
             >
               🔐
             </div>
             <h1>کد تأیید</h1>
             <p id="step2desc">{step2Desc}</p>
-          </div>
+          </header>
           <div className="auth-form">
             <input
               type="text"
               id="otpInput"
               aria-label="کد تأیید"
+              required
+              aria-required="true"
+              aria-invalid={Boolean(msg.text && !msg.isOk) ? 'true' : 'false'}
               placeholder="● ● ● ● ● ●"
               maxLength={6}
               style={{ textAlign: 'center', letterSpacing: '10px', fontSize: '24px' }}
@@ -279,16 +275,17 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
 
       {step === 3 && (
         <div id="step3" className="auth-box">
-          <div className="auth-logo">
+          <header className="auth-logo">
             <div
               className="logo-circle"
               style={{ background: 'linear-gradient(135deg,#22c55e,#06b6d4)' }}
+              aria-hidden="true"
             >
               👋
             </div>
             <h1>خوش آمدی!</h1>
             <p>قبل از ورود قوانین را بخوانید</p>
-          </div>
+          </header>
           <div className="auth-form">
             <div className="id-preview" id="idPreview">
               @{verifiedBaleId}
@@ -324,9 +321,9 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
       )}
 
       {rulesModalOpen && (
-        <div className="modal" id="rulesModal">
+        <div className="modal" id="rulesModal" role="dialog" aria-modal="true" aria-labelledby="rulesModalTitle">
           <div className="modal-box" style={{ maxWidth: '400px' }}>
-            <h3>📋 قوانین پیام‌رسان</h3>
+            <h3 id="rulesModalTitle">📋 قوانین پیام‌رسان</h3>
             <div
               style={{
                 whiteSpace: 'pre-wrap',
@@ -350,6 +347,6 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
           </div>
         </div>
       )}
-    </div>
+    </main>
   );
 };

@@ -1,14 +1,27 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, Suspense } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { AuthScreen } from './components/AuthScreen';
-import { ChatApp } from './components/ChatApp';
 import { BlockedInfo } from './types';
+
+const ChatApp = React.lazy(() =>
+  import('./components/ChatApp').then(m => ({ default: m.ChatApp }))
+);
 
 const SESSION_KEY = 'chat_session_user';
 const socketInstance: Socket = io();
 
+function hasStoredSessionCandidate(): boolean {
+  try {
+    return Boolean(
+      sessionStorage.getItem('adminLoginToken') || localStorage.getItem(SESSION_KEY)
+    );
+  } catch {
+    return false;
+  }
+}
+
 export const App: React.FC = () => {
-  const [initializing, setInitializing] = useState(true);
+  const [initializing, setInitializing] = useState<boolean>(() => hasStoredSessionCandidate());
   const [username, setUsername] = useState<string>('');
   const [maintenance, setMaintenance] = useState<{ active: boolean; msg: string }>({
     active: false,
@@ -85,8 +98,11 @@ export const App: React.FC = () => {
   useEffect(() => {
     async function bootstrap() {
       try {
-        const modeRes = await fetch('/api/settings/mode').then(r => r.json());
-        if (modeRes.mode === 'maintenance') {
+        const res = await fetch('/api/settings/mode', {
+          headers: { 'X-Requested-With': 'XMLHttpRequest' },
+        });
+        const modeRes = await res.json().catch(() => ({}));
+        if (res.status === 503 || modeRes.mode === 'maintenance') {
           setMaintenance({
             active: true,
             msg: modeRes.msg || 'سرور در حال به‌روزرسانی است.',
@@ -99,12 +115,16 @@ export const App: React.FC = () => {
       }
 
       // ۱. بررسی ورود موقت ادمین (Login As)
-      const adminTokenUser = sessionStorage.getItem('adminLoginToken');
-      if (adminTokenUser) {
-        sessionStorage.removeItem('adminLoginToken');
-        handleAuthenticated(adminTokenUser);
-        setInitializing(false);
-        return;
+      try {
+        const adminTokenUser = sessionStorage.getItem('adminLoginToken');
+        if (adminTokenUser) {
+          sessionStorage.removeItem('adminLoginToken');
+          handleAuthenticated(adminTokenUser);
+          setInitializing(false);
+          return;
+        }
+      } catch {
+        // ignore
       }
 
       // ۲. بررسی نشست ذخیره‌شده در LocalStorage
@@ -132,9 +152,11 @@ export const App: React.FC = () => {
     bootstrap();
   }, [handleAuthenticated]);
 
-  if (initializing) {
-    return null;
-  }
+  const skipLink = (
+    <a href="#main-content" className="skip-link">
+      پرش به محتوای اصلی
+    </a>
+  );
 
   if (blocked) {
     const untilText =
@@ -145,40 +167,60 @@ export const App: React.FC = () => {
         : 'مسدودیت حساب';
 
     return (
-      <div id="maintenanceScreen" className="full-screen">
-        <div className="maint-box">
-          <div style={{ fontSize: '60px' }}>🚫</div>
-          <h1>حساب مسدود شد</h1>
-          <p>علت: {blocked.block_reason || 'تخلف'}</p>
-          <p>{untilText}</p>
-        </div>
-      </div>
+      <>
+        {skipLink}
+        <main id="main-content" className="full-screen" tabIndex={-1}>
+          <div className="maint-box">
+            <div style={{ fontSize: '60px' }} aria-hidden="true">🚫</div>
+            <h1>حساب مسدود شد</h1>
+            <p>علت: {blocked.block_reason || 'تخلف'}</p>
+            <p>{untilText}</p>
+          </div>
+        </main>
+      </>
     );
   }
 
   if (maintenance.active) {
     return (
-      <div id="maintenanceScreen" className="full-screen">
-        <div className="maint-box">
-          <div style={{ fontSize: '60px' }}>🔧</div>
-          <h1>در حال به‌روزرسانی</h1>
-          <p id="maintMsg">{maintenance.msg}</p>
-        </div>
-      </div>
+      <>
+        {skipLink}
+        <main id="main-content" className="full-screen" tabIndex={-1}>
+          <div className="maint-box">
+            <div style={{ fontSize: '60px' }} aria-hidden="true">🔧</div>
+            <h1>در حال به‌روزرسانی</h1>
+            <p id="maintMsg">{maintenance.msg}</p>
+          </div>
+        </main>
+      </>
+    );
+  }
+
+  if (initializing) {
+    return (
+      <>
+        {skipLink}
+        <main id="main-content" className="auth-screen" tabIndex={-1} aria-busy="true" />
+      </>
     );
   }
 
   return (
     <>
+      {skipLink}
       {!username ? (
         <AuthScreen onAuthenticated={handleAuthenticated} />
       ) : (
-        <ChatApp
-          myUsername={username}
-          socket={socketInstance}
-          onLogout={handleLogout}
-          showToast={showToast}
-        />
+        <Suspense fallback={<main id="main-content" className="auth-screen" tabIndex={-1} aria-busy="true" />}>
+          <div id="main-content" tabIndex={-1}>
+            <ChatApp
+              myUsername={username}
+              socket={socketInstance}
+              onLogout={handleLogout}
+              showToast={showToast}
+            />
+          </div>
+        </Suspense>
       )}
 
       {announcement && (

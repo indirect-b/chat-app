@@ -73,22 +73,62 @@
   display:flex;
   align-items:center;
   text-align:center;
-  color:var(--faint);
+  color:var(--muted);
   font-size:12px;
-  margin:2px 0;
+  margin:6px 0;
+  gap:10px;
 }
-.test-login-divider::before,.test-login-divider::after{
-  content:'';
+.test-login-divider .divider-line{
   flex:1;
-  border-bottom:1px solid rgba(255,255,255,.1);
+  height:1px;
+  background:rgba(255,255,255,.28);
+  border-top:1px solid rgba(255,255,255,.28);
 }
-.test-login-divider span{padding:0 10px}
-.test-accounts-row{display:flex;gap:8px}
-.test-accounts-row button{
-  flex:1;
-  padding:9px!important;
-  font-size:13px!important;
-  border-radius:10px!important;
+.test-login-divider span.divider-text{padding:0 4px}
+.auth-bot-link{
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:6px;
+  background:rgba(255,255,255,.07);
+  border:1px solid rgba(255,255,255,.14);
+  border-radius:12px;
+  padding:11px 14px;
+  font-size:13.5px;
+  font-weight:500;
+  color:var(--text);
+  text-decoration:none;
+  transition:background .2s,border-color .2s;
+}
+.auth-bot-link:hover{
+  background:rgba(255,255,255,.12);
+  border-color:var(--al);
+}
+.input-hint{
+  font-size:12px;
+  color:var(--muted);
+  margin-top:-2px;
+  line-height:1.5;
+}
+.auth-footer{
+  margin-top:18px;
+  padding-top:14px;
+  border-top:1px solid rgba(255,255,255,.1);
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  font-size:12px;
+  color:var(--muted);
+}
+.auth-footer button.link-btn{
+  background:none!important;
+  border:none!important;
+  padding:0!important;
+  font-size:12px!important;
+  font-weight:500!important;
+  color:var(--al)!important;
+  text-decoration:underline;
+  cursor:pointer;
 }
 .auth-msg{font-size:13px;color:var(--red);text-align:center;min-height:18px}
 .auth-msg.ok{color:var(--green)}
@@ -102,6 +142,7 @@
   transition:border-color .2s;
 }
 .input-prefix:focus-within{border-color:var(--accent)}
+.input-prefix.input-invalid{border-color:var(--red)}
 .input-prefix span{padding:0 12px;color:var(--al);font-size:16px;font-weight:600}
 .input-prefix input{
   background:none!important;
