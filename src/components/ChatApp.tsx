@@ -17,6 +17,8 @@ import {
   getRoomPQStatus,
   parsePeerKeyBundle,
   getMyMLDSAPublicKey,
+  getStoredPeerPublicKey,
+  setStoredPeerPublicKey,
 } from '../utils/crypto';
 
 interface ChatAppProps {
@@ -214,7 +216,14 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     (roomId: string): string | null => {
       if (roomId.startsWith('group__')) return null;
       const partner = roomId.split('__').find(u => u !== myUsername);
-      return partner ? peerPublicKeysRef.current[partner] || null : null;
+      if (!partner) return null;
+      if (peerPublicKeysRef.current[partner]) return peerPublicKeysRef.current[partner];
+      const stored = getStoredPeerPublicKey(partner);
+      if (stored) {
+        peerPublicKeysRef.current[partner] = stored;
+        return stored;
+      }
+      return null;
     },
     [myUsername]
   );
@@ -234,8 +243,21 @@ export const ChatApp: React.FC<ChatAppProps> = ({
 
   const processDecryption = useCallback(
     async (msg: ChatMessage, roomId: string): Promise<DecryptedChatMessage> => {
-      const peerPublicKey = getPeerKeyForRoom(roomId);
+      let peerPublicKey = getPeerKeyForRoom(roomId);
       const partner = roomId.startsWith('group__') ? undefined : roomId.split('__').find(u => u !== myUsername);
+      if (!peerPublicKey && partner) {
+        try {
+          const uRes = await fetch('/api/user/' + encodeURIComponent(partner)).then(r => r.json());
+          if (uRes.ok && uRes.user?.public_key) {
+            peerPublicKey = uRes.user.public_key;
+            peerPublicKeysRef.current[partner] = peerPublicKey;
+            setStoredPeerPublicKey(partner, peerPublicKey);
+          }
+        } catch {
+          // ignore
+        }
+      }
+
       const gId = roomId.startsWith('group__') ? roomId.replace('group__', '') : '';
       const groupMembers = gId ? groupMembersRef.current[gId] || [] : undefined;
 
@@ -282,6 +304,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
           res.contacts.forEach((c: any) => {
             if (c.public_key) {
               peerPublicKeysRef.current[c.username] = c.public_key;
+              setStoredPeerPublicKey(c.username, c.public_key);
             }
           });
           setRooms(
@@ -623,6 +646,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
 
     const onPeerKeyUpdated = ({ username, publicKey }: { username: string; publicKey: string }) => {
       peerPublicKeysRef.current[username] = publicKey;
+      setStoredPeerPublicKey(username, publicKey);
     };
 
     socket.on('new-message', onNewMessage);
@@ -663,14 +687,20 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       ? 'group__' + room.id
       : [myUsername, room.id].sort().join('__');
 
-    if (!room.isGroup && !peerPublicKeysRef.current[room.id]) {
-      try {
-        const uRes = await fetch('/api/user/' + encodeURIComponent(room.id)).then(r => r.json());
-        if (uRes.ok && uRes.user?.public_key) {
-          peerPublicKeysRef.current[room.id] = uRes.user.public_key;
+    if (!room.isGroup) {
+      if (room.publicKey) {
+        peerPublicKeysRef.current[room.id] = room.publicKey;
+        setStoredPeerPublicKey(room.id, room.publicKey);
+      } else if (!peerPublicKeysRef.current[room.id]) {
+        try {
+          const uRes = await fetch('/api/user/' + encodeURIComponent(room.id)).then(r => r.json());
+          if (uRes.ok && uRes.user?.public_key) {
+            peerPublicKeysRef.current[room.id] = uRes.user.public_key;
+            setStoredPeerPublicKey(room.id, uRes.user.public_key);
+          }
+        } catch {
+          // ignore
         }
-      } catch {
-        // ignore
       }
     }
 

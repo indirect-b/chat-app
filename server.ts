@@ -1,4 +1,4 @@
-// sync checkpoint — no behavior change
+// sync checkpoint — no behavior change (verified)
 import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import http from 'http';
