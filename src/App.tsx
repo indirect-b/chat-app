@@ -46,7 +46,10 @@ function updateDocumentMeta(pathname: string) {
 
 function hasStoredSessionCandidate(): boolean {
   try {
-    if (typeof window !== 'undefined' && window.location.pathname === '/terms') {
+    if (
+      typeof window !== 'undefined' &&
+      (window.location.pathname === '/terms' || window.location.pathname === '/login')
+    ) {
       return false;
     }
     return Boolean(
@@ -255,9 +258,24 @@ export const App: React.FC = () => {
         {skipLink}
         <Suspense
           fallback={
-            <main id="main-content" className="terms-screen" tabIndex={-1} aria-busy="true">
-              <h1>قوانین و مقررات پیام‌رسان</h1>
-            </main>
+            <div className="terms-screen">
+              <div className="terms-box">
+                <header role="banner" aria-label="سربرگ صفحه" className="auth-banner">
+                  <div className="auth-brand">
+                    <span className="auth-brand-icon" aria-hidden="true">
+                      💬
+                    </span>
+                    <span className="auth-brand-name">پیام‌رسان</span>
+                  </div>
+                </header>
+                <main id="main-content" tabIndex={-1} aria-busy="true">
+                  <h1>قوانین و مقررات پیام‌رسان</h1>
+                </main>
+                <footer role="contentinfo" aria-label="پاصفحه" className="auth-footer">
+                  <span className="footer-badge">🔒 رمزنگاری سرتاسری</span>
+                </footer>
+              </div>
+            </div>
           }
         >
           <TermsScreen onNavigate={handleNavigate} />
@@ -323,9 +341,32 @@ export const App: React.FC = () => {
       {!username || pathname === '/login' ? (
         <Suspense
           fallback={
-            <main id="main-content" className="auth-screen" tabIndex={-1} aria-busy="true">
-              <h1>پیام‌رسان</h1>
-            </main>
+            <div className="auth-screen">
+              <div className="auth-box">
+                <header role="banner" aria-label="سربرگ صفحه" className="auth-banner">
+                  <a href="/" className="auth-brand">
+                    <span className="auth-brand-icon" aria-hidden="true">
+                      💬
+                    </span>
+                    <span className="auth-brand-name">سامانه پیام‌رسان</span>
+                  </a>
+                </header>
+                <main id="main-content" tabIndex={-1} aria-busy="true">
+                  <h1>پیام‌رسان</h1>
+                </main>
+                <footer role="contentinfo" aria-label="پاصفحه" className="auth-footer">
+                  <nav aria-label="پیوندهای پاصفحه" className="auth-footer-nav">
+                    <a href="/terms" className="link-btn">
+                      قوانین پیام‌رسان
+                    </a>
+                  </nav>
+                  <span className="footer-sep" role="separator" aria-hidden="true">
+                    |
+                  </span>
+                  <span className="footer-badge">🔒 رمزنگاری سرتاسری</span>
+                </footer>
+              </div>
+            </div>
           }
         >
           <AuthScreen onAuthenticated={handleAuthenticated} />

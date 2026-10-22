@@ -146,7 +146,7 @@ export const TermsScreen: React.FC<TermsScreenProps> = ({ onNavigate }) => {
   return (
     <div className="terms-screen">
       <div className="terms-box">
-        <header className="auth-banner">
+        <header role="banner" aria-label="سربرگ صفحه" className="auth-banner">
           <div className="auth-brand">
             <span className="auth-brand-icon" aria-hidden="true">
               💬
@@ -219,7 +219,7 @@ export const TermsScreen: React.FC<TermsScreenProps> = ({ onNavigate }) => {
             aria-labelledby="dataRightsHeading"
           >
             <h2 id="dataRightsHeading" className="terms-section-title">
-              ۶. حقوق داده، دریافت اطلاعات و حذف حساب کاربری
+              ۶. حقوق داده، دریافت اطلاعات و حذف حساب کاربری:
             </h2>
             <p className="terms-section-desc">
               کاربران در هر زمان حق دارند نسخه کامل داده‌های ذخیره شده خود (مشخصات حساب، فهرست
@@ -316,7 +316,7 @@ export const TermsScreen: React.FC<TermsScreenProps> = ({ onNavigate }) => {
           </div>
         </main>
 
-        <footer className="auth-footer">
+        <footer role="contentinfo" aria-label="پاصفحه" className="auth-footer">
           <nav aria-label="پیوندهای پاصفحه" className="auth-footer-nav">
             <a href="/" className="link-btn" onClick={e => navigateTo('/', e)}>
               صفحه اصلی

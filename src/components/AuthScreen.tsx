@@ -170,13 +170,13 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   return (
     <div id="authScreen" className="auth-screen">
       <div id={`step${step}`} className="auth-box">
-        <header className="auth-banner">
-          <div className="auth-brand">
+        <header role="banner" aria-label="سربرگ صفحه" className="auth-banner">
+          <a href="/" className="auth-brand">
             <span className="auth-brand-icon" aria-hidden="true">
               💬
             </span>
             <span className="auth-brand-name">سامانه پیام‌رسان</span>
-          </div>
+          </a>
         </header>
 
         <main id="main-content" tabIndex={-1}>
@@ -432,7 +432,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
           )}
         </main>
 
-        <footer className="auth-footer">
+        <footer role="contentinfo" aria-label="پاصفحه" className="auth-footer">
           <nav aria-label="پیوندهای پاصفحه" className="auth-footer-nav">
             <a href="/terms" className="link-btn">
               قوانین پیام‌رسان
