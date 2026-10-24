@@ -59,6 +59,8 @@ chat-app was designed from the start for hostile networks and a post-quantum fut
 **PQ-MPRBA** *(Post-Quantum Multi-Party Ratchet with Blinded Authentication)* runs entirely in the
 browser (`src/utils/crypto.ts`, Web Crypto API + `@noble/post-quantum` / `@noble/curves`).
 
+PQ-MPRBA was designed by Mohammad Taha Azizi Ahad.
+
 **Layer 1 — Hybrid post-quantum ratchet.**
 Each session combines **ML-KEM-768** (NIST FIPS 203, lattice-based) with classical **ECDH P-256**;
 both shared secrets feed **HKDF-SHA256** into a symmetric ratchet chain. Every message gets a fresh
