@@ -16,10 +16,18 @@ import {
   VoprfBlindTokenRecord,
   getRoomPQStatus,
   parsePeerKeyBundle,
-  getMyMLDSAPublicKey,
   getStoredPeerPublicKey,
   setStoredPeerPublicKey,
 } from '../utils/crypto';
+import {
+  SAFETY_STRINGS_FA,
+  ContactVerificationRecord,
+  getContactVerificationRecord,
+  observeContactPublicKey,
+  getGroupVerificationSummary,
+  rotateSessionRatchetOnly,
+} from '../utils/safetyNumber';
+import { SafetyNumberModal } from './SafetyNumberModal';
 
 interface ChatAppProps {
   myUsername: string;
@@ -78,6 +86,23 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   const [voprfToken, setVoprfToken] = useState<VoprfBlindTokenRecord | null>(null);
   const [currentGroupEpoch, setCurrentGroupEpoch] = useState<number>(1);
   const groupMembersRef = useRef<Record<string, string[]>>({});
+
+  // Safety Numbers (Spec v0.1) State
+  const [verificationVersion, setVerificationVersion] = useState<number>(0);
+  const [inChatLearnMoreOpen, setInChatLearnMoreOpen] = useState<boolean>(false);
+  const [outgoingChangeConfirmOpen, setOutgoingChangeConfirmOpen] = useState<boolean>(false);
+  const [groupMemberProfiles, setGroupMemberProfiles] = useState<Record<string, UserProfile>>({});
+  const [safetyModalState, setSafetyModalState] = useState<{
+    open: boolean;
+    contactUsername: string;
+    contactAvatar?: string | null;
+    initialShowLearnMore?: boolean;
+  }>({
+    open: false,
+    contactUsername: '',
+    contactAvatar: null,
+    initialShowLearnMore: false,
+  });
 
   // Mobile responsive view
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 700);
@@ -212,6 +237,59 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     }, 30);
   }, []);
 
+  const syncPeerPublicKeyAndObserve = useCallback(
+    (peerUsername: string, publicKey: string | null | undefined): ContactVerificationRecord | null => {
+      if (!peerUsername || peerUsername === myUsername) return null;
+      if (publicKey) {
+        peerPublicKeysRef.current[peerUsername] = publicKey;
+        setStoredPeerPublicKey(peerUsername, publicKey);
+      }
+      const effectiveKey =
+        publicKey || peerPublicKeysRef.current[peerUsername] || getStoredPeerPublicKey(peerUsername);
+      const before = getContactVerificationRecord(myUsername, peerUsername);
+      const after = observeContactPublicKey(myUsername, peerUsername, effectiveKey);
+      if (
+        before.state !== after.state ||
+        before.knownMldsaPubB64 !== after.knownMldsaPubB64 ||
+        before.changedAt !== after.changedAt
+      ) {
+        setVerificationVersion(v => v + 1);
+      }
+      return after;
+    },
+    [myUsername]
+  );
+
+  const syncGroupMembersPublicKeys = useCallback(
+    async (members: string[]) => {
+      const otherMembers = Array.from(
+        new Set((members || []).map(m => String(m || '').trim()).filter(Boolean))
+      ).filter(m => m !== myUsername);
+
+      const fetchedProfiles: Record<string, UserProfile> = {};
+      await Promise.all(
+        otherMembers.map(async member => {
+          try {
+            const uRes = await fetch('/api/user/' + encodeURIComponent(member)).then(r => r.json());
+            if (uRes.ok && uRes.user) {
+              fetchedProfiles[member] = uRes.user;
+              if (uRes.user.public_key) {
+                syncPeerPublicKeyAndObserve(member, uRes.user.public_key);
+              }
+            }
+          } catch {
+            // ignore
+          }
+        })
+      );
+      if (Object.keys(fetchedProfiles).length > 0) {
+        setGroupMemberProfiles(prev => ({ ...prev, ...fetchedProfiles }));
+      }
+      setVerificationVersion(v => v + 1);
+    },
+    [myUsername, syncPeerPublicKeyAndObserve]
+  );
+
   const getPeerKeyForRoom = useCallback(
     (roomId: string): string | null => {
       if (roomId.startsWith('group__')) return null;
@@ -239,7 +317,59 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       peerUsername: !currentIsGroup && currentPartner ? currentPartner : undefined,
       customSecret: getRoomSecret(currentRoom),
     });
-  }, [currentRoom, currentIsGroup, e2eeActive, myUsername, getPeerKeyForRoom, currentPartner]);
+  }, [currentRoom, currentIsGroup, e2eeActive, myUsername, getPeerKeyForRoom, currentPartner, verificationVersion]);
+
+  const currentPartnerVerification = useMemo(() => {
+    if (!currentPartner || currentIsGroup) return null;
+    const peerKey =
+      peerPublicKeysRef.current[currentPartner] || getStoredPeerPublicKey(currentPartner);
+    return observeContactPublicKey(myUsername, currentPartner, peerKey);
+  }, [myUsername, currentPartner, currentIsGroup, verificationVersion]);
+
+  const currentGroupMembersList = useMemo(() => {
+    if (!currentIsGroup || !currentPartner) return [];
+    const roomObj = rooms.find(r => r.isGroup && r.id === currentPartner);
+    return roomObj?.members || groupMembersRef.current[currentPartner] || [];
+  }, [currentIsGroup, currentPartner, rooms, currentGroupEpoch]);
+
+  const currentGroupVerificationSummary = useMemo(() => {
+    if (!currentIsGroup || !currentPartner) return null;
+    return getGroupVerificationSummary(myUsername, currentGroupMembersList);
+  }, [myUsername, currentIsGroup, currentPartner, currentGroupMembersList, verificationVersion]);
+
+  const openSafetyModalForContact = useCallback(
+    async (contactUsername: string, avatar?: string | null, initialShowLearnMore = false) => {
+      if (!contactUsername || contactUsername === myUsername) return;
+      let pubKey =
+        peerPublicKeysRef.current[contactUsername] || getStoredPeerPublicKey(contactUsername);
+      let resolvedAvatar = avatar ?? groupMemberProfiles[contactUsername]?.avatar ?? null;
+      if (!pubKey) {
+        try {
+          const uRes = await fetch('/api/user/' + encodeURIComponent(contactUsername)).then(r =>
+            r.json()
+          );
+          if (uRes.ok && uRes.user) {
+            pubKey = uRes.user.public_key || null;
+            resolvedAvatar = resolvedAvatar ?? uRes.user.avatar ?? null;
+            if (pubKey) {
+              syncPeerPublicKeyAndObserve(contactUsername, pubKey);
+            }
+          }
+        } catch {
+          // ignore
+        }
+      } else {
+        syncPeerPublicKeyAndObserve(contactUsername, pubKey);
+      }
+      setSafetyModalState({
+        open: true,
+        contactUsername,
+        contactAvatar: resolvedAvatar,
+        initialShowLearnMore,
+      });
+    },
+    [myUsername, groupMemberProfiles, syncPeerPublicKeyAndObserve]
+  );
 
   const processDecryption = useCallback(
     async (msg: ChatMessage, roomId: string): Promise<DecryptedChatMessage> => {
@@ -250,12 +380,13 @@ export const ChatApp: React.FC<ChatAppProps> = ({
           const uRes = await fetch('/api/user/' + encodeURIComponent(partner)).then(r => r.json());
           if (uRes.ok && uRes.user?.public_key) {
             peerPublicKey = uRes.user.public_key;
-            peerPublicKeysRef.current[partner] = peerPublicKey;
-            setStoredPeerPublicKey(partner, peerPublicKey);
+            syncPeerPublicKeyAndObserve(partner, peerPublicKey);
           }
         } catch {
           // ignore
         }
+      } else if (peerPublicKey && partner) {
+        syncPeerPublicKeyAndObserve(partner, peerPublicKey);
       }
 
       const gId = roomId.startsWith('group__') ? roomId.replace('group__', '') : '';
@@ -291,7 +422,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         decryptFailed: dec.failed,
       };
     },
-    [myUsername, getPeerKeyForRoom]
+    [myUsername, getPeerKeyForRoom, syncPeerPublicKeyAndObserve]
   );
 
   const loadRoomList = useCallback(
@@ -303,8 +434,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         if (res.ok) {
           res.contacts.forEach((c: any) => {
             if (c.public_key) {
-              peerPublicKeysRef.current[c.username] = c.public_key;
-              setStoredPeerPublicKey(c.username, c.public_key);
+              syncPeerPublicKeyAndObserve(c.username, c.public_key);
             }
           });
           setRooms(
@@ -327,6 +457,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
           res.groups.forEach((g: any) => {
             if (Array.isArray(g.members)) {
               groupMembersRef.current[g.id] = g.members;
+              void syncGroupMembersPublicKeys(g.members);
             }
             if (g.epoch) {
               void rotateGroupEpoch(g.id, Number(g.epoch), g.members || []);
@@ -345,7 +476,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         }
       }
     },
-    [myUsername]
+    [myUsername, syncPeerPublicKeyAndObserve, syncGroupMembersPublicKeys]
   );
 
   // Initial load + Ristretto255-VOPRF Blinded Auth + Post-Quantum Hybrid Key Exchange (ML-KEM-768 + P-256)
@@ -630,6 +761,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       members: string[];
     }) => {
       groupMembersRef.current[groupId] = members;
+      void syncGroupMembersPublicKeys(members);
       await rotateGroupEpoch(groupId, epoch, members);
       setRooms(prev =>
         prev.map(r =>
@@ -645,8 +777,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     };
 
     const onPeerKeyUpdated = ({ username, publicKey }: { username: string; publicKey: string }) => {
-      peerPublicKeysRef.current[username] = publicKey;
-      setStoredPeerPublicKey(username, publicKey);
+      syncPeerPublicKeyAndObserve(username, publicKey);
     };
 
     socket.on('new-message', onNewMessage);
@@ -680,27 +811,43 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       socket.off('group-epoch-rotated', onGroupEpochRotated);
       socket.off('peer-key-updated', onPeerKeyUpdated);
     };
-  }, [myUsername, socket, processDecryption, scrollBottom, getPeerKeyForRoom, showToast, formatMessageTime]);
+  }, [
+    myUsername,
+    socket,
+    processDecryption,
+    scrollBottom,
+    getPeerKeyForRoom,
+    showToast,
+    formatMessageTime,
+    syncPeerPublicKeyAndObserve,
+    syncGroupMembersPublicKeys,
+  ]);
 
   const handleOpenChat = async (room: RoomSummary) => {
     const roomId = room.isGroup
       ? 'group__' + room.id
       : [myUsername, room.id].sort().join('__');
 
+    setInChatLearnMoreOpen(false);
+    setOutgoingChangeConfirmOpen(false);
+
     if (!room.isGroup) {
       if (room.publicKey) {
-        peerPublicKeysRef.current[room.id] = room.publicKey;
-        setStoredPeerPublicKey(room.id, room.publicKey);
-      } else if (!peerPublicKeysRef.current[room.id]) {
-        try {
-          const uRes = await fetch('/api/user/' + encodeURIComponent(room.id)).then(r => r.json());
-          if (uRes.ok && uRes.user?.public_key) {
-            peerPublicKeysRef.current[room.id] = uRes.user.public_key;
-            setStoredPeerPublicKey(room.id, uRes.user.public_key);
-          }
-        } catch {
-          // ignore
+        syncPeerPublicKeyAndObserve(room.id, room.publicKey);
+      }
+      try {
+        const uRes = await fetch('/api/user/' + encodeURIComponent(room.id)).then(r => r.json());
+        if (uRes.ok && uRes.user?.public_key) {
+          syncPeerPublicKeyAndObserve(room.id, uRes.user.public_key);
         }
+      } catch {
+        // ignore
+      }
+    } else {
+      const gMembers = room.members || groupMembersRef.current[room.id] || [];
+      if (gMembers.length > 0) {
+        groupMembersRef.current[room.id] = gMembers;
+        void syncGroupMembersPublicKeys(gMembers);
       }
     }
 
@@ -736,7 +883,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     }
   };
 
-  const handleSendMessage = async () => {
+  const executeSendMessage = async () => {
     const trimmed = messageText.trim();
     if (!trimmed || !currentRoom || !currentPartner) return;
 
@@ -768,6 +915,23 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         isTyping: false,
       });
     }
+  };
+
+  const handleSendMessage = async () => {
+    const trimmed = messageText.trim();
+    if (!trimmed || !currentRoom || !currentPartner) return;
+
+    // بند ۵ اسپک: در صورت تغییر کلید هویت مخاطب (CHANGED)، هشدار و تأیید ارسال برای آن پیام نمایش داده می‌شود
+    if (!currentIsGroup && currentPartnerVerification?.state === 'CHANGED') {
+      setOutgoingChangeConfirmOpen(true);
+      return;
+    }
+    if (currentIsGroup && currentGroupVerificationSummary?.status === 'MEMBER_CHANGED') {
+      setOutgoingChangeConfirmOpen(true);
+      return;
+    }
+
+    await executeSendMessage();
   };
 
   const handleTypingInput = (val: string) => {
@@ -874,10 +1038,22 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     }).then(r => r.json());
 
     if (res.ok) {
+      if (res.publicKey) {
+        syncPeerPublicKeyAndObserve(clean, res.publicKey);
+      }
       setContactModalMsg({ text: '✅ مخاطب اضافه شد', ok: true });
       setRooms(prev => {
         if (prev.some(r => r.id === clean)) return prev;
-        return [...prev, { id: clean, name: clean, isGroup: false, preview: 'آفلاین' }];
+        return [
+          ...prev,
+          {
+            id: clean,
+            name: clean,
+            isGroup: false,
+            preview: 'آفلاین',
+            publicKey: res.publicKey || null,
+          },
+        ];
       });
       setNewContactInput('');
       setTimeout(() => {
@@ -977,12 +1153,19 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   const handleOpenContactProfile = async () => {
     if (!currentPartner) return;
     if (currentIsGroup) {
+      const gMembers = currentGroupMembersList;
+      if (gMembers.length > 0) {
+        await syncGroupMembersPublicKeys(gMembers);
+      }
       setContactProfileModal({ open: true, user: null });
       return;
     }
     const res = await fetch('/api/user/' + encodeURIComponent(currentPartner)).then(r =>
       r.json()
     );
+    if (res.ok && res.user?.public_key) {
+      syncPeerPublicKeyAndObserve(currentPartner, res.user.public_key);
+    }
     setContactProfileModal({ open: true, user: res.ok ? res.user : null });
   };
 
@@ -1001,8 +1184,19 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     if (!currentRoom) return;
     setRoomSecret(currentRoom, customSecretInput);
     setE2eeModalOpen(false);
-    showToast('🔑 کلید رمزنگاری این گفتگو به‌روزرسانی شد');
-    // Re-decrypt existing messages with the new key
+    showToast('🔑 کلید نشست این گفتگو به‌روزرسانی شد');
+    const reDecrypted = await Promise.all(
+      messages.map(m => processDecryption(m, currentRoom))
+    );
+    setMessages(reDecrypted);
+  };
+
+  const handleRotateSessionKeyOnly = async () => {
+    if (!currentRoom) return;
+    // بند ۶ اسپک: چرخش صرفاً کلید نشست متقارن بدون هیچ تغییر در شماره ایمنی یا وضعیت تأیید هویت
+    rotateSessionRatchetOnly(myUsername, currentRoom);
+    setE2eeModalOpen(false);
+    showToast('🔄 کلید نشست رمزنگاری بازنشانی شد (بدون تغییر در شماره ایمنی)');
     const reDecrypted = await Promise.all(
       messages.map(m => processDecryption(m, currentRoom))
     );
@@ -1351,7 +1545,55 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 </div>
               </div>
 
-              {/* E2EE Controls */}
+              {/* Small per-contact verification state badge in header (links to verification screen) */}
+              {!currentIsGroup && currentPartner && currentPartnerVerification && (
+                <button
+                  type="button"
+                  id="headerSafetyBadgeBtn"
+                  className="icon-btn"
+                  onClick={() => openSafetyModalForContact(currentPartner)}
+                  title={`${SAFETY_STRINGS_FA.safetyNumber}: ${
+                    currentPartnerVerification.state === 'VERIFIED'
+                      ? SAFETY_STRINGS_FA.verified
+                      : currentPartnerVerification.state === 'CHANGED'
+                      ? SAFETY_STRINGS_FA.safetyNumberChanged
+                      : SAFETY_STRINGS_FA.notVerified
+                  } (کلیک جهت مشاهده صفحه تأیید هویت)`}
+                  style={{
+                    fontSize: '11.5px',
+                    padding: '5px 9px',
+                    borderRadius: '14px',
+                    background:
+                      currentPartnerVerification.state === 'VERIFIED'
+                        ? 'rgba(34, 197, 94, 0.16)'
+                        : currentPartnerVerification.state === 'CHANGED'
+                        ? 'rgba(239, 68, 68, 0.22)'
+                        : 'rgba(255, 255, 255, 0.06)',
+                    color:
+                      currentPartnerVerification.state === 'VERIFIED'
+                        ? '#4ade80'
+                        : currentPartnerVerification.state === 'CHANGED'
+                        ? '#f87171'
+                        : '#d1d5db',
+                    border:
+                      currentPartnerVerification.state === 'VERIFIED'
+                        ? '1px solid rgba(34, 197, 94, 0.4)'
+                        : currentPartnerVerification.state === 'CHANGED'
+                        ? '1px solid rgba(239, 68, 68, 0.5)'
+                        : '1px solid rgba(255, 255, 255, 0.12)',
+                    gap: '4px',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {currentPartnerVerification.state === 'VERIFIED'
+                    ? `🛡️ ${SAFETY_STRINGS_FA.verified}`
+                    : currentPartnerVerification.state === 'CHANGED'
+                    ? `⚠️ ${SAFETY_STRINGS_FA.safetyNumberChanged}`
+                    : `○ ${SAFETY_STRINGS_FA.notVerified}`}
+                </button>
+              )}
+
+              {/* E2EE Transport Controls (distinct from verification) */}
               <button
                 type="button"
                 className="icon-btn"
@@ -1370,14 +1612,14 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                   background: !e2eeActive
                     ? 'rgba(255,255,255,0.06)'
                     : currentPQStatus?.isPQ
-                    ? 'rgba(34,197,94,0.18)'
+                    ? 'rgba(124,58,237,0.18)'
                     : currentPQStatus?.reason === 'INVALID_MLDSA_SIGNATURE'
                     ? 'rgba(239,68,68,0.2)'
                     : 'rgba(234,179,8,0.18)',
                   color: !e2eeActive
                     ? '#9ca3af'
                     : currentPQStatus?.isPQ
-                    ? '#22c55e'
+                    ? '#c4b5fd'
                     : currentPQStatus?.reason === 'INVALID_MLDSA_SIGNATURE'
                     ? '#ef4444'
                     : '#facc15',
@@ -1393,7 +1635,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                   ? currentIsGroup
                     ? `🔒 Epoch #${currentGroupEpoch}`
                     : currentPQStatus?.isPQ
-                    ? '🛡️ PQ-KEM'
+                    ? '🔒 PQ-KEM'
                     : currentPQStatus?.badge || '⚠️ غیر کوانتومی'
                   : '🔓 ساده'}
               </button>
@@ -1402,7 +1644,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 type="button"
                 className="icon-btn"
                 onClick={() => setE2eeModalOpen(true)}
-                title="تنظیم کلید رمزنگاری سرتاسری (E2EE Key)"
+                title="تنظیم و چرخش کلید نشست رمزنگاری (Session Key)"
               >
                 🔑
               </button>
@@ -1427,6 +1669,215 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 </svg>
               </button>
             </div>
+
+            {/* PERSISTENT IN-CHAT SAFETY NUMBER CHANGED WARNING (1-TO-1, LOCAL NOTICE ONLY) */}
+            {!currentIsGroup &&
+              currentPartner &&
+              currentPartnerVerification?.state === 'CHANGED' && (
+                <div
+                  id="inChatSafetyChangedBanner"
+                  style={{
+                    background:
+                      'linear-gradient(90deg, rgba(239,68,68,0.24), rgba(185,28,28,0.16))',
+                    borderBottom: '1px solid rgba(239,68,68,0.55)',
+                    padding: '10px 16px',
+                    color: '#fecaca',
+                    fontSize: '12px',
+                    direction: 'rtl',
+                    flexShrink: 0,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: '10px',
+                      flexWrap: 'wrap',
+                    }}
+                  >
+                    <div style={{ flex: 1, minWidth: '220px', lineHeight: 1.6 }}>
+                      <b style={{ color: '#f87171', fontSize: '12.5px' }}>
+                        ⚠️ {SAFETY_STRINGS_FA.safetyNumberChanged}:
+                      </b>{' '}
+                      {SAFETY_STRINGS_FA.inChatChangedNoticeBody}
+                    </div>
+                    <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
+                      <button
+                        type="button"
+                        onClick={() => openSafetyModalForContact(currentPartner)}
+                        style={{
+                          background: '#ef4444',
+                          border: 'none',
+                          color: '#fff',
+                          borderRadius: '8px',
+                          padding: '5px 11px',
+                          fontSize: '11.5px',
+                          fontWeight: 700,
+                          cursor: 'pointer',
+                          fontFamily: 'inherit',
+                        }}
+                      >
+                        {SAFETY_STRINGS_FA.verifyAgain}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setInChatLearnMoreOpen(prev => !prev)}
+                        style={{
+                          background: 'rgba(255,255,255,0.12)',
+                          border: '1px solid rgba(255,255,255,0.22)',
+                          color: '#fff',
+                          borderRadius: '8px',
+                          padding: '5px 10px',
+                          fontSize: '11.5px',
+                          cursor: 'pointer',
+                          fontFamily: 'inherit',
+                        }}
+                      >
+                        {SAFETY_STRINGS_FA.learnMore}
+                      </button>
+                    </div>
+                  </div>
+
+                  {inChatLearnMoreOpen && (
+                    <div
+                      style={{
+                        marginTop: '8px',
+                        paddingTop: '8px',
+                        borderTop: '1px solid rgba(239,68,68,0.35)',
+                        whiteSpace: 'pre-line',
+                        lineHeight: 1.7,
+                        fontSize: '11.5px',
+                        color: '#fee2e2',
+                      }}
+                    >
+                      {SAFETY_STRINGS_FA.learnMoreBenignAndRisk}
+                      {currentPartnerVerification.auditHistory.length > 0 && (
+                        <div
+                          style={{
+                            marginTop: '6px',
+                            background: 'rgba(0,0,0,0.28)',
+                            padding: '6px 10px',
+                            borderRadius: '8px',
+                            fontSize: '10.5px',
+                          }}
+                        >
+                          <b style={{ color: '#fca5a5' }}>سابقه ممیزی محلی در این دستگاه:</b>{' '}
+                          <span
+                            dir="ltr"
+                            style={{
+                              fontFamily:
+                                'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+                              color: '#fcd34d',
+                            }}
+                          >
+                            SHA-256 قبلی:{' '}
+                            {currentPartnerVerification.auditHistory[0].previousKeyFingerprint.slice(
+                              0,
+                              24
+                            )}
+                            …
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+            {/* GROUP SUMMARY WARNING BANNER WHEN ANY GROUP MEMBER'S KEY HAS CHANGED */}
+            {currentIsGroup &&
+              currentGroupVerificationSummary?.status === 'MEMBER_CHANGED' && (
+                <div
+                  id="groupMemberChangedBanner"
+                  style={{
+                    background:
+                      'linear-gradient(90deg, rgba(239,68,68,0.22), rgba(185,28,28,0.14))',
+                    borderBottom: '1px solid rgba(239,68,68,0.5)',
+                    padding: '9px 16px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '10px',
+                    flexWrap: 'wrap',
+                    color: '#fecaca',
+                    fontSize: '12px',
+                    direction: 'rtl',
+                    flexShrink: 0,
+                  }}
+                >
+                  <div>
+                    <b style={{ color: '#f87171' }}>
+                      ⚠️ {SAFETY_STRINGS_FA.groupMemberChanged}:
+                    </b>{' '}
+                    <span>
+                      {currentGroupVerificationSummary.changedMembers
+                        .map(m => `@${m}`)
+                        .join('، ')}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleOpenContactProfile}
+                    style={{
+                      background: 'rgba(255,255,255,0.12)',
+                      border: '1px solid rgba(255,255,255,0.22)',
+                      color: '#fff',
+                      borderRadius: '8px',
+                      padding: '4px 10px',
+                      fontSize: '11px',
+                      cursor: 'pointer',
+                      fontFamily: 'inherit',
+                    }}
+                  >
+                    مشاهده اعضا و {SAFETY_STRINGS_FA.verifyAgain}
+                  </button>
+                </div>
+              )}
+
+            {/* DISTINCT SESSION RE-KEY PROMPT AFTER UNDELIVERABLE/UNDECRYPTABLE MESSAGES (ONLY WHEN NOT CHANGED) */}
+            {!currentIsGroup &&
+              currentPartnerVerification?.state !== 'CHANGED' &&
+              messages.some(m => m.decryptFailed) && (
+                <div
+                  style={{
+                    background: 'rgba(56, 189, 248, 0.12)',
+                    borderBottom: '1px solid rgba(56, 189, 248, 0.3)',
+                    padding: '8px 16px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '10px',
+                    flexWrap: 'wrap',
+                    color: '#bae6fd',
+                    fontSize: '11.5px',
+                    direction: 'rtl',
+                    flexShrink: 0,
+                  }}
+                >
+                  <div>
+                    🔄 برخی پیام‌های قبلی با کلید نشست فعلی قابل بازگشایی نیستند. می‌توانید کلید
+                    نشست رمزنگاری را نوسازی کنید (این کار شماره ایمنی یا وضعیت تأیید هویت مخاطب را
+                    تغییر نمی‌دهد).
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleRotateSessionKeyOnly}
+                    style={{
+                      background: 'rgba(56, 189, 248, 0.22)',
+                      border: '1px solid rgba(56, 189, 248, 0.45)',
+                      color: '#e0f2fe',
+                      borderRadius: '8px',
+                      padding: '4px 10px',
+                      fontSize: '11px',
+                      cursor: 'pointer',
+                      fontFamily: 'inherit',
+                    }}
+                  >
+                    🔄 بازنشانی کلید نشست (Re-key)
+                  </button>
+                </div>
+              )}
 
             {/* ANTI-DOWNGRADE WARNING BANNER */}
             {currentPQStatus && !currentPQStatus.isPQ && e2eeActive && (
@@ -1946,11 +2397,59 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         </div>
       )}
 
-      {/* E2EE KEY SETTINGS MODAL */}
+      {/* E2EE SESSION KEY SETTINGS MODAL (DISTINCT FROM SAFETY-NUMBER VERIFICATION) */}
       {e2eeModalOpen && (
         <div className="modal">
-          <div className="modal-box">
-            <h3>🛡️ معماری تماماً پساکوانتومی (FIPS 203 ML-KEM + FIPS 204 ML-DSA)</h3>
+          <div className="modal-box" style={{ width: '92%', maxWidth: '420px' }}>
+            <h3>🔑 تنظیمات و چرخش کلید نشست رمزنگاری (Session Key)</h3>
+
+            {/* بند ۶ اسپک: اگر کلید هویت تغییر کرده باشد، هشدار CHANGED بر چرخش کلید نشست اولویت دارد */}
+            {!currentIsGroup &&
+              currentPartner &&
+              currentPartnerVerification?.state === 'CHANGED' && (
+                <div
+                  style={{
+                    background: 'rgba(239, 68, 68, 0.18)',
+                    border: '1px solid rgba(239, 68, 68, 0.5)',
+                    borderRadius: '10px',
+                    padding: '10px 12px',
+                    marginBottom: '12px',
+                    fontSize: '11.5px',
+                    lineHeight: '1.7',
+                    textAlign: 'right',
+                    color: '#fecaca',
+                  }}
+                >
+                  <div style={{ fontWeight: 700, color: '#f87171', marginBottom: '4px' }}>
+                    ⚠️ {SAFETY_STRINGS_FA.safetyNumberChanged} (دارای اولویت امنیتی)
+                  </div>
+                  <div style={{ marginBottom: '8px' }}>
+                    {SAFETY_STRINGS_FA.inChatChangedNoticeBody} چرخش کلید نشست به‌هیچ‌وجه جایگزین
+                    تأیید مجدد هویت نمی‌شود و وضعیت تغییر کلید را پاک نمی‌کند.
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setE2eeModalOpen(false);
+                      openSafetyModalForContact(currentPartner);
+                    }}
+                    style={{
+                      background: '#ef4444',
+                      border: 'none',
+                      borderRadius: '8px',
+                      color: '#fff',
+                      padding: '6px 12px',
+                      fontSize: '11.5px',
+                      fontWeight: 700,
+                      cursor: 'pointer',
+                      fontFamily: 'inherit',
+                    }}
+                  >
+                    🔐 {SAFETY_STRINGS_FA.verifyAgain} ({SAFETY_STRINGS_FA.safetyNumber})
+                  </button>
+                </div>
+              )}
+
             <div
               style={{
                 background: 'rgba(124,58,237,0.12)',
@@ -1964,20 +2463,16 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               }}
             >
               <div>
-                ✅ <b>لایه ۱ (Session Ratchet پساکوانتومی):</b> کپسوله‌سازی هیبریدی{' '}
+                🔒 <b>لایه ۱ (Session Ratchet پساکوانتومی):</b> کپسوله‌سازی هیبریدی{' '}
                 <code>ML-KEM-768 (FIPS 203) + ECDH P-256</code> به همراه کش کلیدهای پرش‌خورده
                 (Out-of-Order Skipped Keys) و پاک‌سازی فوری حافظه (Zeroization).
               </div>
               <div style={{ marginTop: '4px' }}>
-                ✅ <b>لایه ۲ (امضای دیجیتال هویت FIPS 204):</b> امضای هویت کاربر و تصدیق نشست با{' '}
-                <code>ML-DSA-65 (NIST Level 3)</code> برای حفاظت کامل در برابر حملات جعل هویت و الگوریتم شور.
+                🔒 <b>لایه ۲ (امضای دیجیتال هویت FIPS 204):</b> امضای بسته کلید و پیام‌ها با{' '}
+                <code>ML-DSA-65 (NIST Level 3)</code>.
               </div>
               <div style={{ marginTop: '4px' }}>
-                ✅ <b>لایه ۳ (محافظت در برابر تنزل خاموش):</b> تضمین عدم نمایش نشان PQ-KEM هنگام فقدان
-                کلیدهای معتبر پساکوانتومی و نمایش بنر هشدار در چت‌های تنزل‌یافته به کلاسیک.
-              </div>
-              <div style={{ marginTop: '4px' }}>
-                ✅ <b>لایه ۴ (احراز هویت کور - RFC 9497):</b> توکن کور{' '}
+                🔒 <b>لایه ۳ (احراز هویت کور - RFC 9497):</b> توکن کور{' '}
                 <code>Ristretto255-VOPRF</code> با اثبات دانایی صفر DLEQ:{' '}
                 <code style={{ color: '#22c55e' }}>
                   {voprfToken?.anonymousTokenId || 'در حال صدور...'}
@@ -1985,12 +2480,48 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               </div>
               {currentIsGroup && (
                 <div style={{ marginTop: '4px' }}>
-                  ✅ <b>لایه ۵ (Group Epoch FSM):</b> اپوک فعلی گروه:{' '}
-                  <code style={{ color: '#38bdf8' }}>Epoch #{currentGroupEpoch}</code> (مجهز به
-                  Grace Buffer برای پیام‌های همزمان)
+                  🔒 <b>لایه ۴ (Group Epoch FSM):</b> اپوک فعلی گروه:{' '}
+                  <code style={{ color: '#38bdf8' }}>Epoch #{currentGroupEpoch}</code>
                 </div>
               )}
             </div>
+
+            {!currentIsGroup && (
+              <div
+                style={{
+                  background: 'rgba(56, 189, 248, 0.1)',
+                  border: '1px solid rgba(56, 189, 248, 0.28)',
+                  borderRadius: '10px',
+                  padding: '9px 11px',
+                  marginBottom: '12px',
+                  textAlign: 'right',
+                  fontSize: '11px',
+                  lineHeight: '1.65',
+                  color: '#bae6fd',
+                }}
+              >
+                <div style={{ marginBottom: '6px' }}>{SAFETY_STRINGS_FA.rekeyDistinctNote}</div>
+                <button
+                  type="button"
+                  onClick={handleRotateSessionKeyOnly}
+                  style={{
+                    width: '100%',
+                    background: 'rgba(56, 189, 248, 0.22)',
+                    border: '1px solid rgba(56, 189, 248, 0.45)',
+                    borderRadius: '8px',
+                    color: '#e0f2fe',
+                    padding: '7px 10px',
+                    fontSize: '12px',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                    fontFamily: 'inherit',
+                  }}
+                >
+                  🔄 بازنشانی / چرخش کلید نشست (Re-key Session)
+                </button>
+              </div>
+            )}
+
             <p style={{ fontSize: '12px', lineHeight: '1.6' }}>
               در صورت تمایل به بازنویسی کلید خودکار با یک رمز مشترک دستی (PBKDF2 Override)، آن را
               در کادر زیر وارد کنید:
@@ -2010,7 +2541,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 className="btn-ghost"
                 onClick={() => setE2eeModalOpen(false)}
               >
-                انصراف
+                {SAFETY_STRINGS_FA.cancel}
               </button>
             </div>
           </div>
@@ -2141,10 +2672,17 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         </div>
       )}
 
-      {/* CONTACT PROFILE MODAL */}
+      {/* CONTACT / GROUP PROFILE MODAL */}
       {contactProfileModal.open && (
         <div className="modal">
-          <div className="modal-box" style={{ textAlign: 'center' }}>
+          <div
+            className="modal-box"
+            style={{
+              textAlign: 'center',
+              width: '92%',
+              maxWidth: currentIsGroup ? '440px' : '370px',
+            }}
+          >
             <h3>{currentIsGroup ? '👥 اطلاعات گروه' : '👤 اطلاعات مخاطب'}</h3>
             <div
               style={{
@@ -2189,68 +2727,353 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 {contactProfileModal.user.bio}
               </div>
             )}
+
+            {/* 1-TO-1 CONTACT PROFILE: TRANSPORT BUNDLE STATUS + SAFETY NUMBER VERIFICATION */}
             {!currentIsGroup && (
-              <div
-                style={{
-                  background: 'rgba(255,255,255,0.04)',
-                  border: '1px solid rgba(255,255,255,0.08)',
-                  borderRadius: '10px',
-                  padding: '10px 12px',
-                  marginBottom: '14px',
-                  fontSize: '11.5px',
-                  textAlign: 'right',
-                  lineHeight: '1.6',
-                }}
-              >
-                {(() => {
-                  const b = parsePeerKeyBundle(
-                    contactProfileModal.user?.public_key,
-                    contactProfileModal.user?.username
-                  );
-                  if (b.isFullyPostQuantum) {
+              <>
+                <div
+                  style={{
+                    background: 'rgba(255,255,255,0.04)',
+                    border: '1px solid rgba(255,255,255,0.08)',
+                    borderRadius: '10px',
+                    padding: '10px 12px',
+                    marginBottom: '10px',
+                    fontSize: '11.5px',
+                    textAlign: 'right',
+                    lineHeight: '1.6',
+                  }}
+                >
+                  {(() => {
+                    const b = parsePeerKeyBundle(
+                      contactProfileModal.user?.public_key,
+                      contactProfileModal.user?.username
+                    );
+                    if (b.isFullyPostQuantum) {
+                      return (
+                        <div>
+                          <div style={{ color: '#c4b5fd', fontWeight: 700, marginBottom: '2px' }}>
+                            🔒 بسته کلید پساکوانتومی منتشرشده (ML-KEM-768 + ML-DSA-65)
+                          </div>
+                          <div style={{ color: '#9ca3af', fontSize: '11px' }}>
+                            امضای خوداظهاری بسته کلید معتبر است. جهت اطمینان از عدم جعل هویت، شماره
+                            ایمنی را در بخش زیر بررسی و تأیید کنید.
+                          </div>
+                        </div>
+                      );
+                    }
+                    if (b.isMldsaSignatureInvalid) {
+                      return (
+                        <div>
+                          <div style={{ color: '#f87171', fontWeight: 700, marginBottom: '2px' }}>
+                            ⛔ خطر جعل هویت / امضای نامعتبر
+                          </div>
+                          <div style={{ color: '#fca5a5', fontSize: '11px' }}>
+                            امضای دیجیتال هویت ML-DSA با کلیدهای اعلامی مطابقت ندارد!
+                          </div>
+                        </div>
+                      );
+                    }
+                    if (b.ecdhJwk) {
+                      return (
+                        <div>
+                          <div style={{ color: '#facc15', fontWeight: 700, marginBottom: '2px' }}>
+                            ⚠️ رمزنگاری کلاسیک (ECDH P-256)
+                          </div>
+                          <div style={{ color: '#9ca3af', fontSize: '11px' }}>
+                            مخاطب فاقد کلیدهای پساکوانتومی است؛ ارتباطات در برابر الگوریتم شور ایمن نیستند.
+                          </div>
+                        </div>
+                      );
+                    }
                     return (
-                      <div>
-                        <div style={{ color: '#4ade80', fontWeight: 700, marginBottom: '2px' }}>
-                          🛡️ هویت پساکوانتومی تأیید شده (Fully PQ)
-                        </div>
-                        <div style={{ color: '#9ca3af', fontSize: '11px' }}>
-                          مجهز به کپسوله‌سازی ML-KEM-768 و امضای هویت FIPS 204 ML-DSA-65 معتبر.
-                        </div>
+                      <div style={{ color: '#9ca3af' }}>
+                        ⚠️ فاقد کلید رمزنگاری عمومی منتشرشده در سامانه
                       </div>
                     );
-                  }
-                  if (b.isMldsaSignatureInvalid) {
-                    return (
-                      <div>
-                        <div style={{ color: '#f87171', fontWeight: 700, marginBottom: '2px' }}>
-                          ⛔ خطر جعل هویت / امضای نامعتبر
-                        </div>
-                        <div style={{ color: '#fca5a5', fontSize: '11px' }}>
-                          امضای دیجیتال هویت ML-DSA با کلیدهای اعلامی مطابقت ندارد!
-                        </div>
-                      </div>
-                    );
-                  }
-                  if (b.ecdhJwk) {
-                    return (
-                      <div>
-                        <div style={{ color: '#facc15', fontWeight: 700, marginBottom: '2px' }}>
-                          ⚠️ رمزنگاری کلاسیک (ECDH P-256)
-                        </div>
-                        <div style={{ color: '#9ca3af', fontSize: '11px' }}>
-                          مخاطب فاقد کلیدهای پساکوانتومی است؛ ارتباطات در برابر الگوریتم شور ایمن نیستند.
-                        </div>
-                      </div>
-                    );
-                  }
-                  return (
-                    <div style={{ color: '#9ca3af' }}>
-                      ⚠️ فاقد کلید رمزنگاری عمومی منتشرشده در سامانه
+                  })()}
+                </div>
+
+                {/* PER-CONTACT SAFETY NUMBER STATUS & BUTTON */}
+                {currentPartner && currentPartnerVerification && (
+                  <div
+                    style={{
+                      background:
+                        currentPartnerVerification.state === 'VERIFIED'
+                          ? 'rgba(34, 197, 94, 0.12)'
+                          : currentPartnerVerification.state === 'CHANGED'
+                          ? 'rgba(239, 68, 68, 0.16)'
+                          : 'rgba(124, 58, 237, 0.12)',
+                      border:
+                        currentPartnerVerification.state === 'VERIFIED'
+                          ? '1px solid rgba(34, 197, 94, 0.4)'
+                          : currentPartnerVerification.state === 'CHANGED'
+                          ? '1px solid rgba(239, 68, 68, 0.5)'
+                          : '1px solid rgba(124, 58, 237, 0.35)',
+                      borderRadius: '12px',
+                      padding: '10px 12px',
+                      marginBottom: '14px',
+                      textAlign: 'right',
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        marginBottom: '8px',
+                        fontSize: '12px',
+                      }}
+                    >
+                      <span style={{ color: '#d1d5db', fontWeight: 600 }}>
+                        وضعیت {SAFETY_STRINGS_FA.safetyNumber}:
+                      </span>
+                      <span
+                        style={{
+                          fontWeight: 700,
+                          color:
+                            currentPartnerVerification.state === 'VERIFIED'
+                              ? '#4ade80'
+                              : currentPartnerVerification.state === 'CHANGED'
+                              ? '#f87171'
+                              : '#e5e7eb',
+                        }}
+                      >
+                        {currentPartnerVerification.state === 'VERIFIED'
+                          ? `🛡️ ${SAFETY_STRINGS_FA.verified}`
+                          : currentPartnerVerification.state === 'CHANGED'
+                          ? `⚠️ ${SAFETY_STRINGS_FA.safetyNumberChanged}`
+                          : `○ ${SAFETY_STRINGS_FA.notVerified}`}
+                      </span>
                     </div>
-                  );
-                })()}
+                    <button
+                      type="button"
+                      id="profileVerifyContactBtn"
+                      onClick={() => {
+                        const partnerToVerify = currentPartner;
+                        const avatarToUse = contactProfileModal.user?.avatar;
+                        setContactProfileModal({ open: false, user: null });
+                        openSafetyModalForContact(partnerToVerify, avatarToUse);
+                      }}
+                      style={{
+                        width: '100%',
+                        background: 'linear-gradient(135deg, var(--accent), var(--a2))',
+                        border: 'none',
+                        borderRadius: '10px',
+                        color: '#fff',
+                        padding: '9px 12px',
+                        fontSize: '13px',
+                        fontWeight: 700,
+                        cursor: 'pointer',
+                        fontFamily: 'inherit',
+                      }}
+                    >
+                      🔐 {SAFETY_STRINGS_FA.safetyNumber} و{' '}
+                      {currentPartnerVerification.state === 'CHANGED'
+                        ? SAFETY_STRINGS_FA.verifyAgain
+                        : SAFETY_STRINGS_FA.verifyContact}
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+
+            {/* GROUP INFO: DERIVED VERIFICATION SUMMARY + PER-MEMBER SAFETY NUMBERS (NO GROUP SAFETY NUMBER) */}
+            {currentIsGroup && currentGroupVerificationSummary && (
+              <div style={{ textAlign: 'right', marginBottom: '14px' }}>
+                {/* Derived Group Summary Banner */}
+                <div
+                  id="groupVerificationSummaryBox"
+                  style={{
+                    background:
+                      currentGroupVerificationSummary.status === 'ALL_VERIFIED'
+                        ? 'rgba(34, 197, 94, 0.14)'
+                        : currentGroupVerificationSummary.status === 'MEMBER_CHANGED'
+                        ? 'rgba(239, 68, 68, 0.18)'
+                        : 'rgba(255, 255, 255, 0.05)',
+                    border:
+                      currentGroupVerificationSummary.status === 'ALL_VERIFIED'
+                        ? '1px solid rgba(34, 197, 94, 0.45)'
+                        : currentGroupVerificationSummary.status === 'MEMBER_CHANGED'
+                        ? '1px solid rgba(239, 68, 68, 0.5)'
+                        : '1px solid rgba(255, 255, 255, 0.12)',
+                    borderRadius: '10px',
+                    padding: '10px 12px',
+                    marginBottom: '10px',
+                    fontSize: '12px',
+                    lineHeight: '1.65',
+                  }}
+                >
+                  <div
+                    style={{
+                      fontWeight: 700,
+                      color:
+                        currentGroupVerificationSummary.status === 'ALL_VERIFIED'
+                          ? '#4ade80'
+                          : currentGroupVerificationSummary.status === 'MEMBER_CHANGED'
+                          ? '#f87171'
+                          : '#e5e7eb',
+                    }}
+                  >
+                    {currentGroupVerificationSummary.status === 'ALL_VERIFIED'
+                      ? `🛡️ ${SAFETY_STRINGS_FA.groupAllVerified}`
+                      : currentGroupVerificationSummary.status === 'MEMBER_CHANGED'
+                      ? `⚠️ ${SAFETY_STRINGS_FA.groupMemberChanged}`
+                      : `○ ${SAFETY_STRINGS_FA.groupSomeUnverified}`}
+                  </div>
+                  {currentGroupVerificationSummary.status === 'MEMBER_CHANGED' &&
+                    currentGroupVerificationSummary.changedMembers.length > 0 && (
+                      <div style={{ fontSize: '11.5px', color: '#fecaca', marginTop: '4px' }}>
+                        اعضای دارای تغییر کلید:{' '}
+                        <b>
+                          {currentGroupVerificationSummary.changedMembers
+                            .map(m => `@${m}`)
+                            .join('، ')}
+                        </b>
+                      </div>
+                    )}
+                </div>
+
+                {/* Members List with Per-Member State Icon & Safety Number Button */}
+                <div
+                  style={{
+                    fontSize: '12px',
+                    fontWeight: 700,
+                    color: '#c4b5fd',
+                    marginBottom: '6px',
+                  }}
+                >
+                  👥 اعضای گروه (شماره ایمنی مستقل برای هر عضو):
+                </div>
+                <div
+                  style={{
+                    maxHeight: '220px',
+                    overflowY: 'auto',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '6px',
+                    background: 'rgba(0,0,0,0.2)',
+                    border: '1px solid rgba(255,255,255,0.08)',
+                    borderRadius: '10px',
+                    padding: '8px',
+                  }}
+                >
+                  {currentGroupMembersList.map(member => {
+                    const isMe = member === myUsername;
+                    const rec = currentGroupVerificationSummary.memberRecords[member];
+                    const state = rec?.state || 'UNVERIFIED';
+                    const memberAvatar = groupMemberProfiles[member]?.avatar;
+
+                    return (
+                      <div
+                        key={member}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          gap: '8px',
+                          padding: '7px 8px',
+                          borderRadius: '8px',
+                          background:
+                            !isMe && state === 'CHANGED'
+                              ? 'rgba(239, 68, 68, 0.14)'
+                              : 'rgba(255, 255, 255, 0.04)',
+                          border:
+                            !isMe && state === 'CHANGED'
+                              ? '1px solid rgba(239, 68, 68, 0.4)'
+                              : '1px solid rgba(255, 255, 255, 0.06)',
+                        }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <div
+                            style={{
+                              width: '30px',
+                              height: '30px',
+                              borderRadius: '50%',
+                              background: 'linear-gradient(135deg,#7c3aed,#06b6d4)',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              fontSize: '13px',
+                              fontWeight: 700,
+                              color: '#fff',
+                              overflow: 'hidden',
+                              flexShrink: 0,
+                            }}
+                          >
+                            {memberAvatar ? (
+                              <img
+                                src={memberAvatar}
+                                alt=""
+                                style={{ width: '30px', height: '30px', objectFit: 'cover' }}
+                              />
+                            ) : (
+                              member[0]?.toUpperCase()
+                            )}
+                          </div>
+                          <div>
+                            <div style={{ fontSize: '12.5px', fontWeight: 600, color: '#f3f4f6' }}>
+                              @{member} {isMe && <span style={{ color: '#9ca3af' }}>(شما)</span>}
+                            </div>
+                            {!isMe && (
+                              <div
+                                style={{
+                                  fontSize: '10.5px',
+                                  color:
+                                    state === 'VERIFIED'
+                                      ? '#4ade80'
+                                      : state === 'CHANGED'
+                                      ? '#f87171'
+                                      : '#9ca3af',
+                                }}
+                              >
+                                {state === 'VERIFIED'
+                                  ? `🛡️ ${SAFETY_STRINGS_FA.verified}`
+                                  : state === 'CHANGED'
+                                  ? `⚠️ ${SAFETY_STRINGS_FA.safetyNumberChanged}`
+                                  : `○ ${SAFETY_STRINGS_FA.notVerified}`}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        {!isMe && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setContactProfileModal({ open: false, user: null });
+                              openSafetyModalForContact(member, memberAvatar);
+                            }}
+                            style={{
+                              background:
+                                state === 'CHANGED'
+                                  ? '#ef4444'
+                                  : 'rgba(124, 58, 237, 0.25)',
+                              border:
+                                state === 'CHANGED'
+                                  ? 'none'
+                                  : '1px solid rgba(124, 58, 237, 0.5)',
+                              color: '#fff',
+                              borderRadius: '7px',
+                              padding: '5px 9px',
+                              fontSize: '11px',
+                              fontWeight: 600,
+                              cursor: 'pointer',
+                              fontFamily: 'inherit',
+                              whiteSpace: 'nowrap',
+                            }}
+                          >
+                            {state === 'CHANGED'
+                              ? SAFETY_STRINGS_FA.verifyAgain
+                              : SAFETY_STRINGS_FA.safetyNumber}
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             )}
+
             <div className="modal-btns">
               <button
                 type="button"
@@ -2671,6 +3494,126 @@ export const ChatApp: React.FC<ChatAppProps> = ({
           </div>
         </div>
       )}
+
+      {/* Outgoing Message Warn-and-Confirm Dialog when Contact Identity Key is CHANGED */}
+      {outgoingChangeConfirmOpen && (
+        <div
+          className="modal-overlay"
+          style={{ display: 'flex', zIndex: 9998 }}
+          onClick={() => setOutgoingChangeConfirmOpen(false)}
+        >
+          <div
+            className="modal-box"
+            style={{ maxWidth: '440px', width: '92%', textAlign: 'right' }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
+              <span
+                style={{
+                  width: '36px',
+                  height: '36px',
+                  borderRadius: '50%',
+                  background: 'rgba(239, 68, 68, 0.16)',
+                  color: '#f87171',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: '18px',
+                  flexShrink: 0,
+                }}
+              >
+                ⚠️
+              </span>
+              <h3 style={{ margin: 0, color: '#fca5a5', fontSize: '16px' }}>
+                {SAFETY_STRINGS_FA.outgoingChangedDialogTitle}
+              </h3>
+            </div>
+            <p style={{ fontSize: '13px', color: 'var(--text-main)', lineHeight: 1.75, marginBottom: '18px' }}>
+              {SAFETY_STRINGS_FA.outgoingChangedDialogBody}
+            </p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <button
+                type="button"
+                onClick={() => {
+                  setOutgoingChangeConfirmOpen(false);
+                  if (currentPartner) {
+                    const partnerAvatar = rooms.find(
+                      r => !r.isGroup && r.id === currentPartner
+                    )?.avatar;
+                    void openSafetyModalForContact(currentPartner, partnerAvatar);
+                  }
+                }}
+                style={{
+                  width: '100%',
+                  padding: '10px 14px',
+                  borderRadius: '10px',
+                  border: '1px solid rgba(56, 189, 248, 0.45)',
+                  background: 'rgba(56, 189, 248, 0.16)',
+                  color: '#e0f2fe',
+                  fontWeight: 700,
+                  fontSize: '13px',
+                  cursor: 'pointer',
+                }}
+              >
+                {SAFETY_STRINGS_FA.verifyFirst}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setOutgoingChangeConfirmOpen(false);
+                  // Sends this message ONLY; leaves state as CHANGED and never marks verified
+                  void executeSendMessage();
+                }}
+                style={{
+                  width: '100%',
+                  padding: '10px 14px',
+                  borderRadius: '10px',
+                  border: '1px solid rgba(239, 68, 68, 0.45)',
+                  background: 'rgba(239, 68, 68, 0.14)',
+                  color: '#fecaca',
+                  fontWeight: 600,
+                  fontSize: '13px',
+                  cursor: 'pointer',
+                }}
+              >
+                {SAFETY_STRINGS_FA.sendAnyway}
+              </button>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={() => setOutgoingChangeConfirmOpen(false)}
+                style={{ width: '100%', padding: '9px 14px', fontSize: '13px' }}
+              >
+                {SAFETY_STRINGS_FA.cancel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Safety Number Verification Modal (Spec v0.1) */}
+      <SafetyNumberModal
+        open={safetyModalState.open}
+        myUsername={myUsername}
+        contactUsername={safetyModalState.contactUsername}
+        contactAvatar={safetyModalState.contactAvatar}
+        peerPublicKey={
+          safetyModalState.contactUsername
+            ? peerPublicKeysRef.current[safetyModalState.contactUsername] ||
+              getStoredPeerPublicKey(safetyModalState.contactUsername)
+            : null
+        }
+        verificationRecord={getContactVerificationRecord(
+          myUsername,
+          safetyModalState.contactUsername || ''
+        )}
+        initialShowLearnMore={safetyModalState.initialShowLearnMore}
+        onClose={() => setSafetyModalState(prev => ({ ...prev, open: false }))}
+        onVerificationUpdated={() => setVerificationVersion(v => v + 1)}
+        showToast={showToast}
+      />
     </div>
   );
 };
+
+
