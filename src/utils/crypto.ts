@@ -28,32 +28,62 @@ const VOPRF_TOKEN_PREFIX = 'chat_voprf_token_';
 const MAX_SKIP = 100; // حداکثر پرش مجاز برای پیام‌های خارج از نوبت (محافظت در برابر DoS)
 const SKIPPED_KEY_TTL_MS = 10 * 60 * 1000; // ۱۰ دقیقه نگهداری کلیدهای سوخته/پرش‌خورده
 const GROUP_EPOCH_GRACE_BUFFER = 3; // نگهداری ۳ اپوک قبلی برای رمزگشایی پیام‌های در حال پرواز هنگام تغییر اعضا
+const PQ_REKEY_AFTER_MESSAGES = 50; // چرخش نشست راتچت پس از هر ۵۰ پیام ارسالی (Forward Secrecy / PCS)
+const PBKDF2_ITERATIONS_NEW = 600000; // OWASP 2023 برای PBKDF2-HMAC-SHA-256
+const PBKDF2_ITERATIONS_LEGACY = 50000; // مقدار پیشین؛ فقط برای رمزگشایی تاریخچه قدیمی
+const KEY_STORAGE_VERSION = 3; // نسخه ذخیره کلیدها؛ ورودی‌های بدون این نسخه، کلیدهای قطعی قدیمی‌اند و دور ریخته می‌شوند
+
+/**
+ * خطای رمزنگاری سرتاسری. هرگز نباید به‌جای آن متن ساده برگردد.
+ * (رفع F5: شکست رمزنگاری پیش‌تر بی‌صدا به ارسال متن ساده منجر می‌شد.)
+ */
+export class E2EEError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'E2EEError';
+  }
+}
 
 interface StoredKeyPair {
+  v?: number;
   publicJwk: JsonWebKey;
   privateJwk: JsonWebKey;
 }
 
 interface StoredMLKEMKeyPair {
+  v?: number;
   publicKeyB64: string;
   secretKeyB64: string;
 }
 
 interface StoredMLDSAKeyPair {
+  v?: number;
   publicKeyB64: string;
   secretKeyB64: string;
 }
 
 /**
- * اشتقاق قطعی کلید اصلی کاربر (Master Seed) بر اساس نام کاربری
- * تضمین می‌کند که کلیدهای هویت ECDH P-256، ML-KEM-768 و ML-DSA-65 کاربر حتی پس از خروج و ورود مجدد
- * کاملاً ثابت باقی بمانند و دسترسی به پیام‌های پساکوانتومی و کلاسیک قبلی هرگز از بین نرود.
+ * پاک‌سازی وضعیت رمزنگاری کاربر هنگام جایگزینی کلیدهای قدیمی.
+ * (رفع F1: کلیدهای پیش از نسخه ۳ به‌صورت قطعی از نام کاربری مشتق می‌شدند و
+ * بنابراین قابل بازتولید توسط هر کسی بودند. با چرخش هویت، نشست‌های راتچت و
+ * اپوک‌های گروهی قدیمی — که با کلیدهای به‌خطرافتاده ساخته شده‌اند — نیز
+ * دور ریخته می‌شوند. کش متن‌های رمزگشایی‌شده حفظ می‌شود تا تاریخچه
+ * خوانده‌شده از دست نرود.)
  */
-export function getUserMasterSeed(username: string): Uint8Array {
-  const normUser = String(username || '').toLowerCase().replace('@', '').trim();
-  const input = new TextEncoder().encode(`PersianMessenger::MasterSeed::v2::${normUser}`);
-  const salt = new TextEncoder().encode('PersianMessenger-Deterministic-Identity-Salt-v2');
-  return hkdf(sha256, input, salt, new TextEncoder().encode('Identity-Key-Seed'), 64);
+export function clearUserCryptoState(myUsername: string): void {
+  try {
+    const ratchetPrefix = `${RATCHET_STATE_PREFIX}${myUsername}_`;
+    const groupPrefix = GROUP_EPOCH_PREFIX;
+    const doomed: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k) continue;
+      if (k.startsWith(ratchetPrefix) || k.startsWith(groupPrefix)) doomed.push(k);
+    }
+    for (const k of doomed) localStorage.removeItem(k);
+  } catch {
+    // ignore
+  }
 }
 
 export function getPersistentDecryptedCache(myUsername: string, roomId: string): Record<string, string> {
@@ -122,16 +152,18 @@ interface SkippedKeyEntry {
 
 interface RatchetSessionState {
   rootKeyB64: string;
-  initialSendChainKeyB64?: string;
-  initialRecvChainKeyB64?: string;
   sendChainKeyB64: string;
   recvChainKeyB64: string;
   sendStep: number;
   recvStep: number;
   kemCipherTextB64: string; // کپسول ML-KEM-768 برای همگام‌سازی طرف مقابل
   peerKemFingerprint: string;
+  sessionEpoch: number; // با هر چرخش نشست (re-key) یک واحد بیشتر می‌شود
+  sentSinceRekey: number; // پیام‌های ارسالی از آخرین چرخش
+  consumedRecvSteps: number[]; // گام‌های دریافتی مصرف‌شده (محافظت در برابر Replay)
   skippedKeys: Record<number, SkippedKeyEntry>;
   decryptedCache: Record<string, string>; // کش محلی برای نمایش مجدد پیام‌های رمزگشایی‌شده پس از Zeroization کلید
+  previousSession: RatchetSessionState | null; // فقط یک نشست قبلی، برای پیام‌های در حال پرواز هنگام چرخش
 }
 
 export interface GroupEpochKeyRecord {
@@ -139,6 +171,8 @@ export interface GroupEpochKeyRecord {
   rootKeyB64: string;
   createdAt: number;
   membersHash: string;
+  distributedViaMlkem: boolean; // true یعنی کلید اپوک با ML-KEM به اعضا کپسوله شده است (F3)
+  seenMessageKeys?: string[]; // هش پیام‌های گروهی تحویل‌شده در این اپوک — ضد Replay (F7)
 }
 
 export interface GroupEpochState {
@@ -226,24 +260,17 @@ export function serializeMessageForSigning(params: {
 }
 
 export function getMyMLDSASecretKey(myUsername: string): Uint8Array | null {
+  // (رفع F1) اگر کلید ذخیره‌شده نباشد، null برمی‌گردد؛ کلید هرگز به‌صورت
+  // قطعی بازتولید نمی‌شود. تولید کلید فقط در ensureUserHybridKeyPair انجام می‌شود.
   try {
     const raw = localStorage.getItem(`${MLDSA_KEYPAIR_PREFIX}${myUsername}`);
     if (raw) {
       const parsed: StoredMLDSAKeyPair = JSON.parse(raw);
-      if (parsed.secretKeyB64) return base64ToBuf(parsed.secretKeyB64);
+      if (parsed.v === KEY_STORAGE_VERSION && parsed.secretKeyB64) {
+        return base64ToBuf(parsed.secretKeyB64);
+      }
     }
-    // بازتولید قطعی در صورت فقدان در LocalStorage
-    const masterSeed = getUserMasterSeed(myUsername);
-    const dsaSeed = hkdf(sha256, masterSeed, undefined, new TextEncoder().encode('ML-DSA-65-Seed'), 32);
-    const dsaKeys = ml_dsa65.keygen(dsaSeed);
-    localStorage.setItem(
-      `${MLDSA_KEYPAIR_PREFIX}${myUsername}`,
-      JSON.stringify({
-        publicKeyB64: bufToBase64(dsaKeys.publicKey),
-        secretKeyB64: bufToBase64(dsaKeys.secretKey),
-      })
-    );
-    return dsaKeys.secretKey;
+    return null;
   } catch {
     return null;
   }
@@ -254,12 +281,9 @@ export function getMyMLDSAPublicKey(myUsername: string): string | null {
     const raw = localStorage.getItem(`${MLDSA_KEYPAIR_PREFIX}${myUsername}`);
     if (raw) {
       const parsed: StoredMLDSAKeyPair = JSON.parse(raw);
-      if (parsed.publicKeyB64) return parsed.publicKeyB64;
+      if (parsed.v === KEY_STORAGE_VERSION && parsed.publicKeyB64) return parsed.publicKeyB64;
     }
-    const masterSeed = getUserMasterSeed(myUsername);
-    const dsaSeed = hkdf(sha256, masterSeed, undefined, new TextEncoder().encode('ML-DSA-65-Seed'), 32);
-    const dsaKeys = ml_dsa65.keygen(dsaSeed);
-    return bufToBase64(dsaKeys.publicKey);
+    return null;
   } catch {
     return null;
   }
@@ -277,7 +301,21 @@ export async function ensureUserHybridKeyPair(username: string): Promise<string 
   const dsaStorageKey = `${MLDSA_KEYPAIR_PREFIX}${username}`;
 
   try {
-    const masterSeed = getUserMasterSeed(username);
+    // مهاجرت F1: ورودی‌های ذخیره‌شده بدون نشان نسخه ۳، کلیدهای قطعی قدیمی‌اند
+    // (قابل بازتولید از نام کاربری) — دور ریخته و با کلیدهای تصادفی جایگزین می‌شوند.
+    const legacyDetected = [ecdhStorageKey, pqStorageKey, dsaStorageKey].some(k => {
+      try {
+        const raw = localStorage.getItem(k);
+        if (!raw) return false;
+        return JSON.parse(raw).v !== KEY_STORAGE_VERSION;
+      } catch {
+        return true;
+      }
+    });
+    if (legacyDetected) {
+      for (const k of [ecdhStorageKey, pqStorageKey, dsaStorageKey]) localStorage.removeItem(k);
+      clearUserCryptoState(username);
+    }
 
     let publicJwk: JsonWebKey | null = null;
     const existingEcdh = localStorage.getItem(ecdhStorageKey);
@@ -293,8 +331,9 @@ export async function ensureUserHybridKeyPair(username: string): Promise<string 
     }
 
     if (!publicJwk) {
-      const ecdhSeed = hkdf(sha256, masterSeed, undefined, new TextEncoder().encode('ECDH-P256-Key'), 32);
-      const pubBytes = p256.getPublicKey(ecdhSeed, false);
+      // کلید خصوصی تصادفی (F1): هرگز از نام کاربری یا مقدار قطعی مشتق نمی‌شود.
+      const ecdhPriv = p256.utils.randomSecretKey();
+      const pubBytes = p256.getPublicKey(ecdhPriv, false);
       const toB64Url = (buf: Uint8Array) => {
         let binary = '';
         for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i]);
@@ -308,9 +347,10 @@ export async function ensureUserHybridKeyPair(username: string): Promise<string 
       };
       const privateJwk = {
         ...publicJwk,
-        d: toB64Url(ecdhSeed),
+        d: toB64Url(ecdhPriv),
       };
-      localStorage.setItem(ecdhStorageKey, JSON.stringify({ publicJwk, privateJwk }));
+      localStorage.setItem(ecdhStorageKey, JSON.stringify({ v: KEY_STORAGE_VERSION, publicJwk, privateJwk }));
+      zeroizeBuffer(ecdhPriv);
     }
 
     let mlkemPubB64 = '';
@@ -318,7 +358,7 @@ export async function ensureUserHybridKeyPair(username: string): Promise<string 
     if (existingPq) {
       try {
         const parsedPq: StoredMLKEMKeyPair = JSON.parse(existingPq);
-        if (parsedPq.publicKeyB64 && parsedPq.secretKeyB64) {
+        if (parsedPq.v === KEY_STORAGE_VERSION && parsedPq.publicKeyB64 && parsedPq.secretKeyB64) {
           mlkemPubB64 = parsedPq.publicKeyB64;
         }
       } catch {
@@ -327,11 +367,10 @@ export async function ensureUserHybridKeyPair(username: string): Promise<string 
     }
 
     if (!mlkemPubB64) {
-      const kemSeed = hkdf(sha256, masterSeed, undefined, new TextEncoder().encode('ML-KEM-768-Seed'), 64);
-      const pqKeys = ml_kem768.keygen(kemSeed);
+      const pqKeys = ml_kem768.keygen(); // کلید تصادفی با CSPRNG (F1)
       mlkemPubB64 = bufToBase64(pqKeys.publicKey);
       const secretKeyB64 = bufToBase64(pqKeys.secretKey);
-      localStorage.setItem(pqStorageKey, JSON.stringify({ publicKeyB64: mlkemPubB64, secretKeyB64 }));
+      localStorage.setItem(pqStorageKey, JSON.stringify({ v: KEY_STORAGE_VERSION, publicKeyB64: mlkemPubB64, secretKeyB64 }));
       zeroizeBuffer(pqKeys.secretKey);
     }
 
@@ -342,7 +381,7 @@ export async function ensureUserHybridKeyPair(username: string): Promise<string 
     if (existingDsa) {
       try {
         const parsedDsa: StoredMLDSAKeyPair = JSON.parse(existingDsa);
-        if (parsedDsa.publicKeyB64 && parsedDsa.secretKeyB64) {
+        if (parsedDsa.v === KEY_STORAGE_VERSION && parsedDsa.publicKeyB64 && parsedDsa.secretKeyB64) {
           mldsaPubB64 = parsedDsa.publicKeyB64;
           mldsaSec = base64ToBuf(parsedDsa.secretKeyB64);
         }
@@ -352,11 +391,10 @@ export async function ensureUserHybridKeyPair(username: string): Promise<string 
     }
 
     if (!mldsaPubB64 || !mldsaSec) {
-      const dsaSeed = hkdf(sha256, masterSeed, undefined, new TextEncoder().encode('ML-DSA-65-Seed'), 32);
-      const dsaKeys = ml_dsa65.keygen(dsaSeed);
+      const dsaKeys = ml_dsa65.keygen(); // کلید تصادفی با CSPRNG (F1)
       mldsaPubB64 = bufToBase64(dsaKeys.publicKey);
       const secretKeyB64 = bufToBase64(dsaKeys.secretKey);
-      localStorage.setItem(dsaStorageKey, JSON.stringify({ publicKeyB64: mldsaPubB64, secretKeyB64 }));
+      localStorage.setItem(dsaStorageKey, JSON.stringify({ v: KEY_STORAGE_VERSION, publicKeyB64: mldsaPubB64, secretKeyB64 }));
       mldsaSec = dsaKeys.secretKey;
     }
 
@@ -449,25 +487,23 @@ export function parsePeerKeyBundle(
       }
 
       // اعتبارسنجی امضای دیجیتال هویت با الگوریتم FIPS 204 ML-DSA-65
+      // (رفع F11) نام کاربری باندل باید موجود و برابر مخاطب موردانتظار باشد؛
+      // باندل بدون نام کاربری یا با نام ناهمخوان، امضایش نامعتبر شمرده می‌شود.
+      if (expectedPeerUsername && parsed.username !== expectedPeerUsername) {
+        result.isMldsaSignatureInvalid = true;
+        return result;
+      }
       if (result.hasMLKEM && result.hasMLDSA && result.mldsaSigB64 && result.mldsaPub) {
         try {
           const sigBytes = base64ToBuf(result.mldsaSigB64);
-          const uName = parsed.username || expectedPeerUsername || '';
+          const uName = parsed.username || '';
           const target = serializeBundleForSigning({
             username: uName,
             ecdhJwk: result.ecdhJwk,
             mlkemPubB64: parsed.mlkemPubB64,
           });
 
-          let valid = ml_dsa65.verify(sigBytes, target, result.mldsaPub);
-          if (!valid && !parsed.username && expectedPeerUsername) {
-            const fallbackTarget = serializeBundleForSigning({
-              username: '',
-              ecdhJwk: result.ecdhJwk,
-              mlkemPubB64: parsed.mlkemPubB64,
-            });
-            valid = ml_dsa65.verify(sigBytes, fallbackTarget, result.mldsaPub);
-          }
+          const valid = ml_dsa65.verify(sigBytes, target, result.mldsaPub);
 
           if (valid) {
             result.isMldsaVerified = true;
@@ -495,7 +531,7 @@ export function parsePeerKeyBundle(
 export interface RoomPQSecurityStatus {
   isPQ: boolean;
   type: 'PQ_HYBRID_VERIFIED' | 'GROUP_EPOCH' | 'NOT_POST_QUANTUM' | 'DISABLED';
-  reason?: 'CLASSICAL_ECDH' | 'MISSING_PEER_KEYS' | 'INVALID_MLDSA_SIGNATURE' | 'MANUAL_PBKDF2';
+  reason?: 'CLASSICAL_ECDH' | 'MISSING_PEER_KEYS' | 'INVALID_MLDSA_SIGNATURE' | 'MANUAL_PBKDF2' | 'LEGACY_GROUP_EPOCH';
   badge: string;
   tooltip: string;
   warningText?: string;
@@ -523,11 +559,31 @@ export function getRoomPQStatus(options: {
   }
 
   if (options.isGroup) {
+    // (رفع F3) گروه فقط وقتی پساکوانتومی شمرده می‌شود که کلید اپوک جاری
+    // واقعاً با ML-KEM توزیع شده باشد؛ اپوک‌های قدیمیِ مشتق‌شده از ورودی‌های
+    // عمومی، این نشان را نمی‌گیرند.
+    try {
+      const groupId = options.roomId.replace('group__', '');
+      const fsm = getGroupEpochState(groupId, []);
+      const rec = fsm.epochs[fsm.currentEpoch];
+      if (rec && rec.distributedViaMlkem) {
+        return {
+          isPQ: true,
+          type: 'GROUP_EPOCH',
+          badge: '🔒 Epoch',
+          tooltip: 'رمزنگاری گروهی: کلید اپوک با ML-KEM-768 به اعضا توزیع شده است',
+        };
+      }
+    } catch {
+      // ignore — fall through to NOT_POST_QUANTUM
+    }
     return {
-      isPQ: true,
-      type: 'GROUP_EPOCH',
-      badge: '🔒 Epoch',
-      tooltip: 'رمزنگاری گروهی مبتنی بر ماشین وضعیت اپوک (Group Epoch FSM)',
+      isPQ: false,
+      type: 'NOT_POST_QUANTUM',
+      reason: 'LEGACY_GROUP_EPOCH',
+      badge: '⚠️ گروه کلاسیک',
+      tooltip: 'کلید اپوک این گروه با ML-KEM توزیع نشده است',
+      warningText: 'کلید اپوک گروه به‌صورت امن توزیع نشده است. تا زمان دریافت بسته کلید اپوک، پیام‌های گروهی امنیت پساکوانتومی ندارند.',
     };
   }
 
@@ -643,16 +699,28 @@ async function deriveECDHSharedBits(
 
 async function deriveECDHSharedAesKey(
   myUsername: string,
-  peerPublicKeyStr: string
+  peerPublicKeyStr: string,
+  roomId: string,
+  peerUsername?: string
 ): Promise<CryptoKey | null> {
-  const { ecdhJwk } = parsePeerKeyBundle(peerPublicKeyStr);
+  const { ecdhJwk } = parsePeerKeyBundle(peerPublicKeyStr, peerUsername);
   if (!ecdhJwk) return null;
   const bits = await deriveECDHSharedBits(myUsername, ecdhJwk);
   if (!bits) return null;
   try {
+    // (رفع F10) خروجی خام ECDH مستقیم به‌عنوان کلید AES استفاده نمی‌شود؛
+    // نخست از HKDF با salt شناسه اتاق و info وابسته به هویت مخاطب می‌گذرد،
+    // تا کلید هر اتاق جدا باشد.
+    const keyBytes = hkdf(
+      sha256,
+      bits,
+      new TextEncoder().encode(roomId),
+      new TextEncoder().encode(`ECDH-Legacy-AES-v2:${peerUsername || ''}`),
+      32
+    );
     return await window.crypto.subtle.importKey(
       'raw',
-      bits as unknown as BufferSource,
+      keyBytes as unknown as BufferSource,
       { name: 'AES-GCM', length: 256 },
       false,
       ['encrypt', 'decrypt']
@@ -663,53 +731,32 @@ async function deriveECDHSharedAesKey(
 }
 
 function getMyMLKEMSecretKey(myUsername: string): Uint8Array | null {
+  // (رفع F1) اگر کلید ذخیره‌شده نباشد، null برمی‌گردد؛ کلید هرگز به‌صورت
+  // قطعی بازتولید نمی‌شود. تولید کلید فقط در ensureUserHybridKeyPair انجام می‌شود.
   try {
     const raw = localStorage.getItem(`${MLKEM_KEYPAIR_PREFIX}${myUsername}`);
     if (raw) {
       const parsed: StoredMLKEMKeyPair = JSON.parse(raw);
-      if (parsed.secretKeyB64) return base64ToBuf(parsed.secretKeyB64);
+      if (parsed.v === KEY_STORAGE_VERSION && parsed.secretKeyB64) {
+        return base64ToBuf(parsed.secretKeyB64);
+      }
     }
-    // بازتولید قطعی کلید در صورت فقدان در LocalStorage (مثلاً پس از لاگین مجدد در مرورگر تازه)
-    const masterSeed = getUserMasterSeed(myUsername);
-    const kemSeed = hkdf(sha256, masterSeed, undefined, new TextEncoder().encode('ML-KEM-768-Seed'), 64);
-    const pqKeys = ml_kem768.keygen(kemSeed);
-    const sec = pqKeys.secretKey;
-    localStorage.setItem(
-      `${MLKEM_KEYPAIR_PREFIX}${myUsername}`,
-      JSON.stringify({ publicKeyB64: bufToBase64(pqKeys.publicKey), secretKeyB64: bufToBase64(sec) })
-    );
-    return sec;
+    return null;
   } catch {
     return null;
   }
 }
 
-/**
- * اشتقاق کلید پیام‌های قبلی زنجیره راتچت (Historical Message Key) بر اساس کلید اولیه زنجیره
- * جهت امکان مشاهده پیام‌های قبلی تاریخچه چت پس از بازنشانی وضعیت حافظه بدون آسیب به امنیت پیام‌های بعدی
- */
-function deriveHistoricalMessageKey(initialChainKeyBytes: Uint8Array, targetStep: number): Uint8Array {
-  let currChain = initialChainKeyBytes;
-  let targetKey: Uint8Array = new Uint8Array(32);
-  for (let i = 0; i <= targetStep; i++) {
-    const { nextChainKey, messageKey } = kdfChainStep(currChain);
-    if (i > 0) zeroizeBuffer(currChain);
-    currChain = nextChainKey;
-    if (i === targetStep) {
-      targetKey = messageKey;
-      zeroizeBuffer(currChain);
-    } else {
-      zeroizeBuffer(messageKey);
-    }
-  }
-  return targetKey;
-}
+// (رفع F7/F9) اشتقاق کلید تاریخی حذف شد: کلید اولیه زنجیره دیگر ذخیره
+// نمی‌شود و پیام قدیمی فقط از کش متن‌های رمزگشایی‌شده خوانده می‌شود.
+
 
 function loadRatchetState(myUsername: string, roomId: string): RatchetSessionState | null {
   try {
     const raw = localStorage.getItem(`${RATCHET_STATE_PREFIX}${myUsername}_${roomId}`);
     if (!raw) return null;
-    const state: RatchetSessionState = JSON.parse(raw);
+    const parsed: RatchetSessionState = JSON.parse(raw);
+    const state = normalizeRatchetState(parsed);
     const now = Date.now();
     let mutated = false;
     for (const [stepStr, entry] of Object.entries(state.skippedKeys || {})) {
@@ -744,8 +791,97 @@ function saveRatchetState(myUsername: string, roomId: string, state: RatchetSess
   }
 }
 
+/** حذف لایه previousSession از یک نشست، برای اینکه فقط یک سطح قبلی ذخیره شود
+ *  (و کش متن‌ها در شکاف قبلی تکثیر نشود). */
+function stripPreviousSession(state: RatchetSessionState): RatchetSessionState {
+  return { ...state, previousSession: null, decryptedCache: {} };
+}
+
+/** عادی‌سازی نشست خوانده‌شده از حافظه (مهاجرت از نسخه‌های قدیمی). */
+function normalizeRatchetState(state: RatchetSessionState, depth = 0): RatchetSessionState {
+  const s = state as unknown as Record<string, unknown>;
+  delete s.initialSendChainKeyB64;
+  delete s.initialRecvChainKeyB64;
+  return {
+    ...state,
+    sessionEpoch: typeof state.sessionEpoch === 'number' ? state.sessionEpoch : 0,
+    sentSinceRekey: typeof state.sentSinceRekey === 'number' ? state.sentSinceRekey : 0,
+    consumedRecvSteps: Array.isArray(state.consumedRecvSteps) ? state.consumedRecvSteps : [],
+    skippedKeys: state.skippedKeys || {},
+    decryptedCache: state.decryptedCache || {},
+    previousSession:
+      state.previousSession && depth < 1
+        ? normalizeRatchetState(state.previousSession, depth + 1)
+        : null,
+  };
+}
+
+/**
+ * اشتقاق یک نشست راتچت تازه از اسرار مشترک (ECDH + KEM).
+ * (رفع F8/F9) کپسوله‌سازی همیشه با کوین‌های تصادفی تازه انجام می‌شود و
+ * هر نشست تازه، کلید ریشه و زنجیره‌های تازه دارد؛ گام‌ها از صفر شروع می‌شوند.
+ */
+async function deriveFreshRatchetSession(
+  myUsername: string,
+  roomId: string,
+  ecdhSecret: Uint8Array,
+  pqSharedSecret: Uint8Array,
+  kemCipherB64: string,
+  peerFingerprint: string,
+  existing: RatchetSessionState | null
+): Promise<RatchetSessionState> {
+  const combinedInput = new Uint8Array(ecdhSecret.length + pqSharedSecret.length);
+  combinedInput.set(ecdhSecret, 0);
+  combinedInput.set(pqSharedSecret, ecdhSecret.length);
+
+  const rootKey = hkdf(
+    sha256,
+    combinedInput,
+    new TextEncoder().encode(roomId),
+    new TextEncoder().encode('PQ-Hybrid-RootKey-v2'),
+    32
+  );
+
+  const [u1] = roomId.split('__').sort();
+  const amIFirst = myUsername === u1;
+  const chainA = hkdf(sha256, rootKey, undefined, new TextEncoder().encode('Chain-Alpha'), 32);
+  const chainB = hkdf(sha256, rootKey, undefined, new TextEncoder().encode('Chain-Beta'), 32);
+
+  const sendChain = amIFirst ? chainA : chainB;
+  const recvChain = amIFirst ? chainB : chainA;
+
+  const persistentCache = getPersistentDecryptedCache(myUsername, roomId);
+  const newState: RatchetSessionState = {
+    rootKeyB64: bufToBase64(rootKey),
+    sendChainKeyB64: bufToBase64(sendChain),
+    recvChainKeyB64: bufToBase64(recvChain),
+    sendStep: 0,
+    recvStep: 0,
+    kemCipherTextB64: kemCipherB64,
+    peerKemFingerprint: peerFingerprint,
+    sessionEpoch: (existing?.sessionEpoch ?? 0) + 1,
+    sentSinceRekey: 0,
+    consumedRecvSteps: [],
+    skippedKeys: {},
+    decryptedCache: {
+      ...(existing?.decryptedCache || {}),
+      ...persistentCache,
+    },
+    previousSession: existing ? stripPreviousSession(existing) : null,
+  };
+
+  zeroizeBuffer(combinedInput);
+  zeroizeBuffer(rootKey);
+  return newState;
+}
+
 /**
  * مقداردهی اولیه یا بازیابی نشست راتچت پساکوانتومی (Hybrid ML-KEM-768 + ECDH P-256)
+ * (رفع F6/F8/F9)
+ * - برقراری نشست تازه یا چرخش به کپسول تازه، فقط با باندل کاملاً پساکوانتومی
+ *   (امضای ML-DSA-65 معتبر) انجام می‌شود.
+ * - کپسوله‌سازی با کوین‌های تصادفی تازه است؛ fallback بازکپسوله‌سازی حذف شد.
+ * - کپسولِ نشست فعلی یا قبلی، بدون مشتق‌سازی دوباره برگردانده می‌شود.
  */
 async function ensurePQRatchetSession(
   myUsername: string,
@@ -762,154 +898,70 @@ async function ensurePQRatchetSession(
     return existing || null;
   }
 
-  // جلوگیری از تنزل خاموش: برای مکالمه جدید، امضای ML-DSA الزامی است؛
-  // اما برای رمزگشایی تاریخچه و پیام‌های قبلی، سازگاری کامل حفظ می‌شود.
-  if (!bundle.isFullyPostQuantum && !existing && !incomingKemCipherB64) {
-    return null;
-  }
-
   const peerFingerprint = bufToBase64(sha256(bundle.mlkemPub)).slice(0, 16);
 
-  // اگر کپسول جدیدی از سمت مقابل آمده که نیاز به Decapsulation دارد
-  if (incomingKemCipherB64 && (!existing || existing.kemCipherTextB64 !== incomingKemCipherB64)) {
-    const mySecretKey = getMyMLKEMSecretKey(myUsername);
-    const ecdhSecret = await deriveECDHSharedBits(myUsername, ecdhJwk);
-    if (!mySecretKey || !ecdhSecret) return existing || null;
-
-    try {
-      const cipherBytes = base64ToBuf(incomingKemCipherB64);
-      let pqSharedSecret: Uint8Array | null = null;
-      try {
-        pqSharedSecret = ml_kem768.decapsulate(cipherBytes, mySecretKey);
-      } catch {
-        // اگر کپسول مربوط به پیامی است که خود ما در این نشست تولید کرده بودیم
-        const preimage = hkdf(
-          sha256,
-          ecdhSecret,
-          new TextEncoder().encode(roomId),
-          new TextEncoder().encode('ML-KEM-768-Preimage-v2'),
-          32
-        );
-        const enc = ml_kem768.encapsulate(mlkemPub, preimage);
-        pqSharedSecret = enc.sharedSecret;
-      }
-
-      if (!pqSharedSecret) return existing || null;
-
-      const combinedInput = new Uint8Array(ecdhSecret.length + pqSharedSecret.length);
-      combinedInput.set(ecdhSecret, 0);
-      combinedInput.set(pqSharedSecret, ecdhSecret.length);
-
-      const rootKey = hkdf(
-        sha256,
-        combinedInput,
-        new TextEncoder().encode(roomId),
-        new TextEncoder().encode('PQ-Hybrid-RootKey-v2'),
-        32
-      );
-
-      const [u1] = roomId.split('__').sort();
-      const amIFirst = myUsername === u1;
-      const chainA = hkdf(sha256, rootKey, undefined, new TextEncoder().encode('Chain-Alpha'), 32);
-      const chainB = hkdf(sha256, rootKey, undefined, new TextEncoder().encode('Chain-Beta'), 32);
-
-      const sendChain = amIFirst ? chainA : chainB;
-      const recvChain = amIFirst ? chainB : chainA;
-
-      const persistentCache = getPersistentDecryptedCache(myUsername, roomId);
-      const newState: RatchetSessionState = {
-        rootKeyB64: bufToBase64(rootKey),
-        initialSendChainKeyB64: bufToBase64(sendChain),
-        initialRecvChainKeyB64: bufToBase64(recvChain),
-        sendChainKeyB64: bufToBase64(sendChain),
-        recvChainKeyB64: bufToBase64(recvChain),
-        sendStep: existing?.sendStep ?? 0,
-        recvStep: existing?.recvStep ?? 0,
-        kemCipherTextB64: incomingKemCipherB64,
-        peerKemFingerprint: peerFingerprint,
-        skippedKeys: existing?.skippedKeys ?? {},
-        decryptedCache: {
-          ...(existing?.decryptedCache || {}),
-          ...persistentCache,
-        },
-      };
-
-      zeroizeBuffer(mySecretKey);
-      zeroizeBuffer(ecdhSecret);
-      zeroizeBuffer(pqSharedSecret);
-      zeroizeBuffer(combinedInput);
-      zeroizeBuffer(rootKey);
-
-      saveRatchetState(myUsername, roomId, newState);
-      return newState;
-    } catch {
-      zeroizeBuffer(mySecretKey);
-      zeroizeBuffer(ecdhSecret);
-      return existing;
-    }
+  // کپسول ورودی متعلق به نشست فعلی یا قبلی است — نیازی به مشتق‌سازی نیست.
+  if (incomingKemCipherB64 && existing) {
+    if (existing.kemCipherTextB64 === incomingKemCipherB64) return existing;
+    if (existing.previousSession?.kemCipherTextB64 === incomingKemCipherB64) return existing;
   }
 
-  if (existing && existing.peerKemFingerprint === peerFingerprint) {
+  // بدون کپسول تازه و با همان کلید مخاطب: نشست موجود ادامه می‌یابد.
+  if (!incomingKemCipherB64 && existing && existing.peerKemFingerprint === peerFingerprint) {
     return existing;
   }
 
-  // ایجاد کپسول جدید ML-KEM-768 با Preimage معین
+  // برقراری نشست تازه (یا چرخش) فقط با باندل تأییدشده پساکوانتومی (F6).
+  if (!bundle.isFullyPostQuantum) {
+    return existing || null;
+  }
+
   const ecdhSecret = await deriveECDHSharedBits(myUsername, ecdhJwk);
   if (!ecdhSecret) return existing || null;
 
   try {
-    const preimage = hkdf(
-      sha256,
+    let pqSharedSecret: Uint8Array | null = null;
+    let kemCipherB64: string;
+    if (incomingKemCipherB64) {
+      const mySecretKey = getMyMLKEMSecretKey(myUsername);
+      if (!mySecretKey) {
+        zeroizeBuffer(ecdhSecret);
+        return existing || null;
+      }
+      try {
+        pqSharedSecret = ml_kem768.decapsulate(base64ToBuf(incomingKemCipherB64), mySecretKey);
+      } catch {
+        // (رفع F8) شکست Decapsulation به‌معنای کپسول نامعتبر است؛
+        // بازتولید مخفیانه Secret با Preimage حذف شد — Fail closed.
+        zeroizeBuffer(mySecretKey);
+        zeroizeBuffer(ecdhSecret);
+        return existing || null;
+      }
+      zeroizeBuffer(mySecretKey);
+      kemCipherB64 = incomingKemCipherB64;
+    } else {
+      // (رفع F8) کپسوله‌سازی با کوین‌های تصادفی تازه.
+      const enc = ml_kem768.encapsulate(mlkemPub);
+      pqSharedSecret = enc.sharedSecret;
+      kemCipherB64 = bufToBase64(enc.cipherText);
+    }
+
+    if (!pqSharedSecret) {
+      zeroizeBuffer(ecdhSecret);
+      return existing || null;
+    }
+
+    const newState = await deriveFreshRatchetSession(
+      myUsername,
+      roomId,
       ecdhSecret,
-      new TextEncoder().encode(roomId),
-      new TextEncoder().encode('ML-KEM-768-Preimage-v2'),
-      32
+      pqSharedSecret,
+      kemCipherB64,
+      peerFingerprint,
+      existing
     );
-    const { cipherText, sharedSecret: pqSharedSecret } = ml_kem768.encapsulate(mlkemPub, preimage);
-
-    const combinedInput = new Uint8Array(ecdhSecret.length + pqSharedSecret.length);
-    combinedInput.set(ecdhSecret, 0);
-    combinedInput.set(pqSharedSecret, ecdhSecret.length);
-
-    const rootKey = hkdf(
-      sha256,
-      combinedInput,
-      new TextEncoder().encode(roomId),
-      new TextEncoder().encode('PQ-Hybrid-RootKey-v2'),
-      32
-    );
-
-    const [u1] = roomId.split('__').sort();
-    const amIFirst = myUsername === u1;
-    const chainA = hkdf(sha256, rootKey, undefined, new TextEncoder().encode('Chain-Alpha'), 32);
-    const chainB = hkdf(sha256, rootKey, undefined, new TextEncoder().encode('Chain-Beta'), 32);
-
-    const sendChain = amIFirst ? chainA : chainB;
-    const recvChain = amIFirst ? chainB : chainA;
-
-    const persistentCache = getPersistentDecryptedCache(myUsername, roomId);
-    const newState: RatchetSessionState = {
-      rootKeyB64: bufToBase64(rootKey),
-      initialSendChainKeyB64: bufToBase64(sendChain),
-      initialRecvChainKeyB64: bufToBase64(recvChain),
-      sendChainKeyB64: bufToBase64(sendChain),
-      recvChainKeyB64: bufToBase64(recvChain),
-      sendStep: existing?.sendStep ?? 0,
-      recvStep: existing?.recvStep ?? 0,
-      kemCipherTextB64: bufToBase64(cipherText),
-      peerKemFingerprint: peerFingerprint,
-      skippedKeys: existing?.skippedKeys ?? {},
-      decryptedCache: {
-        ...(existing?.decryptedCache || {}),
-        ...persistentCache,
-      },
-    };
-
     zeroizeBuffer(ecdhSecret);
     zeroizeBuffer(pqSharedSecret);
-    zeroizeBuffer(combinedInput);
-    zeroizeBuffer(rootKey);
-
     saveRatchetState(myUsername, roomId, newState);
     return newState;
   } catch {
@@ -919,90 +971,126 @@ async function ensurePQRatchetSession(
 }
 
 /**
- * رمزگشایی پیام در زنجیره راتچت با پشتیبانی کامل از پیام‌های خارج از نوبت و بازیابی تاریخچه پس از ورود مجدد
+ * چرخش صریح نشست برای ارسال (F9): پس از PQ_REKEY_AFTER_MESSAGES پیام،
+ * کپسول تازه با کوین تصادفی ساخته و نشست با epoch بالاتر جایگزین می‌شود.
+ */
+export async function rotateRatchetSessionForSend(
+  myUsername: string,
+  roomId: string,
+  peerPublicKeyStr: string,
+  peerUsername?: string
+): Promise<RatchetSessionState | null> {
+  const bundle = parsePeerKeyBundle(peerPublicKeyStr, peerUsername);
+  if (!bundle.isFullyPostQuantum || !bundle.mlkemPub || !bundle.ecdhJwk) return null;
+  const existing = loadRatchetState(myUsername, roomId);
+  const ecdhSecret = await deriveECDHSharedBits(myUsername, bundle.ecdhJwk);
+  if (!ecdhSecret) return existing || null;
+  try {
+    const enc = ml_kem768.encapsulate(bundle.mlkemPub);
+    const peerFingerprint = bufToBase64(sha256(bundle.mlkemPub)).slice(0, 16);
+    const newState = await deriveFreshRatchetSession(
+      myUsername,
+      roomId,
+      ecdhSecret,
+      enc.sharedSecret,
+      bufToBase64(enc.cipherText),
+      peerFingerprint,
+      existing
+    );
+    zeroizeBuffer(ecdhSecret);
+    zeroizeBuffer(enc.sharedSecret);
+    saveRatchetState(myUsername, roomId, newState);
+    return newState;
+  } catch {
+    zeroizeBuffer(ecdhSecret);
+    return existing;
+  }
+}
+
+/**
+ * رمزگشایی پیام در زنجیره راتچت (F7/F9)
+ * - گام دریافتیِ پیش‌تر مصرف‌شده، Replay است و رد می‌شود.
+ * - کلید تاریخی از زنجیره اولیه بازتولید نمی‌شود؛ نمایش تاریخچه فقط از کش
+ *   متن‌های رمزگشایی‌شده است.
+ * - `root` نشست ریشه‌ای است که ذخیره می‌شود؛ `session` شکافی (فعلی یا قبلی)
+ *   است که پیام به آن تعلق دارد.
  */
 async function ratchetDecryptWithSkippedKeys(
   myUsername: string,
   roomId: string,
-  state: RatchetSessionState,
+  root: RatchetSessionState,
+  session: RatchetSessionState,
   msgStep: number,
   iv: Uint8Array,
   cipherBytes: Uint8Array,
   payloadHashKey: string,
-  isSender?: boolean
+  isSender?: boolean,
+  allowCache = true
 ): Promise<string | null> {
-  // ۱. اولویت اول: کش پیام‌های رمزگشایی‌شده (RAM یا Persistent Storage)
-  if (state.decryptedCache && state.decryptedCache[payloadHashKey]) {
-    return state.decryptedCache[payloadHashKey];
+  // (رفع F7) کش نمایش فقط در مسیر نمایش یا پیام خودِ فرستنده خوانده می‌شود؛
+  // در مسیر شبکه (allowCache=false) کش دور زده می‌شود تا Replay از طریق
+  // کشِ پیامِ پیش‌تر رمزگشایی‌شده دوباره پذیرفته نشود.
+  if (isSender || allowCache !== false) {
+    if (session.decryptedCache && session.decryptedCache[payloadHashKey]) {
+      return session.decryptedCache[payloadHashKey];
+    }
+    const persistent = getPersistentDecryptedCache(myUsername, roomId)[payloadHashKey];
+    if (persistent) {
+      if (!session.decryptedCache) session.decryptedCache = {};
+      session.decryptedCache[payloadHashKey] = persistent;
+      return persistent;
+    }
   }
-  const persistent = getPersistentDecryptedCache(myUsername, roomId)[payloadHashKey];
-  if (persistent) {
-    if (!state.decryptedCache) state.decryptedCache = {};
-    state.decryptedCache[payloadHashKey] = persistent;
-    return persistent;
+
+  // (رفع F7) گام دریافتیِ پیش‌تر مصرف‌شده، Replay است — رد می‌شود.
+  if (!isSender && session.consumedRecvSteps.includes(msgStep)) {
+    return null;
   }
 
   let messageKeyBytes: Uint8Array | null = null;
-  const isPastStep = isSender ? (msgStep < state.sendStep) : (msgStep < state.recvStep);
+  const isPastStep = isSender ? (msgStep < session.sendStep) : (msgStep < session.recvStep);
 
   // حالت ۱: پیام مربوط به یکی از گام‌های قبلی است
   if (isPastStep) {
-    const skipped = state.skippedKeys[msgStep];
+    const skipped = session.skippedKeys[msgStep];
     if (skipped) {
       messageKeyBytes = base64ToBuf(skipped.mkB64);
-      delete state.skippedKeys[msgStep];
+      delete session.skippedKeys[msgStep];
     } else {
-      // بازیابی کلید تاریخی از کلید اولیه زنجیره برای جلوگیری قطعی از قفل شدن پیام‌ها پس از بازنشانی
-      const initChainB64 = isSender ? state.initialSendChainKeyB64 : state.initialRecvChainKeyB64;
-      if (initChainB64) {
-        try {
-          messageKeyBytes = deriveHistoricalMessageKey(base64ToBuf(initChainB64), msgStep);
-        } catch {
-          messageKeyBytes = null;
-        }
-      }
-    }
-    if (!messageKeyBytes) {
+      // بدون کلید تاریخی (F9): پیام قدیمی که کلیدش نگه داشته نشده، قفل می‌ماند.
       return null;
     }
   } else if (isSender) {
-    const initChainB64 = state.initialSendChainKeyB64;
-    if (initChainB64) {
-      try {
-        messageKeyBytes = deriveHistoricalMessageKey(base64ToBuf(initChainB64), msgStep);
-      } catch {
-        messageKeyBytes = null;
-      }
-    }
-    if (!messageKeyBytes) return null;
+    // پیام خود فرستنده فقط از کش خوانده می‌شود؛ بازتولید تاریخی حذف شد (F9).
+    return null;
   } else {
     // بررسی سقف مجاز پرش برای جلوگیری از حمله DoS
-    if (msgStep - state.recvStep > MAX_SKIP) {
+    if (msgStep - session.recvStep > MAX_SKIP) {
       return null;
     }
 
-    let currentRecvChain = base64ToBuf(state.recvChainKeyB64);
+    let currentRecvChain = base64ToBuf(session.recvChainKeyB64);
 
     // پیام جلوتر از گام فعلی است؛ کلیدهای میانی را تولید و در SkippedMessageKeys ذخیره کن
-    while (state.recvStep < msgStep) {
+    while (session.recvStep < msgStep) {
       const { nextChainKey, messageKey } = kdfChainStep(currentRecvChain);
       zeroizeBuffer(currentRecvChain);
       currentRecvChain = nextChainKey;
 
-      state.skippedKeys[state.recvStep] = {
+      session.skippedKeys[session.recvStep] = {
         mkB64: bufToBase64(messageKey),
         timestamp: Date.now(),
       };
       zeroizeBuffer(messageKey);
-      state.recvStep++;
+      session.recvStep++;
     }
 
-    // استخراج کلید پیام فعلی (msgStep === state.recvStep)
+    // استخراج کلید پیام فعلی (msgStep === session.recvStep)
     const { nextChainKey, messageKey } = kdfChainStep(currentRecvChain);
     zeroizeBuffer(currentRecvChain);
-    state.recvChainKeyB64 = bufToBase64(nextChainKey);
+    session.recvChainKeyB64 = bufToBase64(nextChainKey);
     zeroizeBuffer(nextChainKey);
-    state.recvStep++;
+    session.recvStep++;
     messageKeyBytes = messageKey;
   }
 
@@ -1022,10 +1110,18 @@ async function ratchetDecryptWithSkippedKeys(
     );
 
     const plainText = new TextDecoder().decode(decryptedBuffer);
-    if (!state.decryptedCache) state.decryptedCache = {};
-    state.decryptedCache[payloadHashKey] = plainText;
+    if (!session.decryptedCache) session.decryptedCache = {};
+    session.decryptedCache[payloadHashKey] = plainText;
+    if (!isSender) {
+      session.consumedRecvSteps.push(msgStep);
+      if (session.consumedRecvSteps.length > 2000) {
+        session.consumedRecvSteps = session.consumedRecvSteps.filter(
+          s => s >= session.recvStep - 1000
+        );
+      }
+    }
     savePersistentDecryptedMessage(myUsername, roomId, payloadHashKey, plainText);
-    saveRatchetState(myUsername, roomId, state);
+    saveRatchetState(myUsername, roomId, root);
     return plainText;
   } catch {
     return null;
@@ -1122,17 +1218,107 @@ function computeMembersHash(members: string[]): string {
   return bufToBase64(sha256(new TextEncoder().encode(sorted))).slice(0, 12);
 }
 
-function deriveGroupEpochRootKey(groupId: string, epoch: number, membersHash: string, customSecret?: string): Uint8Array {
-  const seedMaterial = new TextEncoder().encode(
-    `group-pq-epoch::${groupId}::v${epoch}::${membersHash}::${customSecret || 'default-pq-group'}`
-  );
-  return hkdf(
-    sha256,
-    seedMaterial,
-    new TextEncoder().encode(groupId),
-    new TextEncoder().encode(`Group-Epoch-Key-${epoch}`),
-    32
-  );
+/**
+ * (رفع F3) کلید اپوک گروه هرگز به‌صورت قطعی از ورودی‌های عمومی مشتق نمی‌شود.
+ * توزیع‌کننده اپوک (سازنده گروه) یک کلید تصادفی ۳۲ بایتی می‌سازد و آن را
+ * برای هر عضو با ML-KEM-768 به کلید عمومی تأییدشده باندل او کپسوله می‌کند؛
+ * سرور فقط کپسول‌ها را جابه‌جا می‌کند و کلید را نمی‌بیند.
+ */
+export interface GroupEpochPacket {
+  epochKeyB64: string; // کلید خام اپوک — فقط نزد توزیع‌کننده می‌ماند
+  keys: Record<string, string>; // username -> کپسول ML-KEM-768 (Base64)
+  missing: string[]; // اعضایی که باندل تأییدشده ندارند و نمی‌توانند بخوانند
+}
+
+export async function createGroupEpochPacket(
+  memberBundles: Record<string, ParsedPeerKeyBundle | null | undefined>
+): Promise<GroupEpochPacket> {
+  const epochKey = window.crypto.getRandomValues(new Uint8Array(32));
+  const keys: Record<string, string> = {};
+  const missing: string[] = [];
+  for (const [username, bundle] of Object.entries(memberBundles)) {
+    if (bundle && bundle.isFullyPostQuantum && bundle.mlkemPub) {
+      try {
+        // کپسوله‌سازی ML-KEM-768 با کوین‌های تصادفی تازه؛ کلید اپوک با
+        // کلید مشتق‌شده از Secret مشترک (HKDF با دامنهٔ نام گیرنده) و
+        // AES-256-GCM پیچیده می‌شود. بدون این پیچش، کپسول هیچ‌گاه کلید
+        // اپوک را منتقل نمی‌کرد (باگ نسخهٔ اول این رفع).
+        const enc = ml_kem768.encapsulate(bundle.mlkemPub); // کوین‌های تصادفی تازه
+        const wrapKey = hkdf(
+          sha256,
+          enc.sharedSecret,
+          undefined,
+          new TextEncoder().encode(`Group-Epoch-Wrap-v1:${username}`),
+          32
+        );
+        const iv = window.crypto.getRandomValues(new Uint8Array(12));
+        const aesKey = await window.crypto.subtle.importKey(
+          'raw',
+          wrapKey as unknown as BufferSource,
+          { name: 'AES-GCM', length: 256 },
+          false,
+          ['encrypt']
+        );
+        const wrapped = await window.crypto.subtle.encrypt(
+          { name: 'AES-GCM', iv: iv as unknown as BufferSource },
+          aesKey,
+          epochKey as unknown as BufferSource
+        );
+        keys[username] = `${bufToBase64(enc.cipherText)}:${bufToBase64(iv)}:${bufToBase64(
+          new Uint8Array(wrapped)
+        )}`;
+        zeroizeBuffer(enc.sharedSecret);
+        zeroizeBuffer(wrapKey);
+      } catch {
+        missing.push(username);
+      }
+    } else {
+      missing.push(username);
+    }
+  }
+  const epochKeyB64 = bufToBase64(epochKey);
+  zeroizeBuffer(epochKey);
+  return { epochKeyB64, keys, missing };
+}
+
+/** باز کردن کپسول کلید اپوک گروه با کلید خصوصی ML-KEM-768 خود کاربر. */
+export async function decapsulateGroupEpochKey(
+  myUsername: string,
+  wrappedB64: string
+): Promise<string | null> {
+  try {
+    const parts = wrappedB64.split(':');
+    if (parts.length !== 3) return null;
+    const [ctB64, ivB64, wrappedKeyB64] = parts;
+    const mySecretKey = getMyMLKEMSecretKey(myUsername);
+    if (!mySecretKey) return null;
+    const shared = ml_kem768.decapsulate(base64ToBuf(ctB64), mySecretKey);
+    zeroizeBuffer(mySecretKey);
+    const wrapKey = hkdf(
+      sha256,
+      shared,
+      undefined,
+      new TextEncoder().encode(`Group-Epoch-Wrap-v1:${myUsername}`),
+      32
+    );
+    zeroizeBuffer(shared);
+    const aesKey = await window.crypto.subtle.importKey(
+      'raw',
+      wrapKey as unknown as BufferSource,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['decrypt']
+    );
+    zeroizeBuffer(wrapKey);
+    const plain = await window.crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: base64ToBuf(ivB64) as unknown as BufferSource },
+      aesKey,
+      base64ToBuf(wrappedKeyB64) as unknown as BufferSource
+    );
+    return bufToBase64(new Uint8Array(plain));
+  } catch {
+    return null;
+  }
 }
 
 export function getGroupEpochState(groupId: string, members: string[] = []): GroupEpochState {
@@ -1158,23 +1344,15 @@ export function getGroupEpochState(groupId: string, members: string[] = []): Gro
     // ignore
   }
 
-  const mHash = computeMembersHash(members);
-  const rk = deriveGroupEpochRootKey(groupId, 1, mHash, getRoomSecret(`group__${groupId}`));
+  // (رفع F3) بدون بسته کلید اپوک، هیچ کلیدی ساخته نمی‌شود؛ اپوک ۱ هم
+  // باید از طریق بسته ML-KEM برسد. تا آن زمان پیام گروهی ارسال نمی‌شود.
   const initial: GroupEpochState = {
     groupId,
     currentEpoch: 1,
     status: 'STABLE',
-    epochs: {
-      1: {
-        epoch: 1,
-        rootKeyB64: bufToBase64(rk),
-        createdAt: Date.now(),
-        membersHash: mHash,
-      },
-    },
+    epochs: {},
     pendingQueue: [],
   };
-  zeroizeBuffer(rk);
   groupFsmMap.set(groupId, initial);
   saveGroupEpochState(initial);
   return initial;
@@ -1198,21 +1376,26 @@ function saveGroupEpochState(state: GroupEpochState): void {
 /**
  * چرخش اتمیک اپوک گروه (Atomic Group Epoch Rotation) هنگام تغییر اعضا
  * نگه‌داشتن کلیدهای ۳ اپوک قبلی در Grace Buffer برای جلوگیری از خراب شدن پیام‌های همزمان (In-Flight)
+ * (رفع F3) کلید اپوک الزامی است و باید از بسته ML-KEM آمده باشد؛
+ * در غیاب آن، به‌جای مشتق قطعی، خطا پرتاب می‌شود (Fail closed).
  */
 export async function rotateGroupEpoch(
   groupId: string,
   newEpoch: number,
   members: string[],
-  encapsulatedEpochKeyB64?: string
+  epochKeyB64?: string
 ): Promise<GroupEpochState> {
+  if (!epochKeyB64) {
+    throw new E2EEError(
+      'Group epoch key unavailable: the epoch key packet has not arrived yet. Refusing to derive a group key from public inputs.'
+    );
+  }
   const state = getGroupEpochState(groupId, members);
   state.status = 'ROTATING';
 
   try {
     const mHash = computeMembersHash(members);
-    const rootKey = encapsulatedEpochKeyB64
-      ? base64ToBuf(encapsulatedEpochKeyB64)
-      : deriveGroupEpochRootKey(groupId, newEpoch, mHash, getRoomSecret(`group__${groupId}`));
+    const rootKey = base64ToBuf(epochKeyB64);
 
     state.currentEpoch = newEpoch;
     state.epochs[newEpoch] = {
@@ -1220,6 +1403,7 @@ export async function rotateGroupEpoch(
       rootKeyB64: bufToBase64(rootKey),
       createdAt: Date.now(),
       membersHash: mHash,
+      distributedViaMlkem: true,
     };
     zeroizeBuffer(rootKey);
 
@@ -1245,11 +1429,18 @@ export async function rotateGroupEpoch(
   return state;
 }
 
-async function derivePbkdf2AesKey(roomId: string, customSecret?: string): Promise<CryptoKey> {
+async function derivePbkdf2AesKey(
+  roomId: string,
+  customSecret: string,
+  iterations: number = PBKDF2_ITERATIONS_NEW
+): Promise<CryptoKey> {
+  // (رفع F4) رمز دستی الزامی است؛ عبارت پیش‌فرض عمومی حذف شد. بدون رمز،
+  // این تابع صدا زده نمی‌شود و encryptMessageText خطا می‌دهد.
+  if (!customSecret) {
+    throw new E2EEError('A manual passphrase is required: no default passphrase exists.');
+  }
   const enc = new TextEncoder();
-  const passphrase = customSecret
-    ? `${roomId}::${customSecret}`
-    : `${roomId}::default-e2ee-channel-secret-256`;
+  const passphrase = `${roomId}::${customSecret}`;
 
   const keyMaterial = await window.crypto.subtle.importKey(
     'raw',
@@ -1264,7 +1455,7 @@ async function derivePbkdf2AesKey(roomId: string, customSecret?: string): Promis
     {
       name: 'PBKDF2',
       salt,
-      iterations: 50000,
+      iterations,
       hash: 'SHA-256',
     },
     keyMaterial,
@@ -1317,7 +1508,14 @@ export async function encryptMessageText(
       }
 
       const epochRec = fsm.epochs[fsm.currentEpoch];
-      if (epochRec) {
+      if (!epochRec) {
+        // (رفع F3/F5) بدون کلید اپوک گروه، پیام ارسال نمی‌شود؛
+        // هرگز با کلید مشتق‌شده از ورودی‌های عمومی جایگزین نمی‌شود.
+        throw new E2EEError(
+          'Group epoch key unavailable: the epoch key packet has not arrived yet.'
+        );
+      }
+      {
         const rawRoot = base64ToBuf(epochRec.rootKeyB64);
         const msgKeyBytes = hkdf(
           sha256,
@@ -1352,13 +1550,24 @@ export async function encryptMessageText(
 
       // ایجاد و ادامه نشست راتچت پساکوانتومی تنها در صورتی که مخاطب کلید تأییدشده ML-KEM و امضای ML-DSA داشته باشد
       if (peerBundle.isFullyPostQuantum) {
-        const ratchetState = await ensurePQRatchetSession(
+        let ratchetState = await ensurePQRatchetSession(
           options.myUsername,
           roomId,
           options.peerPublicKey,
           undefined,
           options.peerUsername
         );
+
+        // (رفع F9) چرخش دوره‌ای نشست پس از PQ_REKEY_AFTER_MESSAGES پیام ارسالی.
+        if (ratchetState && ratchetState.sentSinceRekey >= PQ_REKEY_AFTER_MESSAGES) {
+          const rotated = await rotateRatchetSessionForSend(
+            options.myUsername,
+            roomId,
+            options.peerPublicKey,
+            options.peerUsername
+          );
+          if (rotated) ratchetState = rotated;
+        }
 
         if (ratchetState) {
           const currentSendChain = base64ToBuf(ratchetState.sendChainKeyB64);
@@ -1368,6 +1577,7 @@ export async function encryptMessageText(
           const stepIndex = ratchetState.sendStep;
           ratchetState.sendChainKeyB64 = bufToBase64(nextChainKey);
           ratchetState.sendStep = stepIndex + 1;
+          ratchetState.sentSinceRekey = (ratchetState.sentSinceRekey || 0) + 1;
           zeroizeBuffer(nextChainKey);
 
           const aesKey = await window.crypto.subtle.importKey(
@@ -1391,22 +1601,24 @@ export async function encryptMessageText(
           const kemCipherB64 = ratchetState.kemCipherTextB64;
 
           // امضای دیجیتال پساکوانتومی پیام و پیام اولیه نشست (Session-Init) با ML-DSA-65
-          let msgSigB64 = '';
+          // (رفع F6) پیام PQ بدون امضای هویت معتبر ارسال نمی‌شود.
           const myDsaSec = getMyMLDSASecretKey(options.myUsername);
-          if (myDsaSec) {
-            try {
-              const signTarget = serializeMessageForSigning({
-                roomId,
-                step: stepIndex,
-                kemCipherB64,
-                ivB64,
-                cipherB64,
-              });
-              const sig = ml_dsa65.sign(signTarget, myDsaSec);
-              msgSigB64 = bufToBase64(sig);
-            } finally {
-              zeroizeBuffer(myDsaSec);
-            }
+          if (!myDsaSec) {
+            throw new E2EEError('Identity signing key unavailable: cannot sign a PQ message.');
+          }
+          let msgSigB64 = '';
+          try {
+            const signTarget = serializeMessageForSigning({
+              roomId,
+              step: stepIndex,
+              kemCipherB64,
+              ivB64,
+              cipherB64,
+            });
+            const sig = ml_dsa65.sign(signTarget, myDsaSec);
+            msgSigB64 = bufToBase64(sig);
+          } finally {
+            zeroizeBuffer(myDsaSec);
           }
 
           const payload = `${E2EE_PQ_RATCHET_PREFIX}${stepIndex}:${kemCipherB64}:${ivB64}:${cipherB64}${msgSigB64 ? `:${msgSigB64}` : ''}`;
@@ -1422,7 +1634,12 @@ export async function encryptMessageText(
 
       // تنزل صریح (نه خاموش) به ECDH کلاسیک در صورت فقدان کلیدهای پساکوانتومی مخاطب
       // توجه: در UI نشان PQ-KEM حذف شده و بنر هشدار غیر کوانتومی بودن نمایش داده می‌شود
-      const ecdhKey = await deriveECDHSharedAesKey(options.myUsername, options.peerPublicKey);
+      const ecdhKey = await deriveECDHSharedAesKey(
+        options.myUsername,
+        options.peerPublicKey,
+        roomId,
+        options.peerUsername
+      );
       if (ecdhKey) {
         const cipherBuffer = await window.crypto.subtle.encrypt(
           { name: 'AES-GCM', iv },
@@ -1436,7 +1653,12 @@ export async function encryptMessageText(
       }
     }
 
-    // ۳. در صورت تنظیم رمز دستی (PBKDF2 Override)
+    // ۳. در صورت تنظیم رمز دستی (PBKDF2 Override) — بدون رمز، خطا (F4/F5).
+    if (!manualSecret) {
+      throw new E2EEError(
+        'Cannot establish end-to-end encryption: no verified post-quantum peer bundle and no manual passphrase.'
+      );
+    }
     const pbkdfKey = await derivePbkdf2AesKey(roomId, manualSecret);
     const cipherBuffer = await window.crypto.subtle.encrypt(
       { name: 'AES-GCM', iv },
@@ -1449,8 +1671,10 @@ export async function encryptMessageText(
       savePersistentDecryptedMessage(options.myUsername, roomId, payloadHashKey, plainText);
     }
     return payload;
-  } catch {
-    return plainText;
+  } catch (err) {
+    // (رفع F5) شکست رمزنگاری هرگز به ارسال متن ساده منجر نمی‌شود.
+    if (err instanceof E2EEError) throw err;
+    throw new E2EEError(`Encryption failed: ${err instanceof Error ? err.message : 'unknown error'}`);
   }
 }
 
@@ -1464,6 +1688,10 @@ export async function decryptMessageText(
     customSecret?: string;
     sender?: string;
     groupMembers?: string[];
+    // allowCache=false یعنی «مسیر شبکه»: پیام تازه‌رسیده است و نباید از کش
+    // پیام‌های پیش‌تر رمزگشایی‌شده خوانده شود (ضد Replay — F7). مسیر نمایش
+    // (باز کردن دوبارهٔ اتاق، پیش‌نمایش فهرست) مقدار پیش‌فرض true را می‌گیرد.
+    allowCache?: boolean;
   }
 ): Promise<{
   text: string;
@@ -1480,9 +1708,14 @@ export async function decryptMessageText(
 
   try {
     const payloadHashKey = bufToBase64(sha256(new TextEncoder().encode(payload))).slice(0, 24);
+    const isOwnMessage = Boolean(
+      options?.sender && options?.myUsername && options.sender === options.myUsername
+    );
 
     // ۱. بررسی فوری در Persistent Local Cache برای پیام‌هایی که قبلاً با موفقیت رمزگشایی شده‌اند
-    if (options?.myUsername) {
+    // (رفع F7) در مسیر شبکه (allowCache=false) کش دور زده می‌شود؛ پیام خودِ
+    // فرستنده استثناست چون کلید گام‌های گذشته‌اش پس از ارسال حذف شده است.
+    if (options?.myUsername && (isOwnMessage || options.allowCache !== false)) {
       const persistent = getPersistentDecryptedCache(options.myUsername, roomId)[payloadHashKey];
       if (persistent) {
         const isPQ = payload.startsWith(E2EE_PQ_RATCHET_PREFIX);
@@ -1532,9 +1765,28 @@ export async function decryptMessageText(
         const isSender = Boolean(options.sender && options.sender === options.myUsername);
         const peerBundle = parsePeerKeyBundle(effectivePeerKey, options.peerUsername);
 
-        // اعتبارسنجی امضای هویت دیجیتال پساکوانتومی پیام با کلید عمومی ML-DSA-65 مخاطب
+        // (رفع F6) اعتبارسنجی امضای هویت دیجیتال پساکوانتومی پیام *پیش از*
+        // برقراری نشست یا رمزگشایی. کلید تأیید، کلید فرستنده است: برای پیام
+        // ورودی کلید ML-DSA-65 مخاطب، برای پیام خودم کلید ML-DSA-65 خودم.
+        // امضای نامعتبر همیشه رد می‌شود؛ نبود امضا وقتی فرستنده کلید ML-DSA
+        // دارد هم رد می‌شود (فرستنده‌های نسخه فعلی همیشه امضا می‌کنند).
+        const senderMldsaPub: Uint8Array | null = isSender
+          ? (getMyMLDSAPublicKey(options.myUsername)
+              ? base64ToBuf(getMyMLDSAPublicKey(options.myUsername) as string)
+              : null)
+          : peerBundle.mldsaPub;
         let mldsaVerified = false;
-        if (maybeSigB64 && peerBundle.mldsaPub) {
+        if (senderMldsaPub) {
+          if (!maybeSigB64) {
+            return {
+              text: '🔒 [پیام پساکوانتومی ML-KEM-768 - امضای هویت ML-DSA-65 ندارد]',
+              isEncrypted: true,
+              mode: 'PQ-MLKEM-RATCHET',
+              ratchetStep: msgStep,
+              mldsaVerified: false,
+              failed: true,
+            };
+          }
           try {
             const signData = serializeMessageForSigning({
               roomId,
@@ -1543,13 +1795,23 @@ export async function decryptMessageText(
               ivB64,
               cipherB64,
             });
-            mldsaVerified = ml_dsa65.verify(base64ToBuf(maybeSigB64), signData, peerBundle.mldsaPub);
+            mldsaVerified = ml_dsa65.verify(base64ToBuf(maybeSigB64), signData, senderMldsaPub);
           } catch {
             mldsaVerified = false;
           }
+          if (!mldsaVerified) {
+            return {
+              text: '🔒 [پیام پساکوانتومی ML-KEM-768 - امضای هویت ML-DSA-65 نامعتبر است]',
+              isEncrypted: true,
+              mode: 'PQ-MLKEM-RATCHET',
+              ratchetStep: msgStep,
+              mldsaVerified: false,
+              failed: true,
+            };
+          }
         }
 
-        const ratchetState = await ensurePQRatchetSession(
+        const rootState = await ensurePQRatchetSession(
           options.myUsername,
           roomId,
           effectivePeerKey,
@@ -1557,11 +1819,32 @@ export async function decryptMessageText(
           options.peerUsername
         );
 
-        if (ratchetState) {
-          // اگر پیام در کش محلی رم موجود است
-          if (ratchetState.decryptedCache && ratchetState.decryptedCache[payloadHashKey]) {
+        if (rootState) {
+          // پیام به کدام شکاف نشست تعلق دارد: فعلی یا قبلی (پس از چرخش)؟
+          let session = rootState;
+          if (rootState.kemCipherTextB64 !== kemCipherB64) {
+            if (rootState.previousSession?.kemCipherTextB64 === kemCipherB64) {
+              session = rootState.previousSession;
+            } else {
+              return {
+                text: '🔒 [پیام پساکوانتومی ML-KEM-768 - کپسول نشست ناشناخته است]',
+                isEncrypted: true,
+                mode: 'PQ-MLKEM-RATCHET',
+                ratchetStep: msgStep,
+                mldsaVerified,
+                failed: true,
+              };
+            }
+          }
+
+          // اگر پیام در کش محلی رم موجود است (فقط مسیر نمایش یا پیام خودم — F7)
+          if (
+            (isSender || options.allowCache !== false) &&
+            session.decryptedCache &&
+            session.decryptedCache[payloadHashKey]
+          ) {
             return {
-              text: ratchetState.decryptedCache[payloadHashKey],
+              text: session.decryptedCache[payloadHashKey],
               isEncrypted: true,
               mode: 'PQ-MLKEM-RATCHET',
               ratchetStep: msgStep,
@@ -1573,12 +1856,14 @@ export async function decryptMessageText(
           const plainText = await ratchetDecryptWithSkippedKeys(
             options.myUsername,
             roomId,
-            ratchetState,
+            rootState,
+            session,
             msgStep,
             iv,
             cipherBytes,
             payloadHashKey,
-            isSender
+            isSender,
+            options.allowCache
           );
 
           if (plainText !== null) {
@@ -1617,18 +1902,33 @@ export async function decryptMessageText(
       const groupId = roomId.replace('group__', '');
 
       const fsm = getGroupEpochState(groupId, options?.groupMembers || []);
-      let rootKeyBytes: Uint8Array;
 
-      // جستجو در Grace Buffer اپوک‌ها یا مشتق‌سازی تطبیقی برای اپوک همگام‌شده
-      if (fsm.epochs[msgEpoch]) {
-        rootKeyBytes = base64ToBuf(fsm.epochs[msgEpoch].rootKeyB64);
-      } else {
-        rootKeyBytes = deriveGroupEpochRootKey(
-          groupId,
-          msgEpoch,
-          membersHash,
-          getRoomSecret(roomId)
-        );
+      // (رفع F3) بدون کلید اپوک ذخیره‌شده، پیام قفل می‌ماند؛
+      // مشتق قطعی کلید از ورودی‌های عمومی حذف شد.
+      if (!fsm.epochs[msgEpoch]) {
+        return {
+          text: '🔒 [پیام گروهی - کلید اپوک در دسترس نیست]',
+          isEncrypted: true,
+          mode: 'GROUP-EPOCH-FSM',
+          epoch: msgEpoch,
+          failed: true,
+        };
+      }
+      const rootKeyBytes = base64ToBuf(fsm.epochs[msgEpoch].rootKeyB64);
+
+      // (رفع F7) Replay پیام گروهی: همان بار (اپوک + IV) نباید دو بار
+      // پذیرفته شود. مسیر نمایش پیامِ پیش‌تر رمزگشایی‌شده از کش خوانده
+      // می‌شود و به اینجا نمی‌رسد؛ رسیدن به اینجا یعنی تلاش تازه برای
+      // رمزگشایی همان بار.
+      const epochRec = fsm.epochs[msgEpoch];
+      if (epochRec.seenMessageKeys?.includes(payloadHashKey)) {
+        return {
+          text: '🔒 [پیام گروهی تکراری — Replay رد شد]',
+          isEncrypted: true,
+          mode: 'GROUP-EPOCH-FSM',
+          epoch: msgEpoch,
+          failed: true,
+        };
       }
 
       const msgKeyBytes = hkdf(
@@ -1658,6 +1958,13 @@ export async function decryptMessageText(
       if (options?.myUsername) {
         savePersistentDecryptedMessage(options.myUsername, roomId, payloadHashKey, plainText);
       }
+      // (رفع F7) ثبت بار تحویل‌شده تا Replay بعدی همین پیام رد شود.
+      if (!epochRec.seenMessageKeys) epochRec.seenMessageKeys = [];
+      epochRec.seenMessageKeys.push(payloadHashKey);
+      if (epochRec.seenMessageKeys.length > 500) {
+        epochRec.seenMessageKeys = epochRec.seenMessageKeys.slice(-500);
+      }
+      saveGroupEpochState(fsm);
 
       return {
         text: plainText,
@@ -1680,7 +1987,12 @@ export async function decryptMessageText(
     const cipherBytes = base64ToBuf(cipherB64);
 
     if (isEcdh && options?.myUsername && effectivePeerKey) {
-      const ecdhKey = await deriveECDHSharedAesKey(options.myUsername, effectivePeerKey);
+      const ecdhKey = await deriveECDHSharedAesKey(
+        options.myUsername,
+        effectivePeerKey,
+        roomId,
+        options.peerUsername
+      );
       if (ecdhKey) {
         const decryptedBuffer = await window.crypto.subtle.decrypt(
           { name: 'AES-GCM', iv: iv as unknown as BufferSource },
@@ -1699,12 +2011,27 @@ export async function decryptMessageText(
     }
 
     const manualSecret = options?.customSecret ?? getRoomSecret(roomId);
-    const pbkdfKey = await derivePbkdf2AesKey(roomId, manualSecret);
-    const decryptedBuffer = await window.crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: iv as unknown as BufferSource },
-      pbkdfKey,
-      cipherBytes as unknown as BufferSource
-    );
+    if (!manualSecret) {
+      // (رفع F4) بدون رمز دستی، پیام PBKDF2 قابل رمزگشایی نیست؛
+      // عبارت پیش‌فرض عمومی حذف شد.
+      throw new Error('Manual passphrase required for PBKDF2 message.');
+    }
+    // نخست با تعداد تکرار جدید، سپس با مقدار قدیمی (سازگاری با تاریخچه).
+    let decryptedBuffer: ArrayBuffer | null = null;
+    for (const iterations of [PBKDF2_ITERATIONS_NEW, PBKDF2_ITERATIONS_LEGACY]) {
+      try {
+        const pbkdfKey = await derivePbkdf2AesKey(roomId, manualSecret, iterations);
+        decryptedBuffer = await window.crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: iv as unknown as BufferSource },
+          pbkdfKey,
+          cipherBytes as unknown as BufferSource
+        );
+        break;
+      } catch {
+        decryptedBuffer = null;
+      }
+    }
+    if (!decryptedBuffer) throw new Error('PBKDF2 decrypt failed.');
     const text = new TextDecoder().decode(decryptedBuffer);
     if (options?.myUsername) {
       savePersistentDecryptedMessage(options.myUsername, roomId, payloadHashKey, text);
