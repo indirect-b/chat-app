@@ -10,13 +10,34 @@ import { v4 as uuidv4 } from 'uuid';
 import multer from 'multer';
 import { ristretto255_oprf } from '@noble/curves/ed25519.js';
 import { sha256 } from '@noble/hashes/sha2.js';
+import { hkdf } from '@noble/hashes/hkdf.js';
 import { config, verifyAdminSecret } from './src/server/config';
 import * as bale from './src/server/bale';
 import { pool, init } from './src/server/db';
 import { presence } from './src/server/presence';
 
 // کلید سرور برای پروتکل احراز هویت کور Ristretto255-VOPRF (RFC 9497)
-const voprfSeed = sha256(new TextEncoder().encode(config.ADMIN_PASSWORD + '::voprf-ristretto255-seed'));
+// (رفع F12) بذر اختصاصی VOPRF_SEED (۳۲ بایت Base64) در اولویت است؛ در غیاب
+// آن، مشتق HKDF از رمز مدیر با salt ثابت — نه یک SHA-256 مستقیم از رمز.
+function resolveVoprfSeed(): Uint8Array {
+  const envSeed = process.env.VOPRF_SEED;
+  if (envSeed) {
+    try {
+      const decoded = new Uint8Array(Buffer.from(envSeed, 'base64'));
+      if (decoded.length === 32) return decoded;
+    } catch {
+      // fall through to HKDF derivation
+    }
+  }
+  return hkdf(
+    sha256,
+    new TextEncoder().encode(config.ADMIN_PASSWORD),
+    new TextEncoder().encode('PersianMessenger-VOPRF-Seed-Salt-v2'),
+    new TextEncoder().encode('PersianMessenger-Ristretto255-VOPRF-v2'),
+    32
+  );
+}
+const voprfSeed = resolveVoprfSeed();
 const serverVoprfKeys = ristretto255_oprf.voprf.deriveKeyPair(
   voprfSeed,
   new TextEncoder().encode('PersianMessenger-Ristretto255-VOPRF-v2')
@@ -335,8 +356,9 @@ app.post('/api/voprf/evaluate', (req: Request, res: Response) => {
       proofB64: Buffer.from(proof).toString('base64'),
       serverPublicKeyB64: Buffer.from(serverVoprfKeys.publicKey).toString('base64'),
     });
-  } catch (e: any) {
-    res.status(400).json({ ok: false, msg: e.message });
+  } catch {
+    // (رفع F12) پیام خطای داخلی به بیرون درز نمی‌کند.
+    res.status(400).json({ ok: false });
   }
 });
 
@@ -353,6 +375,12 @@ app.get('/api/user/:username', async (req: Request, res: Response) => {
 app.post('/api/user/public-key', async (req: Request, res: Response) => {
   const { username, publicKey } = req.body;
   if (!username || !publicKey) return res.json({ ok: false });
+  // (رفع F2) فقط خود کاربر با نشست معتبر می‌تواند باندل خودش را منتشر کند؛
+  // در غیر این صورت هر کسی می‌توانست باندل هر کاربری را جایگزین کند.
+  const sessionUser = getSessionUsername(req);
+  if (!sessionUser || sessionUser !== username) {
+    return res.status(401).json({ ok: false, msg: 'unauthorized' });
+  }
   await pool.query('UPDATE users SET public_key=$1 WHERE username=$2', [publicKey, username]);
 
   // اطلاع‌رسانی کلید عمومی جدید به مخاطبان آنلاین برای رمزنگاری خودکار ECDH
@@ -425,6 +453,61 @@ app.get('/api/groups/:username', async (req: Request, res: Response) => {
       members: JSON.parse(g.members),
     })),
   });
+});
+
+// ===== GROUP EPOCH KEY PACKETS (F3) =====
+// بسته کلید اپوک گروه: توزیع‌کننده (سازنده گروه) کلید تصادفی اپوک را با
+// ML-KEM-768 به هر عضو کپسوله می‌کند؛ سرور فقط کپسول‌ها را نگه می‌دارد و
+// جابه‌جا می‌کند و کلید را نمی‌بیند.
+app.post('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
+  const sessionUser = getSessionUsername(req);
+  if (!sessionUser) return res.status(401).json({ ok: false });
+  const { epoch, keys } = req.body as { epoch?: unknown; keys?: unknown };
+  if (typeof epoch !== 'number' || !Number.isInteger(epoch) || epoch < 1) {
+    return res.json({ ok: false, msg: 'invalid epoch' });
+  }
+  if (!keys || typeof keys !== 'object' || Array.isArray(keys)) {
+    return res.json({ ok: false, msg: 'invalid keys' });
+  }
+  for (const [u, ct] of Object.entries(keys as Record<string, unknown>)) {
+    if (typeof u !== 'string' || !u || typeof ct !== 'string' || !/^[A-Za-z0-9+/=]+$/.test(ct)) {
+      return res.json({ ok: false, msg: 'invalid key entry' });
+    }
+  }
+  const { rows } = await pool.query('SELECT * FROM groups WHERE id = $1', [req.params.id]);
+  if (!rows.length) return res.json({ ok: false, msg: 'group not found' });
+  const members: string[] = JSON.parse(rows[0].members);
+  if (!members.includes(sessionUser)) return res.status(403).json({ ok: false });
+  const packet = { epoch, keys, postedBy: sessionUser, postedAt: new Date().toISOString() };
+  await setSetting(`group_epoch_packet_${req.params.id}`, JSON.stringify(packet));
+  // پخش فوری به اعضای آنلاین
+  members.forEach(m => {
+    presence.emitToUser(io, m, 'group-epoch-rotated', {
+      groupId: req.params.id,
+      name: rows[0].name,
+      epoch,
+      members,
+      epochKeys: keys,
+    });
+  });
+  res.json({ ok: true });
+});
+
+app.get('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
+  const sessionUser = getSessionUsername(req);
+  if (!sessionUser) return res.status(401).json({ ok: false });
+  const { rows } = await pool.query('SELECT * FROM groups WHERE id = $1', [req.params.id]);
+  if (!rows.length) return res.json({ ok: false });
+  const members: string[] = JSON.parse(rows[0].members);
+  if (!members.includes(sessionUser)) return res.status(403).json({ ok: false });
+  const raw = await getSetting(`group_epoch_packet_${req.params.id}`);
+  if (!raw) return res.json({ ok: false });
+  try {
+    const packet = JSON.parse(raw);
+    res.json({ ok: true, epoch: packet.epoch, keys: packet.keys });
+  } catch {
+    res.json({ ok: false });
+  }
 });
 
 // ===== REPORT =====
@@ -634,6 +717,11 @@ app.delete('/api/admin/message', async (req: Request, res: Response) => {
 app.post('/api/create-group', async (req: Request, res: Response) => {
   const { name, members, creator } = req.body;
   if (!name || !name.trim()) return res.json({ ok: false, msg: 'نام گروه را وارد کنید' });
+  // (رفع F2) فقط کاربر واردشده می‌تواند گروهی به نام خودش بسازد.
+  const sessionUser = getSessionUsername(req);
+  if (!sessionUser || sessionUser !== creator) {
+    return res.status(401).json({ ok: false });
+  }
   const memberList = Array.isArray(members) ? members : [];
   const allMembers = Array.from(new Set([creator, ...memberList].filter(Boolean)));
   const groupId = uuidv4();
@@ -880,7 +968,14 @@ io.on('connection', async (socket) => {
     // ignore
   }
 
-  socket.on('auth', async (username: string) => {
+  socket.on('auth', async (authData: string | { username?: string; token?: string }) => {
+    // (رفع F2) احراز هویت سوکت باید با توکن نشست معتبر باشد؛
+    // نام کاربریِ تنها قابل جعل است (جعل حضور و دریافت پیام‌های دیگران).
+    const username = typeof authData === 'string' ? authData : authData?.username;
+    const token = typeof authData === 'string' ? undefined : authData?.token;
+    if (!username || !token) return;
+    const session = userSessions[token];
+    if (!session || session.username !== username || Date.now() > session.expire) return;
     if (await isUserBlocked(username)) {
       const { rows } = await pool.query(
         'SELECT block_reason, block_type, block_until FROM users WHERE username=$1',

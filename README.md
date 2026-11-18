@@ -49,7 +49,7 @@ chat-app was designed from the start for hostile networks and a post-quantum fut
 - **Group Epoch FSM** — membership changes rotate group keys without losing in-flight messages
 - Typing indicators, presence, reactions, message edit/delete/pin/forward, read receipts
 - Voice notes & file attachments up to **50 MB**, processed off the main thread in Web Workers
-- PBKDF2 room passphrases (100,000 iterations)
+- PBKDF2 room passphrases (600,000 iterations; pre-hardening rooms used 50,000 and stay readable)
 - Stealth admin dashboard at an obfuscated, server-side-only path (timing-safe auth)
 - Dual-mode persistence: **PostgreSQL** when configured, otherwise an atomic, mutex-guarded JSON store
 - Hybrid media storage so uploads survive container redeploys on Render / Railway / Docker
