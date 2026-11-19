@@ -2,7 +2,16 @@
 
 ---
 
-## 🌟 v6.0 (Latest) — Invention & Full Implementation of the **Post-Quantum Multi-Party Ratchet with Blinded Authentication (`PQ-MPRBA`)**
+## v6.1.0 (Latest) — Hardening round 2
+- Keys moved from localStorage to IndexedDB (v4 keystore); ECDH P-256 is non-extractable. ML-KEM/ML-DSA keys are stored AES-GCM-wrapped — WebCrypto has no native key objects for them yet.
+- Strict CSP: no `unsafe-inline`, no unpinned CDN. Admin/error pages self-hosted.
+- NIST KAT vectors (ML-KEM-768, ML-DSA-65), fuzz tests (490+ inputs, fail closed), benchmarks. 31/31 tests pass.
+- Bale fallback: one-time recovery codes (scrypt hash, rate-limited), health probe, `GET /api/health`.
+- Docs: SECURITY.md, THREAT_MODEL.md, AUDIT_STATUS.md, DEPLOYMENT.md, CONTRIBUTING.md.
+- Verification fix: the round-2 export was built on a pre-round-1 baseline and had reverted 7 round-1 fixes (auth checks, epoch keys, default passphrase, replay tracking, rotation, HKDF, VOPRF seed). All restored + regression tests. Also fixed a latent bug where group creation never sent its auth token.
+- Known limits: multi-device docs only; rotation has no previous-session slot; no live HTTP test yet; no independent audit.
+
+## 🌟 v6.0 — Invention & Full Implementation of the **Post-Quantum Multi-Party Ratchet with Blinded Authentication (`PQ-MPRBA`)**
 
 ### 1. Groundbreaking Original Cryptographic Architecture (First-of-its-Kind Browser Protocol)
 In **v6.0**, we did not merely assemble standard off-the-shelf patterns—we **conceived, architected, and engineered from scratch a completely original, unprecedented browser-native cryptographic protocol (`PQ-MPRBA`: Post-Quantum Multi-Party Ratchet with Blinded Authentication)** that did not previously exist in any web messenger. Even major industry platforms (such as Signal or Telegram Web) have not deployed a unified, pure client-side **Post-Quantum Lattice Multi-Party Ratchet combined with Zero-Knowledge Verifiable Oblivious Pseudorandom Blinded Authentication**.
