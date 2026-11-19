@@ -31,6 +31,15 @@ import {
   EMAIL_OTP_MAX_REQUESTS_PER_HOUR,
   EMAIL_OTP_REQUEST_WINDOW_MS,
 } from './src/server/email';
+import { verifiedMarks } from './src/server/verified';
+import {
+  getGoogleClientId,
+  isGoogleConfigured,
+  verifyGoogleIdToken,
+  GOOGLE_DISABLED_MSG,
+  GOOGLE_LOGIN_FAILED_MSG,
+} from './src/server/google';
+import { PRIVACY_HTML } from './src/server/privacy';
 
 const APP_VERSION = '6.1.0';
 const recoverRateLimiter = new RecoveryRateLimiter(5, 15 * 60 * 1000);
@@ -86,7 +95,7 @@ app.use(
       useDefaults: false,
       directives: {
         defaultSrc: ["'self'"],
-        scriptSrc: ["'self'"],
+        scriptSrc: ["'self'", 'https://accounts.google.com'],
         styleSrc: ["'self'"],
         fontSrc: ["'self'", 'data:'],
         imgSrc: ["'self'", 'data:', 'blob:'],
@@ -94,7 +103,9 @@ app.use(
         connectSrc: [
           "'self'",
           'wss://chatapp-server-1i2a.onrender.com',
+          'https://accounts.google.com',
         ],
+        frameSrc: ["'self'", 'https://accounts.google.com'],
         objectSrc: ["'none'"],
         baseUri: ["'self'"],
         formAction: ["'self'"],
@@ -307,6 +318,12 @@ app.get('/api/media/:id', async (req: Request, res: Response) => {
   return res.status(404).send('Media not found');
 });
 
+// ===== PUBLIC CLIENT CONFIG (Google Client ID is public, not a secret) =====
+app.get('/api/config', (_req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
+  res.json({ googleClientId: getGoogleClientId() });
+});
+
 // ===== HEALTH CHECK (Bale API + DB telemetry) =====
 app.get('/api/health', async (_req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
@@ -376,6 +393,10 @@ app.post('/api/verify-otp', async (req: Request, res: Response) => {
   if (otp.code !== code) return res.json({ ok: false, msg: 'کد اشتباه است' });
   delete otps[key];
 
+  // (ثبت‌نام مقید به اثبات مالکیت) مالکیت این آیدی اثبات شد؛ /api/register
+  // فقط با همین نشانه‌ی یک‌بارمصرف و ۱۰ دقیقه‌ای اجازه‌ی ساخت حساب می‌دهد.
+  verifiedMarks.mark(key);
+
   const sessionToken = uuidv4();
   userSessions[sessionToken] = {
     username: key,
@@ -440,6 +461,10 @@ app.post('/api/verify-email-otp', async (req: Request, res: Response) => {
   if (outcome === 'wrong') return res.json({ ok: false, msg: 'کد اشتباه است' });
   delete otps[key];
 
+  // (ثبت‌نام مقید به اثبات مالکیت) مالکیت این ایمیل اثبات شد؛ /api/register
+  // فقط با همین نشانه‌ی یک‌بارمصرف و ۱۰ دقیقه‌ای اجازه‌ی ساخت حساب می‌دهد.
+  verifiedMarks.mark(email);
+
   if (await isUserBlocked(email)) {
     return res.status(403).json({ ok: false, msg: 'این حساب مسدود شده است.' });
   }
@@ -454,6 +479,56 @@ app.post('/api/verify-email-otp', async (req: Request, res: Response) => {
   res.json({ ok: true, isNew: rows.length === 0, username: email, sessionToken });
 });
 
+// ===== GOOGLE SIGN-IN (primary login; env-gated) =====
+app.post('/api/google-login', async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
+  if (!isGoogleConfigured()) return res.json({ ok: false, msg: GOOGLE_DISABLED_MSG });
+  const idToken = String((req.body || {}).idToken || '').trim();
+  if (!idToken) return res.json({ ok: false, msg: GOOGLE_LOGIN_FAILED_MSG });
+
+  // توکن ID گوگل سمت سرور با کلیدهای گوگل بررسی می‌شود؛ در هر خطایی
+  // (امضای نامعتبر، audience اشتباه، توکن منقضی، ایمیل تأییدنشده) پیام
+  // کلی برمی‌گردد و هیچ جزئیاتی به بیرون درز نمی‌کند.
+  let email: string;
+  try {
+    email = await verifyGoogleIdToken(idToken);
+  } catch {
+    return res.json({ ok: false, msg: GOOGLE_LOGIN_FAILED_MSG });
+  }
+
+  if (await isUserBlocked(email)) {
+    return res.status(403).json({ ok: false, msg: 'این حساب مسدود شده است.' });
+  }
+
+  // گوگل خودش مالکیت ایمیل را اثبات کرده است؛ کاربر تازه اتمیک ساخته
+  // می‌شود (بدون عبور از /api/register) و کد بازیابی فقط همین‌بار نمایش داده می‌شود.
+  const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [email]);
+  let recoveryCode: string | undefined;
+  const isNew = rows.length === 0;
+  if (isNew) {
+    recoveryCode = generateRecoveryCode();
+    const recoveryCodeHash = await hashRecoveryCode(recoveryCode);
+    await pool.query(
+      'INSERT INTO users (username, bale_chat_id, joined_at, recovery_code_hash, email) VALUES ($1, $2, $3, $4, $5)',
+      [email, null, new Date().toISOString(), recoveryCodeHash, email]
+    );
+  }
+
+  const sessionToken = uuidv4();
+  userSessions[sessionToken] = {
+    username: email,
+    expire: Date.now() + 7 * 24 * 60 * 60 * 1000,
+  };
+
+  res.json({
+    ok: true,
+    isNew,
+    username: email,
+    sessionToken,
+    ...(recoveryCode ? { recoveryCode } : {}),
+  });
+});
+
 app.post('/api/register', async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
   const { baleId, email: rawEmail } = req.body || {};
@@ -463,6 +538,11 @@ app.post('/api/register', async (req: Request, res: Response) => {
     const email = validateEmail(rawEmail);
     if (!email) return res.status(400).json({ ok: false, msg: 'ایمیل معتبر وارد کنید.' });
     if (!isEmailConfigured()) return res.json({ ok: false, msg: EMAIL_DISABLED_MSG });
+    // (ثبت‌نام مقید به اثبات مالکیت) بدون نشانه‌ی زنده‌ی تأیید OTP که
+    // /api/verify-email-otp صادر کرده، ثبت‌نام ممکن نیست؛ نشانه تک‌مصرف است.
+    if (!verifiedMarks.consume(email)) {
+      return res.status(403).json({ ok: false, msg: 'ابتدا کد تأیید را وارد کن' });
+    }
     const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [email]);
     if (rows.length) return res.json({ ok: false, msg: 'این حساب قبلاً ثبت‌نام کرده' });
 
@@ -476,9 +556,14 @@ app.post('/api/register', async (req: Request, res: Response) => {
     return res.json({ ok: true, username: email, recoveryCode });
   }
 
-  // --- Bale registration (unchanged) ---
+  // --- Bale registration (ownership-bound: requires a live verified mark) ---
   const key = String(baleId || '').toLowerCase().replace('@', '').trim();
   if (!key) return res.status(400).json({ ok: false, msg: 'آیدی بله نامعتبر است' });
+  // (ثبت‌نام مقید به اثبات مالکیت) بدون نشانه‌ی زنده‌ی تأیید OTP که
+  // /api/verify-otp صادر کرده، ثبت‌نام ممکن نیست؛ نشانه تک‌مصرف است.
+  if (!verifiedMarks.consume(key)) {
+    return res.status(403).json({ ok: false, msg: 'ابتدا کد تأیید را وارد کن' });
+  }
   const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [key]);
   if (rows.length) return res.json({ ok: false, msg: 'این حساب قبلاً ثبت‌نام کرده' });
 
@@ -1174,6 +1259,16 @@ app.get('/sitemap.xml', (req: Request, res: Response) => {
   res.send(
     `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url>\n    <loc>${baseUrl}/</loc>\n    <changefreq>weekly</changefreq>\n    <priority>1.0</priority>\n  </url>\n</urlset>\n`
   );
+});
+
+// Privacy policy (public page, required e.g. by the Google OAuth consent
+// screen). Plain HTML document, no scripts/styles/external resources, so it
+// renders under the strict CSP. Defined here, before the SPA fallback, so a
+// direct visit to /privacy returns the policy in both dev and production.
+app.get('/privacy', (_req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.send(PRIVACY_HTML);
 });
 
 // ===== SOCKET.IO =====
