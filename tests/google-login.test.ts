@@ -1,62 +1,63 @@
 /**
  * Google Sign-In — pure-function tests.
  *
- * No network, no credentials, no Google calls: the verified-marks
- * store (registration binding fix) and the Google ID-token verification
- * wrapper (with a fake verifier standing in for Google's OAuth2Client).
+ * No network, no credentials, no Google calls: the email validation
+ * helper (moved here from the deleted email module — Google Sign-In
+ * uses it to normalize the verified address) and the Google ID-token
+ * verification wrapper (with a fake verifier standing in for Google's
+ * OAuth2Client).
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  VerifiedMarks,
-  VERIFIED_MARK_EXPIRE_MS,
-} from '../src/server/verified';
-import {
   getGoogleClientId,
   isGoogleConfigured,
+  validateEmail,
   verifyGoogleIdToken,
 } from '../src/server/google';
 
-describe('VerifiedMarks (registration requires a live verified mark)', () => {
-  it('consume fails when no mark was ever set (register must refuse)', () => {
-    const marks = new VerifiedMarks();
-    assert.equal(marks.consume('someuser'), false);
-    assert.equal(marks.consume('user@example.com'), false);
-  });
-
-  it('consume succeeds once after a mark, then the mark is gone (single-use)', () => {
-    const marks = new VerifiedMarks();
-    marks.mark('someuser', 1_000_000);
-    assert.equal(marks.consume('someuser', 1_000_000 + 1000), true);
-    // Second consume fails: the mark was consumed by the first one.
-    assert.equal(marks.consume('someuser', 1_000_000 + 2000), false);
-  });
-
-  it('an expired mark does not verify, even for the right identifier', () => {
-    const marks = new VerifiedMarks();
-    marks.mark('user@example.com', 1_000_000);
+describe('validateEmail', () => {
+  it('accepts normal addresses and normalizes case/whitespace', () => {
+    assert.equal(validateEmail('User@Example.com'), 'user@example.com');
     assert.equal(
-      marks.consume('user@example.com', 1_000_000 + VERIFIED_MARK_EXPIRE_MS + 1),
-      false
+      validateEmail('  name.surname+tag@sub.domain.co  '),
+      'name.surname+tag@sub.domain.co'
     );
+    assert.equal(validateEmail('a@b.co'), 'a@b.co');
   });
 
-  it('marks are per-identifier: one user’s mark does not verify another', () => {
-    const marks = new VerifiedMarks();
-    marks.mark('alice@example.com', 1_000_000);
-    assert.equal(marks.consume('bob@example.com', 1_000_000 + 1000), false);
-    assert.equal(marks.consume('alice@example.com', 1_000_000 + 1000), true);
-  });
-
-  it('re-marking refreshes the expiry window', () => {
-    const marks = new VerifiedMarks();
-    marks.mark('someuser', 1_000_000);
-    marks.mark('someuser', 1_000_000 + VERIFIED_MARK_EXPIRE_MS - 1000);
-    assert.equal(
-      marks.consume('someuser', 1_000_000 + VERIFIED_MARK_EXPIRE_MS + 500),
-      true
-    );
+  it('rejects malformed addresses', () => {
+    const bad: unknown[] = [
+      '',
+      '   ',
+      'plainaddress',
+      '@no-local.com',
+      'user@',
+      'user@domain',
+      'user@domain.',
+      'user..dots@example.com',
+      '.user@example.com',
+      'user.@example.com',
+      'user@exam ple.com',
+      'user@example.c',
+      'user@example.123',
+      'user@@example.com',
+      'üser@example.com',
+      'user@-example.com',
+      'user@example-.com',
+      'user@.example.com',
+      'user@example.com.',
+      'a'.repeat(250) + '@example.com',
+      null,
+      undefined,
+      42,
+      {},
+      ['a@b.co'],
+    ];
+    for (const input of bad) {
+      assert.equal(validateEmail(input), null, JSON.stringify(input));
+    }
   });
 });
 
