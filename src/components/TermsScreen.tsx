@@ -27,7 +27,7 @@ export const TermsScreen: React.FC<TermsScreenProps> = ({ onNavigate }) => {
     null
   );
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const [deleteOtp, setDeleteOtp] = useState('');
+  const [deleteRecoveryCode, setDeleteRecoveryCode] = useState('');
 
   const navigateTo = (path: string, e?: React.MouseEvent) => {
     if (e) e.preventDefault();
@@ -79,35 +79,23 @@ export const TermsScreen: React.FC<TermsScreenProps> = ({ onNavigate }) => {
     }
   };
 
-  const handleRequestDeleteOtp = async () => {
+  // Account deletion is confirmed with the one-time recovery code
+  // (the Bale OTP channel is gone). The code is verified server-side
+  // against the stored scrypt hash; accounts created before recovery
+  // codes existed have no hash and are deleted on the session alone.
+  const handleRequestDelete = async () => {
     if (!sessionUser || !sessionToken) {
       setActionStatus({ text: 'نشست کاربری معتبر نیست. لطفاً دوباره وارد شوید.', isError: true });
       return;
     }
     setConfirmDelete(true);
-    try {
-      const res = await fetch('/api/send-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ baleId: sessionUser }),
-      }).then(r => r.json());
-      if (res.ok) {
-        setActionStatus({
-          text: res.msg || 'کد تأیید برای حذف حساب به بله شما ارسال شد.',
-        });
-      } else {
-        setActionStatus({ text: res.msg || 'خطا در ارسال کد تأیید.', isError: true });
-      }
-    } catch {
-      setActionStatus({ text: 'خطا در ارتباط با سرور.', isError: true });
-    }
   };
 
   const handleDeleteAccount = async () => {
     if (!sessionUser || !sessionToken) return;
-    const cleanOtp = deleteOtp.trim();
-    if (!/^\d{6}$/.test(cleanOtp)) {
-      setActionStatus({ text: 'لطفاً کد تأیید ۶ رقمی را وارد کنید.', isError: true });
+    const cleanCode = deleteRecoveryCode.trim();
+    if (!cleanCode) {
+      setActionStatus({ text: 'لطفاً کد بازیابی یک‌بارمصرف خود را وارد کنید.', isError: true });
       return;
     }
     try {
@@ -117,7 +105,7 @@ export const TermsScreen: React.FC<TermsScreenProps> = ({ onNavigate }) => {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${sessionToken}`,
         },
-        body: JSON.stringify({ otp: cleanOtp }),
+        body: JSON.stringify({ code: cleanCode }),
       }).then(r => r.json());
 
       if (res.ok) {
@@ -129,12 +117,12 @@ export const TermsScreen: React.FC<TermsScreenProps> = ({ onNavigate }) => {
         }
         setSessionUser('');
         setSessionToken('');
-        setDeleteOtp('');
+        setDeleteRecoveryCode('');
         setConfirmDelete(false);
         setActionStatus({ text: 'حساب کاربری و داده‌های شما به طور کامل حذف شد.' });
       } else {
         setActionStatus({
-          text: res.msg || 'کد تأیید نامعتبر یا منقضی است.',
+          text: res.msg || 'کد بازیابی نامعتبر است.',
           isError: true,
         });
       }
@@ -200,8 +188,8 @@ export const TermsScreen: React.FC<TermsScreenProps> = ({ onNavigate }) => {
             <section>
               <h2 className="terms-section-title">۴. حفاظت از حساب کاربری:</h2>
               <p className="terms-section-desc">
-                مسئولیت حفظ امنیت حساب بر عهده کاربر است. هرگز کد تأیید یک‌بارمصرف (OTP) دریافتی در
-                بله یا کلیدهای امنیتی خود را در اختیار دیگران قرار ندهید.
+                مسئولیت حفظ امنیت حساب بر عهده کاربر است. هرگز کد بازیابی یک‌بارمصرف خود را در
+                اختیار دیگران قرار ندهید.
               </p>
             </section>
             <section>
@@ -231,7 +219,7 @@ export const TermsScreen: React.FC<TermsScreenProps> = ({ onNavigate }) => {
             {sessionUser && sessionToken ? (
               <div className="data-rights-actions">
                 <p className="data-rights-user">
-                  حساب فعال: <bdi dir="ltr">@{sessionUser}</bdi>
+                  حساب فعال: <bdi dir="ltr">{sessionUser}</bdi>
                 </p>
                 <div className="data-rights-btn-row">
                   <button
@@ -245,25 +233,33 @@ export const TermsScreen: React.FC<TermsScreenProps> = ({ onNavigate }) => {
                     <button
                       type="button"
                       className="btn-danger-outline"
-                      onClick={handleRequestDeleteOtp}
+                      onClick={handleRequestDelete}
                     >
                       🗑️ حذف دائمی حساب کاربری
                     </button>
                   ) : (
                     <>
-                      <label htmlFor="deleteOtpInput" className="sr-only">
-                        کد تأیید ۶ رقمی حذف حساب
+                      <label htmlFor="deleteRecoveryCodeInput" className="sr-only">
+                        کد بازیابی یک‌بارمصرف حذف حساب
                       </label>
                       <input
-                        id="deleteOtpInput"
+                        id="deleteRecoveryCodeInput"
                         type="text"
-                        inputMode="numeric"
-                        maxLength={6}
                         dir="ltr"
-                        placeholder="کد تأیید ۶ رقمی"
-                        value={deleteOtp}
-                        onChange={e => setDeleteOtp(e.target.value)}
+                        maxLength={39}
+                        placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"
+                        value={deleteRecoveryCode}
+                        onChange={e => setDeleteRecoveryCode(e.target.value)}
+                        style={{
+                          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                          fontSize: '13px',
+                          textAlign: 'center',
+                        }}
                       />
+                      <p className="terms-section-note">
+                        برای تأیید حذف، کد بازیابی یک‌بارمصرف خود را وارد کنید (همان کدی که هنگام
+                        ورود دریافت کردید).
+                      </p>
                       <button
                         type="button"
                         className="btn-danger-confirm"

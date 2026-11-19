@@ -5,8 +5,9 @@
  * facts the code actually implements (sign-in identifiers, E2E-encrypted
  * messages, salted recovery-code hash, Google sharing email + name,
  * Render storage, in-app account deletion, contact email) and contains
- * no scripts, no styles and no external resources (it must render under
- * the strict CSP: styleSrc 'self', no unsafe-inline).
+ * no scripts and no external resources. Presentation is one inline
+ * <style> block only (system fonts, no external resources) — the route
+ * sets a page-specific CSP allowing inline styles and nothing else.
  */
 
 import { describe, it } from 'node:test';
@@ -56,11 +57,14 @@ describe('privacy policy page', () => {
     assert.ok(PRIVACY_HTML.includes('indirectnebula6@gmail.com'));
   });
 
-  it('contains no scripts, no styles and no external resources (CSP-safe)', () => {
+  it('contains no scripts and no external resources (CSP-safe); presentation is one inline <style> block only', () => {
     assert.ok(!/<script/i.test(PRIVACY_HTML), 'must not contain <script>');
-    assert.ok(!/<style/i.test(PRIVACY_HTML), 'must not contain <style>');
+    assert.ok(/<style>/i.test(PRIVACY_HTML), 'must contain one inline <style> block');
+    assert.equal((PRIVACY_HTML.match(/<style>/gi) || []).length, 1, 'exactly one <style> block');
     assert.ok(!/style\s*=/i.test(PRIVACY_HTML), 'must not contain inline style attributes');
     assert.ok(!/src\s*=\s*"https?:/i.test(PRIVACY_HTML), 'must not load external scripts');
     assert.ok(!/href\s*=\s*"https?:/i.test(PRIVACY_HTML), 'must not link external stylesheets');
+    assert.ok(!/url\s*\(/i.test(PRIVACY_HTML), 'must not reference external resources from CSS');
+    assert.ok(!/@import/i.test(PRIVACY_HTML), 'must not @import anything');
   });
 });

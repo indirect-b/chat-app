@@ -1,5 +1,33 @@
 import { OAuth2Client, type TokenPayload } from 'google-auth-library';
-import { validateEmail } from './email';
+
+/**
+ * Strict email validation. Returns the normalized (trimmed, lowercased)
+ * address, or null when the input is not a plausible deliverable address.
+ * (Moved here from the deleted src/server/email.ts — Google Sign-In
+ * needs it to normalize the verified address from the ID token.)
+ */
+export function validateEmail(input: unknown): string | null {
+  if (typeof input !== 'string') return null;
+  const email = input.trim().toLowerCase();
+  if (email.length < 3 || email.length > 254) return null;
+  const at = email.indexOf('@');
+  if (at <= 0 || at !== email.lastIndexOf('@')) return null;
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  if (!local || !domain) return null;
+  if (local.length > 64 || domain.length > 253) return null;
+  if (!/^[a-z0-9._%+-]+$/.test(local)) return null;
+  if (local.startsWith('.') || local.endsWith('.') || local.includes('..')) return null;
+  if (!/^[a-z0-9.-]+$/.test(domain)) return null;
+  if (domain.startsWith('.') || domain.endsWith('.') || domain.includes('..')) return null;
+  if (domain.startsWith('-') || domain.endsWith('-')) return null;
+  const labels = domain.split('.');
+  if (labels.length < 2) return null;
+  if (labels.some(l => l.length === 0 || l.startsWith('-') || l.endsWith('-'))) return null;
+  const tld = labels[labels.length - 1];
+  if (!/^[a-z]{2,}$/.test(tld)) return null;
+  return email;
+}
 
 /**
  * Google Sign-In (primary login).
@@ -11,8 +39,8 @@ import { validateEmail } from './email';
  * public by design (it is also embedded in the login page).
  *
  * Env-gated: GOOGLE_CLIENT_ID must be set, otherwise the Google
- * endpoints refuse with a "not enabled" message and the Bale / email
- * flows are completely untouched.
+ * endpoints refuse with a "not enabled" message. Google Sign-In is
+ * the only login method — the Bale / email OTP flows were removed.
  */
 
 export const GOOGLE_DISABLED_MSG = 'ورود با گوگل فعلاً فعال نیست';
@@ -74,4 +102,78 @@ export async function verifyGoogleIdToken(
   const normalized = validateEmail(email);
   if (!normalized) throw new Error('invalid_email');
   return normalized;
+}
+
+// ---------------------------------------------------------------------------
+// Redirect mode (ux_mode 'redirect'): Google POSTs the credential as a
+// form to /api/google-redirect instead of returning it to a popup.
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse the `g_csrf_token` cookie Google Identity Services sets on the
+ * app's own domain. Minimal parsing — no cookie library. Returns null
+ * when the cookie is absent.
+ */
+export function parseGoogleCsrfCookie(cookieHeader: string | undefined): string | null {
+  if (!cookieHeader) return null;
+  for (const part of cookieHeader.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() === 'g_csrf_token') {
+      const value = part.slice(eq + 1).trim();
+      return value || null;
+    }
+  }
+  return null;
+}
+
+/** Outcome of the redirect-request gate (decided before any token is issued). */
+export type GoogleRedirectGate = 'ok' | 'bad_request' | 'forbidden';
+
+/**
+ * Gate a redirect-mode login request. Missing credential is a malformed
+ * request (400); a missing or mismatched CSRF token fails closed (403).
+ * Pure — the handler maps the result to the HTTP status.
+ */
+export function checkGoogleRedirectRequest(input: {
+  credential: string;
+  csrfField: string;
+  csrfCookie: string | null;
+}): GoogleRedirectGate {
+  if (!input.credential.trim()) return 'bad_request';
+  if (!input.csrfField || !input.csrfCookie || input.csrfField !== input.csrfCookie) {
+    return 'forbidden';
+  }
+  return 'ok';
+}
+
+/**
+ * Build the post-login redirect target. The session token rides in the
+ * URL only for this one hop (the client stores it and strips it from
+ * the address bar at once). The recovery code NEVER appears here — it
+ * is fetched once via POST /api/recovery-code-once.
+ */
+export function buildGoogleRedirectUrl(sessionToken: string, isNew: boolean): string {
+  return `/?session=${encodeURIComponent(sessionToken)}${isNew ? '&new=1' : ''}`;
+}
+
+/**
+ * One-time pending recovery codes for redirect logins. A new redirect
+ * login stores its code here keyed by session token; the client fetches
+ * it exactly once (take deletes the entry, so a second fetch finds
+ * nothing) and expired entries return nothing.
+ */
+export class PendingRecoveryCodes {
+  private readonly codes = new Map<string, { code: string; expire: number }>();
+
+  store(sessionToken: string, code: string, nowMs: number, ttlMs = 10 * 60 * 1000): void {
+    this.codes.set(sessionToken, { code, expire: nowMs + ttlMs });
+  }
+
+  take(sessionToken: string, nowMs: number): string | undefined {
+    const pending = this.codes.get(sessionToken);
+    this.codes.delete(sessionToken);
+    if (!pending || nowMs > pending.expire) return undefined;
+    return pending.code;
+  }
 }

@@ -21,23 +21,17 @@ import {
   generateRecoveryCode,
   hashRecoveryCode,
   verifyRecoveryCode,
+  canDeleteWithCode,
   RecoveryRateLimiter,
 } from './src/server/recovery';
-import {
-  validateEmail,
-  generateEmailOtp,
-  isEmailConfigured,
-  sendEmailOtp,
-  createEmailOtpRecord,
-  verifyEmailOtpAttempt,
-  EMAIL_OTP_MAX_REQUESTS_PER_HOUR,
-  EMAIL_OTP_REQUEST_WINDOW_MS,
-} from './src/server/email';
-import { verifiedMarks } from './src/server/verified';
 import {
   getGoogleClientId,
   isGoogleConfigured,
   verifyGoogleIdToken,
+  parseGoogleCsrfCookie,
+  checkGoogleRedirectRequest,
+  buildGoogleRedirectUrl,
+  PendingRecoveryCodes,
   GOOGLE_DISABLED_MSG,
   GOOGLE_LOGIN_FAILED_MSG,
 } from './src/server/google';
@@ -45,20 +39,6 @@ import { PRIVACY_HTML } from './src/server/privacy';
 
 const APP_VERSION = '6.3.0';
 const recoverRateLimiter = new RecoveryRateLimiter(5, 15 * 60 * 1000);
-// Email OTP requests: 5 per hour, per email address and per IP (same sliding-window style as /api/recover).
-const emailOtpRateLimiter = new RecoveryRateLimiter(
-  EMAIL_OTP_MAX_REQUESTS_PER_HOUR,
-  EMAIL_OTP_REQUEST_WINDOW_MS
-);
-const EMAIL_DISABLED_MSG = 'ورود با ایمیل فعلاً فعال نیست';
-
-function getClientIp(req: Request): string {
-  return (
-    (typeof req.ip === 'string' && req.ip) ||
-    req.socket?.remoteAddress ||
-    'unknown'
-  );
-}
 
 // کلید سرور برای پروتکل احراز هویت کور Ristretto255-VOPRF (RFC 9497)
 // (رفع F12، بازیابی‌شده از دور اول) بذر اختصاصی VOPRF_SEED (۳۲ بایت Base64) در اولویت است؛ در غیاب
@@ -133,6 +113,10 @@ const server = http.createServer(app);
 const io = new SocketIOServer(server);
 
 app.use(express.json({ limit: '5mb' }));
+// Google posts the redirect-mode credential as application/x-www-form-urlencoded
+// (credential + g_csrf_token) to /api/google-redirect — JSON parsing alone
+// would leave req.body empty for that route.
+app.use(express.urlencoded({ extended: false }));
 
 // آپلود فایل با پشتیبانی ترکیبی (Hybrid Cloud-Safe Media Storage + Disk Stream)
 // توجه: مسیر عمومی /uploads حذف شده — فایل‌ها فقط از طریق /api/media با
@@ -163,8 +147,7 @@ async function fileStartsWithMagic(filePath: string, magic: string): Promise<boo
   }
 }
 
-// متغیرهای درون‌حافظه‌ای کدهای تایید و توکن‌های موقت
-const otps: Record<string, any> = {};
+// متغیرهای درون‌حافظه‌ای توکن‌های موقت
 const adminTokens: Record<string, { username: string; expire: number; adminAt: number }> = {};
 const userSessions: Record<string, { username: string; expire: number }> = {};
 
@@ -203,9 +186,7 @@ function isAdmin(req: Request): boolean {
   return verifyAdminSecret(token);
 }
 
-function generateOTP(): string {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
+
 
 async function isUserBlocked(username: string): Promise<boolean> {
   const { rows } = await pool.query(
@@ -235,48 +216,6 @@ function parseMsg(m: any) {
     is_pinned: !!m.is_pinned,
     is_read: !!m.is_read,
   };
-}
-
-// ===== Bale Bot Polling =====
-let baleOffset = 0;
-
-async function startBalePolling(): Promise<void> {
-  if (!config.BALE_BOT_TOKEN) {
-    console.log('⚠️ توکن بله ست نشده - polling غیرفعال است');
-    return;
-  }
-  console.log('🤖 ربات بله در حال اتصال...');
-  while (true) {
-    try {
-      const updates = await bale.getUpdates(baleOffset);
-      for (const update of updates) {
-        baleOffset = update.update_id + 1;
-        await handleBaleUpdate(update);
-      }
-    } catch (e: any) {
-      console.error('❌ خطای polling بله:', e.message);
-    }
-    await new Promise(r => setTimeout(r, 1000));
-  }
-}
-
-async function handleBaleUpdate(update: bale.BaleUpdate): Promise<void> {
-  const msg = update.message;
-  if (!msg || !msg.text) return;
-  const chatId = msg.chat.id;
-  const baleId = (msg.from.username || String(msg.from.id)).toLowerCase();
-  otps[`__chatid__${baleId}`] = chatId;
-
-  if (msg.text === '/start') {
-    await bale.sendMessage(chatId, '👋 سلام!\nبرای ورود یا ثبت‌نام، آیدی بله‌ات رو توی سایت وارد کن.');
-    return;
-  }
-  if (otps[baleId]) {
-    await bale.sendMessage(
-      chatId,
-      `🔐 کد تأیید:\n\n${otps[baleId].code}\n\n⏱ ${config.OTP_EXPIRE} ثانیه معتبر است.`
-    );
-  }
 }
 
 // ===== HYBRID PERSISTENT FILE UPLOAD & MEDIA SERVING =====
@@ -444,124 +383,43 @@ app.get('/api/health', async (_req: Request, res: Response) => {
   });
 });
 
-// ===== AUTH =====
-app.post('/api/send-otp', async (req: Request, res: Response) => {
-  const { baleId } = req.body;
-  if (!baleId) return res.json({ ok: false, msg: 'آیدی بله رو وارد کن' });
-  const key = String(baleId).toLowerCase().replace('@', '').trim();
-  const code = generateOTP();
-  otps[key] = { code, expire: Date.now() + config.OTP_EXPIRE * 1000 };
+// ===== GOOGLE SIGN-IN (primary login; env-gated) =====
 
-  const chatId = otps[`__chatid__${key}`];
-  if (chatId) {
-    const sent = await bale.sendMessage(
-      chatId,
-      `🔐 کد تأیید:\n\n${code}\n\n⏱ ${config.OTP_EXPIRE} ثانیه معتبر است.`
+/**
+ * One-time recovery codes for redirect logins. The recovery code must
+ * never travel in a URL, so a new redirect login stores its code here
+ * keyed by session token (10-minute expiry) and the client fetches it
+ * exactly once via POST /api/recovery-code-once. The popup flow does
+ * not use this store — it returns the code directly in its JSON reply.
+ */
+const pendingRecoveryCodes = new PendingRecoveryCodes();
+
+/**
+ * Shared Google sign-in completion, used by BOTH /api/google-login
+ * (popup JSON) and /api/google-redirect (form POST + 302). Verifies
+ * nothing itself — the caller must have verified the ID token and
+ * checked the block list first. Creates the user atomically when new
+ * (same one-time recovery code as every other registration path) and
+ * issues a 7-day session token. The recovery code is returned to the
+ * caller; it is the caller's job to deliver it safely (JSON reply for
+ * popup, one-time fetch for redirect — never in a URL).
+ */
+async function completeGoogleSignIn(email: string): Promise<{
+  sessionToken: string;
+  username: string;
+  isNew: boolean;
+  recoveryCode?: string;
+}> {
+  const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [email]);
+  let recoveryCode: string | undefined;
+  const isNew = rows.length === 0;
+  if (isNew) {
+    recoveryCode = generateRecoveryCode();
+    const recoveryCodeHash = await hashRecoveryCode(recoveryCode);
+    await pool.query(
+      'INSERT INTO users (username, bale_chat_id, joined_at, recovery_code_hash, email) VALUES ($1, $2, $3, $4, $5)',
+      [email, null, new Date().toISOString(), recoveryCodeHash, email]
     );
-    if (!sent) {
-      return res.status(503).json({
-        ok: false,
-        baleUnavailable: true,
-        msg: 'ارسال کد از طریق بله با خطا مواجه شد. می‌توانید با کد بازیابی وارد شوید.',
-      });
-    }
-    res.json({ ok: true, msg: '✅ کد به بله‌ات فرستاده شد' });
-  } else {
-    if (!config.BALE_BOT_TOKEN) {
-      console.log(`🔐 [حالت آزمایشی] کد تأیید برای @${key}: ${code}`);
-      res.json({ ok: true, msg: `کد تأیید آزمایشی: ${code}` });
-    } else {
-      res.json({ ok: true, needStart: true, msg: 'ابتدا به ربات بله /start بزن' });
-    }
-  }
-});
-
-app.post('/api/verify-otp', async (req: Request, res: Response) => {
-  const { baleId, code } = req.body;
-  const key = String(baleId || '').toLowerCase().replace('@', '').trim();
-  const otp = otps[key];
-  if (!otp) return res.json({ ok: false, msg: 'ابتدا کد درخواست کن' });
-  if (Date.now() > otp.expire) {
-    delete otps[key];
-    return res.json({ ok: false, msg: 'کد منقضی شده' });
-  }
-  if (otp.code !== code) return res.json({ ok: false, msg: 'کد اشتباه است' });
-  delete otps[key];
-
-  // (ثبت‌نام مقید به اثبات مالکیت) مالکیت این آیدی اثبات شد؛ /api/register
-  // فقط با همین نشانه‌ی یک‌بارمصرف و ۱۰ دقیقه‌ای اجازه‌ی ساخت حساب می‌دهد.
-  verifiedMarks.mark(key);
-
-  const sessionToken = uuidv4();
-  userSessions[sessionToken] = {
-    username: key,
-    expire: Date.now() + 7 * 24 * 60 * 60 * 1000,
-  };
-
-  const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [key]);
-  res.json({ ok: true, isNew: rows.length === 0, username: key, sessionToken });
-});
-
-// ===== EMAIL AUTH (alternative to Bale; env-gated) =====
-app.post('/api/request-email-otp', async (req: Request, res: Response) => {
-  if (!isEmailConfigured()) return res.json({ ok: false, msg: EMAIL_DISABLED_MSG });
-  const email = validateEmail((req.body || {}).email);
-  if (!email) return res.json({ ok: false, msg: 'ایمیل معتبر وارد کنید.' });
-
-  const limit = emailOtpRateLimiter.checkAndConsume(getClientIp(req), `email:${email}`);
-  if (!limit.allowed) {
-    res.setHeader('Retry-After', String(limit.retryAfterSec));
-    return res.status(429).json({
-      ok: false,
-      msg: 'تعداد درخواست کد بیش از حد مجاز است. لطفاً یک ساعت دیگر دوباره تلاش کنید.',
-    });
-  }
-
-  const code = generateEmailOtp();
-  otps[`email:${email}`] = createEmailOtpRecord(code);
-  try {
-    await sendEmailOtp(email, code);
-  } catch {
-    delete otps[`email:${email}`];
-    return res.status(503).json({
-      ok: false,
-      msg: 'ارسال ایمیل با خطا مواجه شد. لطفاً بعداً دوباره تلاش کنید.',
-    });
-  }
-  // Never reveal whether the email is registered: the request path does not check registration.
-  return res.json({ ok: true, msg: '✅ کد تأیید به ایمیل شما فرستاده شد' });
-});
-
-app.post('/api/verify-email-otp', async (req: Request, res: Response) => {
-  if (!isEmailConfigured()) return res.json({ ok: false, msg: EMAIL_DISABLED_MSG });
-  const email = validateEmail((req.body || {}).email);
-  const code = String((req.body || {}).code || '').trim();
-  if (!email || !/^\d{6}$/.test(code)) {
-    return res.json({ ok: false, msg: 'ایمیل یا کد تأیید نامعتبر است.' });
-  }
-  const key = `email:${email}`;
-  const outcome = verifyEmailOtpAttempt(otps[key], code);
-  if (outcome === 'missing') return res.json({ ok: false, msg: 'ابتدا کد درخواست کن' });
-  if (outcome === 'expired') {
-    delete otps[key];
-    return res.json({ ok: false, msg: 'کد منقضی شده' });
-  }
-  if (outcome === 'locked') {
-    delete otps[key];
-    return res.json({
-      ok: false,
-      msg: 'تعداد تلاش‌های ناموفق بیش از حد مجاز است. لطفاً کد جدید درخواست کن.',
-    });
-  }
-  if (outcome === 'wrong') return res.json({ ok: false, msg: 'کد اشتباه است' });
-  delete otps[key];
-
-  // (ثبت‌نام مقید به اثبات مالکیت) مالکیت این ایمیل اثبات شد؛ /api/register
-  // فقط با همین نشانه‌ی یک‌بارمصرف و ۱۰ دقیقه‌ای اجازه‌ی ساخت حساب می‌دهد.
-  verifiedMarks.mark(email);
-
-  if (await isUserBlocked(email)) {
-    return res.status(403).json({ ok: false, msg: 'این حساب مسدود شده است.' });
   }
 
   const sessionToken = uuidv4();
@@ -570,11 +428,9 @@ app.post('/api/verify-email-otp', async (req: Request, res: Response) => {
     expire: Date.now() + 7 * 24 * 60 * 60 * 1000,
   };
 
-  const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [email]);
-  res.json({ ok: true, isNew: rows.length === 0, username: email, sessionToken });
-});
+  return { sessionToken, username: email, isNew, recoveryCode };
+}
 
-// ===== GOOGLE SIGN-IN (primary login; env-gated) =====
 app.post('/api/google-login', async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
   if (!isGoogleConfigured()) return res.json({ ok: false, msg: GOOGLE_DISABLED_MSG });
@@ -596,82 +452,85 @@ app.post('/api/google-login', async (req: Request, res: Response) => {
   }
 
   // گوگل خودش مالکیت ایمیل را اثبات کرده است؛ کاربر تازه اتمیک ساخته
-  // می‌شود (بدون عبور از /api/register) و کد بازیابی فقط همین‌بار نمایش داده می‌شود.
-  const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [email]);
-  let recoveryCode: string | undefined;
-  const isNew = rows.length === 0;
-  if (isNew) {
-    recoveryCode = generateRecoveryCode();
-    const recoveryCodeHash = await hashRecoveryCode(recoveryCode);
-    await pool.query(
-      'INSERT INTO users (username, bale_chat_id, joined_at, recovery_code_hash, email) VALUES ($1, $2, $3, $4, $5)',
-      [email, null, new Date().toISOString(), recoveryCodeHash, email]
-    );
-  }
-
-  const sessionToken = uuidv4();
-  userSessions[sessionToken] = {
-    username: email,
-    expire: Date.now() + 7 * 24 * 60 * 60 * 1000,
-  };
+  // می‌شود (ثبت‌نام جداگانه‌ای وجود ندارد) و کد بازیابی فقط همین‌بار نمایش داده می‌شود.
+  const { sessionToken, username, isNew, recoveryCode } = await completeGoogleSignIn(email);
 
   res.json({
     ok: true,
     isNew,
-    username: email,
+    username,
     sessionToken,
     ...(recoveryCode ? { recoveryCode } : {}),
   });
 });
 
-app.post('/api/register', async (req: Request, res: Response) => {
+// Google Sign-In in redirect mode (ux_mode 'redirect'): Google POSTs the
+// credential as a form to this endpoint instead of returning it to a
+// popup. The popup return trip stalls on some mobile browsers (blank
+// accounts.google.com/gsi/transform tab), while a full-page redirect
+// always comes back. NOTE: this login_uri must be registered as an
+// Authorized redirect URI in the Google Cloud Console OAuth client,
+// otherwise Google refuses the redirect (redirect_uri_mismatch).
+app.post('/api/google-redirect', async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
-  const { baleId, email: rawEmail } = req.body || {};
-
-  // --- Email registration (alternative to Bale) ---
-  if (rawEmail !== undefined && rawEmail !== null && String(rawEmail).trim() !== '') {
-    const email = validateEmail(rawEmail);
-    if (!email) return res.status(400).json({ ok: false, msg: 'ایمیل معتبر وارد کنید.' });
-    if (!isEmailConfigured()) return res.json({ ok: false, msg: EMAIL_DISABLED_MSG });
-    // (ثبت‌نام مقید به اثبات مالکیت) بدون نشانه‌ی زنده‌ی تأیید OTP که
-    // /api/verify-email-otp صادر کرده، ثبت‌نام ممکن نیست؛ نشانه تک‌مصرف است.
-    if (!verifiedMarks.consume(email)) {
-      return res.status(403).json({ ok: false, msg: 'ابتدا کد تأیید را وارد کن' });
-    }
-    const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [email]);
-    if (rows.length) return res.json({ ok: false, msg: 'این حساب قبلاً ثبت‌نام کرده' });
-
-    // Same one-time recovery code as the Bale path (scrypt hash stored, code shown once).
-    const recoveryCode = generateRecoveryCode();
-    const recoveryCodeHash = await hashRecoveryCode(recoveryCode);
-    await pool.query(
-      'INSERT INTO users (username, bale_chat_id, joined_at, recovery_code_hash, email) VALUES ($1, $2, $3, $4, $5)',
-      [email, null, new Date().toISOString(), recoveryCodeHash, email]
-    );
-    return res.json({ ok: true, username: email, recoveryCode });
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  if (!isGoogleConfigured()) {
+    return res.status(403).send(GOOGLE_DISABLED_MSG);
+  }
+  const body = (req.body || {}) as Record<string, unknown>;
+  const credential = String(body.credential || '').trim();
+  const csrfField = String(body.g_csrf_token || '').trim();
+  const csrfCookie = parseGoogleCsrfCookie(req.headers.cookie);
+  // Gate first: missing credential is a malformed request (400); a
+  // missing or mismatched CSRF token fails closed (403). No token is
+  // issued unless the gate passes.
+  const gate = checkGoogleRedirectRequest({ credential, csrfField, csrfCookie });
+  if (gate === 'bad_request') {
+    return res.status(400).send(GOOGLE_LOGIN_FAILED_MSG);
+  }
+  if (gate === 'forbidden') {
+    return res.status(403).send(GOOGLE_LOGIN_FAILED_MSG);
   }
 
-  // --- Bale registration (ownership-bound: requires a live verified mark) ---
-  const key = String(baleId || '').toLowerCase().replace('@', '').trim();
-  if (!key) return res.status(400).json({ ok: false, msg: 'آیدی بله نامعتبر است' });
-  // (ثبت‌نام مقید به اثبات مالکیت) بدون نشانه‌ی زنده‌ی تأیید OTP که
-  // /api/verify-otp صادر کرده، ثبت‌نام ممکن نیست؛ نشانه تک‌مصرف است.
-  if (!verifiedMarks.consume(key)) {
-    return res.status(403).json({ ok: false, msg: 'ابتدا کد تأیید را وارد کن' });
+  let email: string;
+  try {
+    email = await verifyGoogleIdToken(credential);
+  } catch {
+    return res.status(403).send(GOOGLE_LOGIN_FAILED_MSG);
   }
-  const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [key]);
-  if (rows.length) return res.json({ ok: false, msg: 'این حساب قبلاً ثبت‌نام کرده' });
 
-  // تولید کد بازیابی یک‌بارمصرف؛ فقط هش scrypt آن در سرور ذخیره می‌شود و کد اصلی یک‌بار به کاربر نمایش داده می‌شود
-  const recoveryCode = generateRecoveryCode();
-  const recoveryCodeHash = await hashRecoveryCode(recoveryCode);
+  if (await isUserBlocked(email)) {
+    return res.status(403).send('این حساب مسدود شده است.');
+  }
 
-  const chatId = otps[`__chatid__${key}`] || null;
-  await pool.query(
-    'INSERT INTO users (username, bale_chat_id, joined_at, recovery_code_hash) VALUES ($1, $2, $3, $4)',
-    [key, chatId, new Date().toISOString(), recoveryCodeHash]
-  );
-  res.json({ ok: true, username: key, recoveryCode });
+  const { sessionToken, isNew, recoveryCode } = await completeGoogleSignIn(email);
+  if (isNew && recoveryCode) {
+    pendingRecoveryCodes.store(sessionToken, recoveryCode, Date.now());
+  }
+
+  // The session token rides in the URL only for this one hop; the
+  // client stores it and strips it from the address bar immediately
+  // (history.replaceState). The recovery code NEVER appears in a URL.
+  return res.redirect(302, buildGoogleRedirectUrl(sessionToken, isNew));
+});
+
+// One-time fetch of the recovery code issued by a redirect login.
+// The client calls this once after storing the session token; the code
+// is returned at most once and then burned. The response also carries
+// the session owner's username so the client can finish the login
+// without the username ever appearing in a URL.
+app.post('/api/recovery-code-once', async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
+  const sessionToken = String((req.body || {}).sessionToken || '').trim();
+  const session = sessionToken ? userSessions[sessionToken] : undefined;
+  if (!session || Date.now() > session.expire) {
+    return res.json({ ok: false });
+  }
+  const code = pendingRecoveryCodes.take(sessionToken, Date.now());
+  if (!code) {
+    return res.json({ ok: true, username: session.username });
+  }
+  return res.json({ ok: true, username: session.username, recoveryCode: code });
 });
 
 app.post('/api/recover', async (req: Request, res: Response) => {
@@ -991,24 +850,20 @@ app.post('/api/account/delete', async (req: Request, res: Response) => {
   const username = getSessionUsername(req);
   if (!username) return res.status(401).json({ ok: false, msg: 'ابتدا وارد حساب کاربری شوید.' });
 
-  const submittedOtp = String(req.body?.otp ?? req.body?.code ?? '').trim();
-  const otpRecord = otps[username];
-  if (!otpRecord) {
-    return res.status(403).json({ ok: false });
-  }
-  if (Date.now() > otpRecord.expire) {
-    delete otps[username];
-    return res.status(403).json({ ok: false });
-  }
-  if (!submittedOtp || otpRecord.code !== submittedOtp) {
-    return res.status(403).json({ ok: false });
-  }
-  delete otps[username];
-
-  const { rows: userRows } = await pool.query('SELECT username FROM users WHERE username = $1', [
-    username,
-  ]);
+  // Deletion is confirmed with the one-time recovery code (the Bale OTP
+  // channel is gone). The code is verified against the stored scrypt
+  // hash; accounts created before recovery codes existed have no hash
+  // and fall back to the (already verified) session alone — see
+  // canDeleteWithCode in src/server/recovery.ts.
+  const submittedCode = String(req.body?.otp ?? req.body?.code ?? '').trim();
+  const { rows: userRows } = await pool.query(
+    'SELECT username, recovery_code_hash FROM users WHERE username = $1',
+    [username]
+  );
   if (!userRows.length) return res.status(404).json({ ok: false, msg: 'حساب کاربری یافت نشد.' });
+  if (!(await canDeleteWithCode(userRows[0].recovery_code_hash, submittedCode))) {
+    return res.status(403).json({ ok: false, msg: 'کد بازیابی نامعتبر است.' });
+  }
 
   await pool.query('DELETE FROM messages WHERE sender = $1', [username]);
   await pool.query('DELETE FROM contacts WHERE username = $1 OR contact = $1', [username]);
@@ -1394,12 +1249,18 @@ app.get('/sitemap.xml', (req: Request, res: Response) => {
 });
 
 // Privacy policy (public page, required e.g. by the Google OAuth consent
-// screen). Plain HTML document, no scripts/styles/external resources, so it
-// renders under the strict CSP. Defined here, before the SPA fallback, so a
-// direct visit to /privacy returns the policy in both dev and production.
+// screen). Styled HTML document with an inline <style> block only — no
+// scripts, no external resources, no user data. The global Helmet CSP
+// forbids inline styles, so this route overrides it with a tighter
+// page-specific policy: inline styles allowed, everything else 'none'.
+// This is safe precisely because the page has no scripts and no user data.
 app.get('/privacy', (_req: Request, res: Response) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'none'; base-uri 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'; script-src 'none'; frame-ancestors 'none'; form-action 'none'"
+  );
   res.send(PRIVACY_HTML);
 });
 
@@ -1880,7 +1741,6 @@ async function start(): Promise<void> {
       void bale.checkBaleHealth();
     }, 5 * 60 * 1000);
     healthTimer.unref();
-    startBalePolling();
   });
 }
 

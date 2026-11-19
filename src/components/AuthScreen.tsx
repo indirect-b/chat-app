@@ -10,7 +10,9 @@ declare global {
         id: {
           initialize: (options: {
             client_id: string;
-            callback: (response: { credential: string }) => void;
+            callback?: (response: { credential: string }) => void;
+            ux_mode?: string;
+            login_uri?: string;
           }) => void;
           renderButton: (
             parent: HTMLElement,
@@ -22,24 +24,26 @@ declare global {
   }
 }
 
+// Redirect-mode login URI: Google POSTs the credential back here.
+// Must be registered as an Authorized redirect URI in the Google Cloud
+// Console OAuth client, otherwise Google refuses the redirect.
+const GOOGLE_REDIRECT_LOGIN_URI =
+  'https://chatapp-server-1i2a.onrender.com/api/google-redirect';
+
 interface AuthScreenProps {
   onAuthenticated: (username: string) => void;
 }
 
-type AuthStep = 1 | 2 | 3 | 4 | 5;
+// Google-only login: step 1 = Google button, step 4 = one-time recovery
+// code display (new Google registrations), step 5 = recovery-code login.
+// The Bale / email OTP flows were removed entirely.
+type AuthStep = 1 | 4 | 5;
 
 export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   const [step, setStep] = useState<AuthStep>(1);
-  const [baleId, setBaleId] = useState('');
-  const [verifiedBaleId, setVerifiedBaleId] = useState('');
-  const [otp, setOtp] = useState('');
-  const [step2Desc, setStep2Desc] = useState('کد ارسال شده به بله رو وارد کن');
-  const [resendTimer, setResendTimer] = useState(60);
-  const [rulesChecked, setRulesChecked] = useState(false);
-  const [rulesModalOpen, setRulesModalOpen] = useState(false);
-  const [rulesText, setRulesText] = useState('');
 
-  // Recovery code fallback (Item 3.1)
+  // One-time recovery code (shown once after a new Google registration,
+  // or after a recovery login rotates it).
   const [recoveryCodeInput, setRecoveryCodeInput] = useState('');
   const [recoveryError, setRecoveryError] = useState('');
   const [issuedRecoveryCode, setIssuedRecoveryCode] = useState('');
@@ -48,48 +52,75 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   const [recoveryCopied, setRecoveryCopied] = useState(false);
   const [recoveryHeading, setRecoveryHeading] = useState('کد بازیابی یک‌بارمصرف شما');
 
-  const [msg, setMsg] = useState<{ text: string; isOk: boolean; needStart?: boolean }>({
+  // Recovery-login identifier: the account's email (Google accounts) or
+  // a legacy Bale ID (accounts created before Google-only login).
+  const [accountId, setAccountId] = useState('');
+
+  const [msg, setMsg] = useState<{ text: string; isOk: boolean }>({
     text: '',
     isOk: false,
   });
 
-  const timerRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    return () => {
-      if (timerRef.current) window.clearInterval(timerRef.current);
-    };
-  }, []);
-
-  const startTimer = () => {
-    setResendTimer(60);
-    if (timerRef.current) window.clearInterval(timerRef.current);
-    timerRef.current = window.setInterval(() => {
-      setResendTimer(prev => {
-        if (prev <= 1) {
-          if (timerRef.current) window.clearInterval(timerRef.current);
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-  };
-
-  const [baleIdError, setBaleIdError] = useState('');
-  const [otpError, setOtpError] = useState('');
-
-  // Email signup/login (alternative to Bale)
-  const [authMethod, setAuthMethod] = useState<'bale' | 'email'>('bale');
-  const [email, setEmail] = useState('');
-  const [verifiedEmail, setVerifiedEmail] = useState('');
-  const [emailError, setEmailError] = useState('');
-
-  // Google Sign-In (primary login). The button renders only when the
-  // server reports a Client ID AND the GIS script loaded successfully.
+  // Google Sign-In (the only login method). The button renders only when
+  // the server reports a Client ID AND the GIS script loaded successfully.
   const [googleClientId, setGoogleClientId] = useState<string | null>(null);
   const [googleReady, setGoogleReady] = useState(false);
   const googleBtnRef = useRef<HTMLDivElement | null>(null);
   const googleRenderedRef = useRef(false);
+  // Guards the redirect-return handling below (runs once per mount).
+  const redirectHandledRef = useRef(false);
+
+  // Redirect-mode return: Google sent us back to /?session=<token>(&new=1).
+  // Store the session, strip it from the address bar at once (the token
+  // must never sit in the URL), then resolve the session owner — and a
+  // pending one-time recovery code, if this login created the account.
+  useEffect(() => {
+    if (redirectHandledRef.current) return;
+    const params = new URLSearchParams(window.location.search);
+    const session = params.get('session');
+    if (!session) return;
+    redirectHandledRef.current = true;
+    try {
+      localStorage.setItem('chat_session_token', session);
+    } catch {
+      // ignore
+    }
+    window.history.replaceState(
+      null,
+      '',
+      `${window.location.pathname}${window.location.hash}`
+    );
+    const isNew = params.get('new') === '1';
+    void (async () => {
+      try {
+        const res = await fetch('/api/recovery-code-once', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionToken: session }),
+        }).then(r => r.json());
+        if (!res || !res.ok || !res.username) {
+          setMsg({ text: 'ورود با گوگل ناموفق بود. لطفاً دوباره تلاش کنید.', isOk: false });
+          return;
+        }
+        // New Google users get their one-time recovery code, shown once
+        // (step 4), exactly like the previous registration flow.
+        if (isNew && res.recoveryCode) {
+          setIssuedRecoveryCode(res.recoveryCode);
+          setPendingAuthUsername(res.username);
+          setRecoverySavedChecked(false);
+          setRecoveryCopied(false);
+          setRecoveryHeading('کد بازیابی یک‌بارمصرف شما');
+          setMsg({ text: '', isOk: false });
+          setStep(4);
+        } else {
+          setMsg({ text: '✅ خوش آمدی!', isOk: true });
+          setTimeout(() => onAuthenticated(res.username), 400);
+        }
+      } catch {
+        setMsg({ text: 'ارتباط با سرور برقرار نشد. لطفاً دوباره تلاش کنید.', isOk: false });
+      }
+    })();
+  }, [onAuthenticated]);
 
   useEffect(() => {
     let cancelled = false;
@@ -137,10 +168,13 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
     const el = googleBtnRef.current;
     if (!g || !el) return;
     g.accounts.id.initialize({
+      // Redirect mode (not the popup): clicking the button navigates the
+      // whole page to Google and Google POSTs the credential back to
+      // /api/google-redirect. The popup return trip stalls on some mobile
+      // browsers (blank gsi/transform tab); the redirect does not.
       client_id: googleClientId,
-      callback: (response: { credential: string }) => {
-        void handleGoogleLogin(response.credential);
-      },
+      ux_mode: 'redirect',
+      login_uri: GOOGLE_REDIRECT_LOGIN_URI,
     });
     g.accounts.id.renderButton(el, {
       theme: 'outline',
@@ -154,250 +188,25 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   const isValidEmailFormat = (value: string): boolean =>
     /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(value.trim().toLowerCase());
 
-  const toggleBtnStyle = (active: boolean): React.CSSProperties => ({
-    flex: 1,
-    padding: '10px 0',
-    borderRadius: '12px',
-    border: active ? '1px solid #06b6d4' : '1px solid #374151',
-    background: active ? 'rgba(6, 182, 212, 0.18)' : 'transparent',
-    color: active ? '#67e8f9' : '#d1d5db',
-    fontSize: '15px',
-    fontWeight: 600,
-    cursor: 'pointer',
-  });
-
-  const handleSendOTP = async () => {
-    const clean = baleId.trim().replace(/^@+/, '');
-    if (!clean) {
-      const errText = 'لطفاً آیدی بله خود را وارد کنید.';
-      setBaleIdError(errText);
-      setMsg({ text: errText, isOk: false });
-      return;
-    }
-    if (!/^[a-zA-Z0-9_]{3,64}$/.test(clean)) {
-      const errText = 'آیدی بله نامعتبر است (حداقل ۳ کاراکتر انگلیسی، عدد یا زیرخط).';
-      setBaleIdError(errText);
-      setMsg({ text: errText, isOk: false });
-      return;
-    }
-    setBaleIdError('');
-    try {
-      const res = await fetch('/api/send-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ baleId: clean }),
-      }).then(r => r.json());
-
-      if (res.ok) {
-        setVerifiedBaleId(clean);
-        if (res.needStart) {
-          setMsg({
-            text: '',
-            isOk: false,
-            needStart: true,
-          });
-        } else {
-          setMsg({ text: res.msg, isOk: true });
-          if (res.msg && res.msg.includes('آزمایشی')) {
-            const match = res.msg.match(/\d{6}/);
-            if (match) {
-              setStep2Desc(res.msg);
-              setOtp(match[0]);
-            }
-          }
-          setTimeout(() => {
-            setMsg({ text: '', isOk: false });
-            setOtpError('');
-            setStep(2);
-            startTimer();
-          }, 600);
-        }
-      } else {
-        const errText = res.msg || 'خطا در ارسال کد تأیید.';
-        setBaleIdError(errText);
-        setMsg({ text: errText, isOk: false });
-      }
-    } catch {
-      const errText =
-        'ارتباط با سرور یا سرویس بله برقرار نشد. در صورت داشتن کد بازیابی، از گزینه «ورود با کد بازیابی» استفاده کنید.';
-      setBaleIdError(errText);
-      setMsg({ text: errText, isOk: false });
-    }
-  };
-
-  const handleSendEmailOTP = async () => {
-    const clean = email.trim().toLowerCase();
-    if (!clean || !isValidEmailFormat(clean)) {
-      const errText = 'لطفاً یک ایمیل معتبر وارد کنید.';
-      setEmailError(errText);
-      setMsg({ text: errText, isOk: false });
-      return;
-    }
-    setEmailError('');
-    try {
-      const res = await fetch('/api/request-email-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: clean }),
-      }).then(r => r.json());
-
-      if (res.ok) {
-        setVerifiedEmail(clean);
-        setStep2Desc('کد ارسال شده به ایمیل رو وارد کن');
-        setMsg({ text: res.msg, isOk: true });
-        setTimeout(() => {
-          setMsg({ text: '', isOk: false });
-          setOtpError('');
-          setStep(2);
-          startTimer();
-        }, 600);
-      } else {
-        const errText = res.msg || 'خطا در ارسال کد تأیید.';
-        setEmailError(errText);
-        setMsg({ text: errText, isOk: false });
-      }
-    } catch {
-      const errText = 'ارتباط با سرور برقرار نشد. لطفاً بعداً دوباره تلاش کنید.';
-      setEmailError(errText);
-      setMsg({ text: errText, isOk: false });
-    }
-  };
-
-  const handleVerifyOTP = async () => {
-    const cleanCode = otp.trim();
-    if (!cleanCode) {
-      const errText = 'لطفاً کد تأیید ۶ رقمی را وارد کنید.';
-      setOtpError(errText);
-      setMsg({ text: errText, isOk: false });
-      return;
-    }
-    if (!/^\d{6}$/.test(cleanCode)) {
-      const errText = 'کد تأیید باید یک عدد ۶ رقمی باشد.';
-      setOtpError(errText);
-      setMsg({ text: errText, isOk: false });
-      return;
-    }
-    setOtpError('');
-    const verifyUrl = authMethod === 'email' ? '/api/verify-email-otp' : '/api/verify-otp';
-    const verifyBody =
-      authMethod === 'email'
-        ? { email: verifiedEmail, code: cleanCode }
-        : { baleId: verifiedBaleId, code: cleanCode };
-    const res = await fetch(verifyUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(verifyBody),
-    }).then(r => r.json());
-
-    if (!res.ok) {
-      const errText = res.msg || 'کد تأیید نادرست است.';
-      setOtpError(errText);
-      setMsg({ text: errText, isOk: false });
-      return;
-    }
-
-    if (res.sessionToken) {
-      try {
-        localStorage.setItem('chat_session_token', res.sessionToken);
-      } catch {
-        // ignore
-      }
-    }
-
-    if (!res.isNew) {
-      setMsg({ text: '✅ خوش آمدی!', isOk: true });
-      setTimeout(() => onAuthenticated(res.username), 400);
-    } else {
-      setMsg({ text: '', isOk: false });
-      setStep(3);
-    }
-  };
-
-  const handleGoogleLogin = async (idToken: string) => {
-    try {
-      const res = await fetch('/api/google-login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ idToken }),
-      }).then(r => r.json());
-
-      if (!res.ok) {
-        const errText = res.msg || 'ورود با گوگل ناموفق بود. لطفاً دوباره تلاش کنید.';
-        setMsg({ text: errText, isOk: false });
-        return;
-      }
-
-      if (res.sessionToken) {
-        try {
-          localStorage.setItem('chat_session_token', res.sessionToken);
-        } catch {
-          // ignore
-        }
-      }
-
-      // New Google users get a one-time recovery code, shown exactly
-      // like the Bale/email registration flow (step 4).
-      if (res.isNew && res.recoveryCode) {
-        setIssuedRecoveryCode(res.recoveryCode);
-        setPendingAuthUsername(res.username);
-        setRecoverySavedChecked(false);
-        setRecoveryCopied(false);
-        setRecoveryHeading('کد بازیابی یک‌بارمصرف شما');
-        setMsg({ text: '', isOk: false });
-        setStep(4);
-      } else {
-        setMsg({ text: '✅ خوش آمدی!', isOk: true });
-        setTimeout(() => onAuthenticated(res.username), 400);
-      }
-    } catch {
-      setMsg({ text: 'ارتباط با سرور برقرار نشد. لطفاً دوباره تلاش کنید.', isOk: false });
-    }
-  };
-
-  const handleRegister = async () => {
-    const registerBody =
-      authMethod === 'email' ? { email: verifiedEmail } : { baleId: verifiedBaleId };
-    const res = await fetch('/api/register', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(registerBody),
-    }).then(r => r.json());
-
-    if (res.ok) {
-      if (res.recoveryCode) {
-        setIssuedRecoveryCode(res.recoveryCode);
-        setPendingAuthUsername(res.username);
-        setRecoverySavedChecked(false);
-        setRecoveryCopied(false);
-        setRecoveryHeading('کد بازیابی یک‌بارمصرف شما');
-        setMsg({ text: '', isOk: false });
-        setStep(4);
-      } else {
-        setMsg({ text: '✅ حساب ساخته شد!', isOk: true });
-        setTimeout(() => onAuthenticated(res.username), 400);
-      }
-    } else {
-      setMsg({ text: res.msg, isOk: false });
-    }
-  };
-
   const handleRecoverLogin = async () => {
-    // Recovery login accepts the account identifier: Bale ID in Bale mode,
-    // email address in email mode (the username of an email account is its email).
-    const cleanId =
-      authMethod === 'email'
-        ? baleId.trim().toLowerCase()
-        : baleId.trim().replace(/^@+/, '');
-    const cleanCode = recoveryCodeInput.trim();
-    if (authMethod === 'email') {
-      if (!cleanId || !isValidEmailFormat(cleanId)) {
+    // The account identifier is the account's email (Google accounts) or
+    // a legacy Bale ID (accounts created before Google-only login).
+    const rawId = accountId.trim();
+    let cleanId = '';
+    if (rawId.includes('@')) {
+      cleanId = rawId.toLowerCase();
+      if (!isValidEmailFormat(cleanId)) {
         setRecoveryError('ایمیل معتبر وارد کنید.');
         return;
       }
-    } else if (!cleanId || !/^[a-zA-Z0-9_]{3,64}$/.test(cleanId)) {
-      setRecoveryError('آیدی بله معتبر وارد کنید.');
-      return;
+    } else {
+      cleanId = rawId.replace(/^@+/, '');
+      if (!/^[a-zA-Z0-9_]{3,64}$/.test(cleanId)) {
+        setRecoveryError('ایمیل یا آیدی حساب معتبر وارد کنید.');
+        return;
+      }
     }
+    const cleanCode = recoveryCodeInput.trim();
     if (!cleanCode) {
       setRecoveryError('کد بازیابی یک‌بارمصرف را وارد کنید.');
       return;
@@ -413,7 +222,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
       const res = await response.json();
 
       if (!res.ok) {
-        setRecoveryError(res.msg || 'آیدی یا کد بازیابی نامعتبر است.');
+        setRecoveryError(res.msg || 'ایمیل/آیدی یا کد بازیابی نامعتبر است.');
         return;
       }
 
@@ -451,16 +260,6 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
     }
   };
 
-  const handleOpenRules = async (e: React.MouseEvent) => {
-    e.preventDefault();
-    const res = await fetch('/api/settings/rules').then(r => r.json());
-    setRulesText(res.rules || 'قوانینی تنظیم نشده');
-    setRulesModalOpen(true);
-  };
-
-  const isBaleIdInvalid = Boolean(baleIdError);
-  const isOtpInvalid = Boolean(otpError);
-
   return (
     <div id="authScreen" className="auth-screen">
       <div id={`step${step}`} className="auth-box">
@@ -481,148 +280,19 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                   💬
                 </div>
                 <h1>پیام‌رسان</h1>
-                <p>
-                  {authMethod === 'email'
-                    ? 'ورود با ایمیل • مجهز به رمزنگاری E2EE'
-                    : 'ورود با آیدی بله • مجهز به رمزنگاری E2EE'}
-                </p>
+                <p>ورود با گوگل • مجهز به رمزنگاری E2EE</p>
               </div>
-              {googleClientId && googleReady && (
-                <>
-                  <div
-                    ref={googleBtnRef}
-                    style={{ display: 'flex', justifyContent: 'center', marginBottom: '12px' }}
-                  />
-                  <div className="test-login-divider" role="separator" aria-label="یا">
-                    <span className="divider-line" aria-hidden="true" />
-                    <span className="divider-text">یا</span>
-                    <span className="divider-line" aria-hidden="true" />
-                  </div>
-                </>
-              )}
-              <div
-                className="auth-method-toggle"
-                role="tablist"
-                aria-label="روش ورود"
-                style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}
-              >
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={authMethod === 'bale'}
-                  onClick={() => {
-                    setAuthMethod('bale');
-                    setMsg({ text: '', isOk: false });
-                    setEmailError('');
-                  }}
-                  style={toggleBtnStyle(authMethod === 'bale')}
-                >
-                  بله
-                </button>
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={authMethod === 'email'}
-                  onClick={() => {
-                    setAuthMethod('email');
-                    setMsg({ text: '', isOk: false });
-                    setBaleIdError('');
-                  }}
-                  style={toggleBtnStyle(authMethod === 'email')}
-                >
-                  ایمیل
-                </button>
-              </div>
-              <form
-                className="auth-form"
-                noValidate
-                onSubmit={e => {
-                  e.preventDefault();
-                  if (authMethod === 'email') {
-                    handleSendEmailOTP();
-                  } else {
-                    handleSendOTP();
-                  }
-                }}
-              >
-                {authMethod === 'bale' ? (
-                  <>
-                <label htmlFor="baleIdInput">
-                  آیدی بله <span aria-hidden="true">*</span>
-                </label>
-                <div className={`input-prefix ${isBaleIdInvalid ? 'input-invalid' : ''}`}>
-                  <span aria-hidden="true">@</span>
-                  <input
-                    type="text"
-                    id="baleIdInput"
-                    name="baleId"
-                    aria-label="آیدی بله"
-                    required
-                    aria-required="true"
-                    aria-invalid={isBaleIdInvalid ? 'true' : 'false'}
-                    aria-describedby="baleIdHint baleIdError"
-                    placeholder="username123"
-                    dir="ltr"
-                    autoComplete="username"
-                    value={baleId}
-                    onChange={e => {
-                      setBaleId(e.target.value);
-                      if (baleIdError) setBaleIdError('');
-                    }}
-                  />
-                </div>
-                <p
-                  id="baleIdError"
-                  role="alert"
-                  aria-live="assertive"
-                  className={`field-error ${baleIdError ? 'visible' : ''}`}
-                >
-                  {baleIdError}
-                </p>
-                <p id="baleIdHint" className="input-hint">
-                  آیدی بله خود را بدون <bdi dir="ltr">@</bdi> وارد کنید (مثال:{' '}
-                  <bdi dir="ltr">username123</bdi>)
-                </p>
-                  </>
-                ) : (
-                  <>
-                <label htmlFor="emailInput">
-                  ایمیل <span aria-hidden="true">*</span>
-                </label>
-                <input
-                  type="email"
-                  id="emailInput"
-                  name="email"
-                  aria-label="ایمیل"
-                  required
-                  aria-required="true"
-                  aria-invalid={emailError ? 'true' : 'false'}
-                  aria-describedby="emailHint emailError"
-                  placeholder="you@example.com"
-                  dir="ltr"
-                  autoComplete="email"
-                  className={emailError ? 'input-invalid' : ''}
-                  value={email}
-                  onChange={e => {
-                    setEmail(e.target.value);
-                    if (emailError) setEmailError('');
-                  }}
+              {googleClientId && googleReady ? (
+                <div
+                  ref={googleBtnRef}
+                  style={{ display: 'flex', justifyContent: 'center', marginBottom: '12px' }}
                 />
-                <p
-                  id="emailError"
-                  role="alert"
-                  aria-live="assertive"
-                  className={`field-error ${emailError ? 'visible' : ''}`}
-                >
-                  {emailError}
+              ) : (
+                <p className="auth-msg" role="status">
+                  ورود با گوگل فعلاً در دسترس نیست. لطفاً بعداً دوباره تلاش کنید.
                 </p>
-                <p id="emailHint" className="input-hint">
-                  کد تأیید ۶ رقمی به این ایمیل فرستاده می‌شود.
-                </p>
-                  </>
-                )}
-                <button type="submit">دریافت کد تأیید</button>
-
+              )}
+              <div className="auth-form">
                 <button
                   type="button"
                   className="btn-ghost"
@@ -632,219 +302,14 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                     setStep(5);
                   }}
                 >
-                  {authMethod === 'email'
-                    ? '🔑 ورود با کد بازیابی'
-                    : '🔑 ورود با کد بازیابی (در صورت اختلال بله)'}
-                </button>
-
-                {authMethod === 'bale' && (
-                  <>
-                <div className="test-login-divider" role="separator" aria-label="یا">
-                  <span className="divider-line" aria-hidden="true" />
-                  <span className="divider-text">یا</span>
-                  <span className="divider-line" aria-hidden="true" />
-                </div>
-
-                <a
-                  href="https://ble.ir/Optcodebot"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="auth-bot-link"
-                >
-                  🤖 فعال‌سازی ربات کد تأیید در بله (<bdi dir="ltr">@Optcodebot</bdi>)
-                </a>
-
-                <p className="bale-signup-note">
-                  «بله» پیام‌رسان ایرانی است که کد تأیید ورود به آن ارسال می‌شود. اگر حساب بله
-                  ندارید، در{' '}
-                  <a
-                    href="https://ble.ir"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="rules-link"
-                  >
-                    وب‌سایت رسمی بله (ble.ir)
-                  </a>{' '}
-                  ثبت‌نام کنید.
-                </p>
-                  </>
-                )}
-
-                {msg.needStart ? (
-                  <p id="msg1" role="alert" className="auth-msg">
-                    ⚠️ ابتدا{' '}
-                    <a
-                      href="https://ble.ir/Optcodebot"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="rules-link"
-                    >
-                      <bdi dir="ltr">@Optcodebot</bdi>
-                    </a>{' '}
-                    را در بله استارت کن
-                  </p>
-                ) : (
-                  <p
-                    id="msg1"
-                    role="status"
-                    aria-live="polite"
-                    className={`auth-msg ${msg.isOk ? 'ok' : ''}`}
-                  >
-                    {msg.isOk ? msg.text : ''}
-                  </p>
-                )}
-              </form>
-            </>
-          )}
-
-          {step === 2 && (
-            <>
-              <div className="auth-logo">
-                <div
-                  className="logo-circle"
-                  style={{ background: 'linear-gradient(135deg,#06b6d4,#7c3aed)' }}
-                  aria-hidden="true"
-                >
-                  🔐
-                </div>
-                <h1>کد تأیید</h1>
-                <p id="step2desc">{step2Desc}</p>
-              </div>
-              <form
-                className="auth-form"
-                noValidate
-                onSubmit={e => {
-                  e.preventDefault();
-                  handleVerifyOTP();
-                }}
-              >
-                <label htmlFor="otpInput">
-                  کد تأیید ۶ رقمی <span aria-hidden="true">*</span>
-                </label>
-                <input
-                  type="text"
-                  id="otpInput"
-                  name="otp"
-                  aria-label="کد تأیید ۶ رقمی"
-                  required
-                  aria-required="true"
-                  aria-invalid={isOtpInvalid ? 'true' : 'false'}
-                  aria-describedby="otpError"
-                  className={isOtpInvalid ? 'input-invalid' : ''}
-                  placeholder="● ● ● ● ● ●"
-                  maxLength={6}
-                  inputMode="numeric"
-                  autoComplete="one-time-code"
-                  style={{ textAlign: 'center', letterSpacing: '10px', fontSize: '24px' }}
-                  value={otp}
-                  onChange={e => {
-                    setOtp(e.target.value);
-                    if (otpError) setOtpError('');
-                  }}
-                />
-                <p
-                  id="otpError"
-                  role="alert"
-                  aria-live="assertive"
-                  className={`field-error ${otpError ? 'visible' : ''}`}
-                >
-                  {otpError}
-                </p>
-                <button type="submit">تأیید</button>
-                <button
-                  type="button"
-                  className="btn-ghost"
-                  disabled={resendTimer > 0}
-                  onClick={() => {
-                    if (authMethod === 'email') {
-                      handleSendEmailOTP();
-                    } else {
-                      handleSendOTP();
-                    }
-                    startTimer();
-                  }}
-                >
-                  {resendTimer > 0 ? `ارسال مجدد (${resendTimer})` : 'ارسال مجدد کد'}
-                </button>
-                <button
-                  type="button"
-                  className="btn-ghost"
-                  onClick={() => {
-                    setMsg({ text: '', isOk: false });
-                    setOtpError('');
-                    setStep(1);
-                  }}
-                >
-                  برگشت
+                  🔑 ورود با کد بازیابی (در صورت عدم دسترسی به حساب گوگل)
                 </button>
                 <p
-                  id="msg2"
+                  id="msg1"
                   role="status"
                   aria-live="polite"
                   className={`auth-msg ${msg.isOk ? 'ok' : ''}`}
                 >
-                  {msg.isOk ? msg.text : ''}
-                </p>
-              </form>
-            </>
-          )}
-
-          {step === 3 && (
-            <>
-              <div className="auth-logo">
-                <div
-                  className="logo-circle"
-                  style={{ background: 'linear-gradient(135deg,#22c55e,#06b6d4)' }}
-                  aria-hidden="true"
-                >
-                  👋
-                </div>
-                <h1>خوش آمدی!</h1>
-                <p>قبل از ورود قوانین را بخوانید</p>
-              </div>
-              <div className="auth-form">
-                <div className="id-preview" id="idPreview">
-                  {authMethod === 'email' ? (
-                    <bdi dir="ltr">{verifiedEmail}</bdi>
-                  ) : (
-                    <bdi dir="ltr">@{verifiedBaleId}</bdi>
-                  )}
-                </div>
-                <div className="rules-check">
-                  <input
-                    type="checkbox"
-                    id="rulesCheck"
-                    checked={rulesChecked}
-                    onChange={e => setRulesChecked(e.target.checked)}
-                  />
-                  <label htmlFor="rulesCheck">
-                    <button
-                      type="button"
-                      onClick={handleOpenRules}
-                      className="rules-link"
-                      style={{
-                        background: 'none',
-                        border: 'none',
-                        padding: 0,
-                        font: 'inherit',
-                        cursor: 'pointer',
-                      }}
-                    >
-                      قوانین
-                    </button>{' '}
-                    را خواندم و می‌پذیرم
-                  </label>
-                </div>
-                <button
-                  type="button"
-                  id="regBtn"
-                  onClick={handleRegister}
-                  disabled={!rulesChecked}
-                  className={!rulesChecked ? 'btn-disabled' : ''}
-                >
-                  ورود به پیام‌رسان
-                </button>
-                <p id="msg3" className={`auth-msg ${msg.isOk ? 'ok' : ''}`}>
                   {msg.text}
                 </p>
               </div>
@@ -884,7 +349,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                   {issuedRecoveryCode}
                 </div>
                 <p className="input-hint">
-                  در صورتی که سرویس بله در دسترس نباشد، می‌توانید با این کد یک‌بارمصرف وارد حساب خود
+                  اگر به حساب گوگل خود دسترسی ندارید، می‌توانید با این کد یک‌بارمصرف وارد حساب خود
                   شوید. پس از هر بار استفاده، کد جدیدی جایگزین آن می‌شود.
                 </p>
                 <button type="button" className="btn-ghost" onClick={handleCopyRecoveryCode}>
@@ -906,9 +371,8 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                   disabled={!recoverySavedChecked}
                   className={!recoverySavedChecked ? 'btn-disabled' : ''}
                   onClick={() => {
-                    const user = pendingAuthUsername || verifiedBaleId;
                     setIssuedRecoveryCode('');
-                    onAuthenticated(user);
+                    onAuthenticated(pendingAuthUsername);
                   }}
                 >
                   ادامه به پیام‌رسان
@@ -928,7 +392,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                   🔑
                 </div>
                 <h1>ورود با کد بازیابی</h1>
-                <p>در صورت عدم دسترسی به سرویس بله از کد بازیابی یک‌بارمصرف استفاده کنید</p>
+                <p>در صورت عدم دسترسی به حساب گوگل از کد بازیابی یک‌بارمصرف استفاده کنید</p>
               </div>
               <form
                 className="auth-form"
@@ -938,26 +402,25 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                   void handleRecoverLogin();
                 }}
               >
-                <label htmlFor="recoverBaleIdInput">
-                  {authMethod === 'email' ? 'ایمیل' : 'آیدی بله'}{' '}
-                  <span aria-hidden="true">*</span>
+                <label htmlFor="recoverAccountIdInput">
+                  ایمیل یا آیدی حساب <span aria-hidden="true">*</span>
                 </label>
-                <div className="input-prefix">
-                  {authMethod === 'bale' && <span aria-hidden="true">@</span>}
-                  <input
-                    type="text"
-                    id="recoverBaleIdInput"
-                    name="recoverBaleId"
-                    placeholder={authMethod === 'email' ? 'you@example.com' : 'username123'}
-                    dir="ltr"
-                    autoComplete="username"
-                    value={baleId}
-                    onChange={e => {
-                      setBaleId(e.target.value);
-                      if (recoveryError) setRecoveryError('');
-                    }}
-                  />
-                </div>
+                <input
+                  type="text"
+                  id="recoverAccountIdInput"
+                  name="recoverAccountId"
+                  placeholder="you@example.com"
+                  dir="ltr"
+                  autoComplete="username"
+                  value={accountId}
+                  onChange={e => {
+                    setAccountId(e.target.value);
+                    if (recoveryError) setRecoveryError('');
+                  }}
+                />
+                <p className="input-hint">
+                  ایمیل حساب گوگل خود، یا آیدی حساب‌های قدیمی را وارد کنید.
+                </p>
                 <label htmlFor="recoveryCodeInput">
                   کد بازیابی یک‌بارمصرف <span aria-hidden="true">*</span>
                 </label>
@@ -996,7 +459,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                     setStep(1);
                   }}
                 >
-                  برگشت به {authMethod === 'email' ? 'ورود با ایمیل' : 'ورود با بله'}
+                  برگشت به ورود با گوگل
                 </button>
               </form>
             </>
@@ -1021,40 +484,6 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
           <span className="footer-badge">🔒 رمزنگاری سرتاسری</span>
         </footer>
       </div>
-
-      {rulesModalOpen && (
-        <div
-          className="modal"
-          id="rulesModal"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="rulesModalTitle"
-        >
-          <div className="modal-box" style={{ maxWidth: '400px' }}>
-            <h3 id="rulesModalTitle">📋 قوانین پیام‌رسان</h3>
-            <div
-              style={{
-                whiteSpace: 'pre-wrap',
-                fontSize: '14px',
-                lineHeight: 1.7,
-                color: '#d1d5db',
-                margin: '14px 0',
-                maxHeight: '300px',
-                overflowY: 'auto',
-              }}
-            >
-              {rulesText}
-            </div>
-            <button
-              type="button"
-              onClick={() => setRulesModalOpen(false)}
-              style={{ width: '100%' }}
-            >
-              متوجه شدم
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   );
 };

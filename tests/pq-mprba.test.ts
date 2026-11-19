@@ -616,10 +616,31 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     const adminHtml = fs.readFileSync(path.resolve(process.cwd(), 'public/admin.html'), 'utf8');
 
     assert.match(serverSrc, /defaultSrc:\s*\["'self'"\]/);
-    assert.equal(serverSrc.includes('unsafe-inline'), false, 'CSP must not allow unsafe-inline');
+    // The global Helmet CSP (the app shell) must stay strict: no
+    // unsafe-inline, no unsafe-eval anywhere in the Helmet directives.
+    const helmetBlock = serverSrc.slice(
+      serverSrc.indexOf('helmet({'),
+      serverSrc.indexOf('}));', serverSrc.indexOf('helmet({'))
+    );
+    assert.equal(helmetBlock.includes('unsafe-inline'), false, 'Helmet CSP must not allow unsafe-inline');
+    assert.equal(helmetBlock.includes('unsafe-eval'), false, 'Helmet CSP must not allow unsafe-eval');
     assert.equal(serverSrc.includes('unsafe-eval'), false, 'CSP must not allow unsafe-eval');
     assert.equal(serverSrc.includes('fonts.googleapis.com'), false, 'CSP must not allow unpinned Google Fonts CDN');
     assert.equal(serverSrc.includes('fonts.gstatic.com'), false, 'CSP must not allow unpinned Google Fonts CDN');
+
+    // Deliberate, scoped exception: the public /privacy page is a
+    // static document with one inline <style> block and no scripts, no
+    // external resources, no user data. Its route overrides the CSP
+    // with a tighter page-specific policy — inline styles allowed,
+    // scripts forbidden. 'unsafe-inline' may appear ONLY in that one
+    // override, never in the Helmet directives or anywhere else.
+    const inlineOccurrences = (serverSrc.match(/unsafe-inline/g) || []).length;
+    assert.equal(inlineOccurrences, 1, "'unsafe-inline' must appear exactly once (the /privacy override)");
+    const privacyStart = serverSrc.indexOf("app.get('/privacy'");
+    const privacyOverride = serverSrc.slice(privacyStart, privacyStart + 1400);
+    assert.match(privacyOverride, /style-src 'unsafe-inline'/);
+    assert.match(privacyOverride, /script-src 'none'/);
+    assert.match(privacyOverride, /default-src 'none'/);
 
     assert.equal(adminHtml.includes('fonts.googleapis.com'), false, 'admin.html must not load unpinned Google Fonts CDN');
     assert.equal(/<style[\s>]/i.test(adminHtml), false, 'admin.html must not contain inline <style> blocks');
