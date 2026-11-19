@@ -10,6 +10,10 @@ import {
   decapsulateGroupEpochKey,
   encryptMessageText,
   decryptMessageText,
+  encryptFileBytes,
+  decryptFileBytes,
+  isEncryptedFileBytes,
+  FileEncryptionOptions,
   E2EEError,
   isE2EEEnabled,
   setE2EEEnabled,
@@ -50,6 +54,159 @@ interface DecryptedChatMessage extends ChatMessage {
 }
 
 const QUICK_EMOJIS = ['❤️', '👍', '😂', '🔥', '👏', '😮'];
+
+// ===== Media E2EE — authenticated fetch + decrypt + blob URL =====
+//
+// <img>/<audio> tags cannot send an Authorization header, so media is never
+// put in a raw src. Instead it is fetched with the session token, decrypted
+// with the room key when the server says it is encrypted (X-Media-Encrypted),
+// and rendered from a blob URL. A media link therefore opens only for an
+// authenticated member of the chat — never from a bare URL, never anonymously.
+//
+// Legacy /uploads/... links (stored in old messages/avatars) are rewritten to
+// /api/media/... before fetching: the public /uploads route no longer exists.
+
+function resolveMediaUrl(fileUrl: string): string {
+  return fileUrl.startsWith('/uploads/') ? '/api/media/' + fileUrl.slice('/uploads/'.length) : fileUrl;
+}
+
+function getSessionToken(): string {
+  try {
+    return localStorage.getItem('chat_session_token') || '';
+  } catch {
+    return '';
+  }
+}
+
+interface FetchedMedia {
+  bytes: Uint8Array;
+  isEncrypted: boolean;
+  mime: string;
+}
+
+async function fetchAuthenticatedMedia(fileUrl: string): Promise<FetchedMedia> {
+  const token = getSessionToken();
+  const res = await fetch(resolveMediaUrl(fileUrl), {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (!res.ok) {
+    throw new Error(`media fetch failed: ${res.status}`);
+  }
+  const buf = new Uint8Array(await res.arrayBuffer());
+  return {
+    bytes: buf,
+    isEncrypted: res.headers.get('X-Media-Encrypted') === '1' || isEncryptedFileBytes(buf),
+    mime: res.headers.get('Content-Type') || '',
+  };
+}
+
+// Avatars are fetched from many places (list, profile, group members) — one
+// shared in-memory cache per URL so the same picture is fetched once.
+const avatarBlobCache = new Map<string, { url: string; mime: string }>();
+
+async function fetchAvatarBlobUrl(src: string): Promise<{ url: string; mime: string }> {
+  const cached = avatarBlobCache.get(src);
+  if (cached) return cached;
+  const fetched = await fetchAuthenticatedMedia(src);
+  const blob = new Blob([fetched.bytes as unknown as BlobPart], {
+    type: fetched.mime || undefined,
+  });
+  const entry = { url: URL.createObjectURL(blob), mime: fetched.mime };
+  avatarBlobCache.set(src, entry);
+  return entry;
+}
+
+/** An avatar image fetched with the session token (never a raw src). */
+function AuthImg(props: {
+  src: string | null | undefined;
+  alt?: string;
+  className?: string;
+  style?: React.CSSProperties;
+}) {
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setObjectUrl(null);
+    if (!props.src) return;
+    fetchAvatarBlobUrl(props.src)
+      .then(entry => {
+        if (!cancelled) setObjectUrl(entry.url);
+      })
+      .catch(() => {
+        // Avatar unavailable (deleted / no access) — render nothing.
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.src]);
+  if (!objectUrl) return null;
+  return <img src={objectUrl} alt={props.alt || ''} className={props.className} style={props.style} />;
+}
+
+/** A chat media attachment (image / voice / file) fetched with the session token and decrypted with the room key. */
+function SecureMedia(props: {
+  fileUrl: string;
+  fileType: string;
+  roomId: string | null;
+  cryptoOptions: FileEncryptionOptions;
+}) {
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setFailed(false);
+    setObjectUrl(null);
+    (async () => {
+      try {
+        const fetched = await fetchAuthenticatedMedia(props.fileUrl);
+        let bytes = fetched.bytes;
+        if (fetched.isEncrypted) {
+          if (!props.roomId) throw new Error('no room for encrypted media');
+          bytes = await decryptFileBytes(bytes, props.roomId, props.cryptoOptions);
+        }
+        if (cancelled) return;
+        const blob = new Blob([bytes as unknown as BlobPart], {
+          type: fetched.mime || undefined,
+        });
+        setObjectUrl(URL.createObjectURL(blob));
+      } catch {
+        if (!cancelled) setFailed(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // The crypto options object is rebuilt by the parent memo per room; the
+    // effect must re-run when the file or the room changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.fileUrl, props.roomId]);
+
+  if (failed) {
+    return <div className="media-unavailable">🔒 رسانه در دسترس نیست</div>;
+  }
+  if (!objectUrl) {
+    return <div className="media-loading">⏳ در حال بارگذاری رسانه…</div>;
+  }
+  if (props.fileType === 'image') {
+    return <img src={objectUrl} alt="" />;
+  }
+  if (props.fileType === 'voice') {
+    return <audio controls src={objectUrl} />;
+  }
+  if (props.fileType === 'video') {
+    return <video controls src={objectUrl} style={{ maxWidth: '100%' }} />;
+  }
+  return (
+    <div className="file-attach">
+      📁{' '}
+      <a href={objectUrl} download style={{ color: 'inherit' }}>
+        دانلود فایل
+      </a>
+    </div>
+  );
+}
 
 export const ChatApp: React.FC<ChatAppProps> = ({
   myUsername,
@@ -409,6 +566,17 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     const roomObj = rooms.find(r => r.isGroup && r.id === currentPartner);
     return roomObj?.members || groupMembersRef.current[currentPartner] || [];
   }, [currentIsGroup, currentPartner, rooms, currentGroupEpoch]);
+
+  // گزینه‌های رمزنگاری فایل برای اتاق جاری — همان ورودی‌های encryptMessageText.
+  const getFileCryptoOptions = useCallback((): FileEncryptionOptions => {
+    return {
+      myUsername,
+      peerPublicKey: !currentIsGroup && currentRoom ? getPeerKeyForRoom(currentRoom) : undefined,
+      peerUsername: !currentIsGroup && currentPartner ? currentPartner : undefined,
+      customSecret: currentRoom ? getRoomSecret(currentRoom) : undefined,
+      groupMembers: currentIsGroup ? currentGroupMembersList : undefined,
+    };
+  }, [myUsername, currentRoom, currentIsGroup, currentPartner, getPeerKeyForRoom, currentGroupMembersList]);
 
   const currentGroupVerificationSummary = useMemo(() => {
     if (!currentIsGroup || !currentPartner) return null;
@@ -1091,28 +1259,49 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     fallbackType: string
   ) => {
     const file = e.target.files?.[0];
-    if (!file || !currentPartner) return;
+    if (!file || !currentPartner || !currentRoom) return;
     setAttachOpen(false);
 
-    const fd = new FormData();
-    fd.append('file', file);
-    const res = await fetch('/api/upload', { method: 'POST', body: fd }).then(r =>
-      r.json()
-    );
-    if (res.ok) {
-      socket.emit('send-message', {
-        to: currentPartner,
-        text: '',
-        fileUrl: res.fileUrl,
-        fileType: res.fileType || fallbackType,
-        isGroup: currentIsGroup,
-        replyToId: replyTo?.id || null,
-        replyToText: replyTo?.text || null,
-        disappearAfter: disappearAfter || 0,
-      });
-      setReplyTo(null);
-    } else {
-      showToast(res.msg || 'خطا در آپلود فایل');
+    try {
+      // Media E2EE: بایت‌های فایل پیش از آپلود با کلید پایدار اتاق رمز می‌شوند؛
+      // بدون کلید اتاق، Fail-Closed — هیچی آپلود نمی‌شود (مثل پیام، رفع F5).
+      // اگر E2EE خاموش است، مثل پیام متنی، فایل خام فرستاده می‌شود.
+      let uploadFile: File = file;
+      if (e2eeActive) {
+        const rawBytes = new Uint8Array(await file.arrayBuffer());
+        const cipherBytes = await encryptFileBytes(rawBytes, currentRoom, getFileCryptoOptions());
+        uploadFile = new File([cipherBytes as unknown as BlobPart], file.name, {
+          type: file.type,
+        });
+      }
+      const sessionToken = getSessionToken();
+      const fd = new FormData();
+      fd.append('file', uploadFile);
+      fd.append('room_id', currentRoom);
+      const res = await fetch('/api/upload', {
+        method: 'POST',
+        headers: sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {},
+        body: fd,
+      }).then(r => r.json());
+      if (res.ok) {
+        socket.emit('send-message', {
+          to: currentPartner,
+          text: '',
+          fileUrl: res.fileUrl,
+          fileType: res.fileType || fallbackType,
+          isGroup: currentIsGroup,
+          replyToId: replyTo?.id || null,
+          replyToText: replyTo?.text || null,
+          disappearAfter: disappearAfter || 0,
+        });
+        setReplyTo(null);
+      } else {
+        showToast(res.msg || 'خطا در آپلود فایل');
+      }
+    } catch (err) {
+      // Fail-Closed: اگر رمزنگاری نشد، فایل اصلاً ارسال نمی‌شود.
+      const reason = err instanceof E2EEError ? err.code : 'ENCRYPTION_FAILED';
+      showToast(`⛔ خطا در رمزنگاری فایل (${reason}) — فایل ارسال نشد`);
     }
     e.target.value = '';
   };
@@ -1127,20 +1316,42 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       recorder.ondataavailable = ev => audioChunksRef.current.push(ev.data);
       recorder.onstop = async () => {
         const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-        const fd = new FormData();
-        fd.append('file', blob, 'voice.webm');
-        const res = await fetch('/api/upload', { method: 'POST', body: fd }).then(r =>
-          r.json()
-        );
-        if (res.ok) {
-          socket.emit('send-message', {
-            to: currentPartner,
-            text: '',
-            fileUrl: res.fileUrl,
-            fileType: 'voice',
-            isGroup: currentIsGroup,
-            disappearAfter: disappearAfter || 0,
-          });
+        try {
+          // ویس هم مثل بقیه فایل‌ها پیش از آپلود با کلید اتاق رمز می‌شود.
+          let uploadBlob: Blob = blob;
+          if (e2eeActive && currentRoom) {
+            const rawBytes = new Uint8Array(await blob.arrayBuffer());
+            const cipherBytes = await encryptFileBytes(
+              rawBytes,
+              currentRoom,
+              getFileCryptoOptions()
+            );
+            uploadBlob = new Blob([cipherBytes as unknown as BlobPart], {
+              type: 'audio/webm',
+            });
+          }
+          const sessionToken = getSessionToken();
+          const fd = new FormData();
+          fd.append('file', uploadBlob, 'voice.webm');
+          if (currentRoom) fd.append('room_id', currentRoom);
+          const res = await fetch('/api/upload', {
+            method: 'POST',
+            headers: sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {},
+            body: fd,
+          }).then(r => r.json());
+          if (res.ok) {
+            socket.emit('send-message', {
+              to: currentPartner,
+              text: '',
+              fileUrl: res.fileUrl,
+              fileType: 'voice',
+              isGroup: currentIsGroup,
+              disappearAfter: disappearAfter || 0,
+            });
+          }
+        } catch (err) {
+          const reason = err instanceof E2EEError ? err.code : 'ENCRYPTION_FAILED';
+          showToast(`⛔ خطا در رمزنگاری ویس (${reason}) — ویس ارسال نشد`);
         }
         stream.getTracks().forEach(t => t.stop());
       };
@@ -1253,11 +1464,17 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   const handleUploadAvatar = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    // آواتار عکس پروفایل است و به هیچ چتی تعلق ندارد: خام آپلود می‌شود
+    // (kind=avatar) و با توکن نشست احراز هویت می‌شود.
+    const sessionToken = getSessionToken();
     const fd = new FormData();
     fd.append('file', file);
-    const res = await fetch('/api/upload', { method: 'POST', body: fd }).then(r =>
-      r.json()
-    );
+    fd.append('kind', 'avatar');
+    const res = await fetch('/api/upload', {
+      method: 'POST',
+      headers: sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {},
+      body: fd,
+    }).then(r => r.json());
     if (res.ok) {
       setAvatarPreview(res.fileUrl);
     }
@@ -1430,7 +1647,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
             <div className="my-story" onClick={() => setProfileModalOpen(true)}>
               <div className="story-avatar" id="myAvatar">
                 {myProfile.avatar ? (
-                  <img src={myProfile.avatar} alt="" />
+                  <AuthImg src={myProfile.avatar} alt="" />
                 ) : (
                   myUsername[0]?.toUpperCase()
                 )}
@@ -1578,7 +1795,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               >
                 <div className={`ci-avatar ${room.online ? 'online' : ''}`}>
                   {room.avatar ? (
-                    <img src={room.avatar} alt="" />
+                    <AuthImg src={room.avatar} alt="" />
                   ) : (
                     room.name[0]?.toUpperCase()
                   )}
@@ -2187,21 +2404,13 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                           </div>
                         )}
 
-                        {msg.file_type === 'image' && msg.file_url ? (
-                          <img src={msg.file_url} alt="" />
-                        ) : msg.file_type === 'voice' && msg.file_url ? (
-                          <audio controls src={msg.file_url} />
-                        ) : msg.file_type === 'file' && msg.file_url ? (
-                          <div className="file-attach">
-                            📁{' '}
-                            <a
-                              href={msg.file_url}
-                              download
-                              style={{ color: 'inherit' }}
-                            >
-                              دانلود فایل
-                            </a>
-                          </div>
+                        {msg.file_url ? (
+                          <SecureMedia
+                            fileUrl={msg.file_url}
+                            fileType={msg.file_type || 'file'}
+                            roomId={msg.room_id || currentRoom}
+                            cryptoOptions={getFileCryptoOptions()}
+                          />
                         ) : (
                           <span>{renderHighlightedText(displayText || '', searchQuery)}</span>
                         )}
@@ -2751,7 +2960,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 }}
               >
                 {avatarPreview ? (
-                  <img
+                  <AuthImg
                     src={avatarPreview}
                     alt=""
                     style={{
@@ -2842,7 +3051,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               }}
             >
               {contactProfileModal.user?.avatar ? (
-                <img
+                <AuthImg
                   src={contactProfileModal.user.avatar}
                   alt=""
                   style={{ width: '70px', height: '70px', objectFit: 'cover' }}
@@ -3144,7 +3353,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                             }}
                           >
                             {memberAvatar ? (
-                              <img
+                              <AuthImg
                                 src={memberAvatar}
                                 alt=""
                                 style={{ width: '30px', height: '30px', objectFit: 'cover' }}
