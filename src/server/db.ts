@@ -65,7 +65,10 @@ export interface DbReport {
 export interface DbMediaBlob {
   id: string;
   mime_type: string;
-  data_base64: string;
+  data_base64: string | null;
+  room_id?: string | null;
+  is_encrypted?: number;
+  uploaded_by?: string | null;
   created_at: string;
 }
 
@@ -193,8 +196,15 @@ export class PersistentFallbackDatabase {
 
     // 0. MEDIA BLOBS (Persistent Cloud-Safe File Storage)
     if (lower.startsWith('insert into media_blobs')) {
-      const [id, mime_type, data_base64, created_at] = params;
-      this.mediaBlobs.set(id, { id, mime_type, data_base64, created_at });
+      // New shape (7 params): id, mime_type, data_base64, room_id,
+      // is_encrypted, uploaded_by, created_at. Older shapes (6 or 4 params)
+      // tolerated for snapshots written before the media-E2EE change.
+      const [id, mime_type, data_base64] = params;
+      const created_at = params.length >= 7 ? params[6] : params.length >= 6 ? params[5] : params[3];
+      const room_id = params.length >= 6 ? params[3] ?? null : null;
+      const is_encrypted = params.length >= 6 ? Number(params[4]) || 0 : 0;
+      const uploaded_by = params.length >= 7 ? params[5] ?? null : null;
+      this.mediaBlobs.set(id, { id, mime_type, data_base64, room_id, is_encrypted, uploaded_by, created_at });
       this.scheduleSave();
       return { rows: [] };
     }
@@ -215,6 +225,15 @@ export class PersistentFallbackDatabase {
     }
 
     // 2. USERS
+    if (lower === 'select username from users') {
+      return { rows: Array.from(this.users.keys()).map(username => ({ username })) };
+    }
+    if (lower.includes('select username from users where avatar = $1 or avatar = $2')) {
+      const found = Array.from(this.users.values()).find(
+        u => u.avatar === params[0] || u.avatar === params[1]
+      );
+      return { rows: found ? [{ username: found.username }] : [] };
+    }
     if (lower.includes('from users where username = $1') || lower.includes('from users where username=$1')) {
       const u = this.users.get(params[0]);
       if (!u) return { rows: [] };
@@ -403,6 +422,10 @@ export class PersistentFallbackDatabase {
       });
       this.scheduleSave();
       return { rows: [] };
+    }
+    if (lower.includes('select room_id, is_deleted from messages where file_url = $1')) {
+      const m = this.messages.find(msg => msg.file_url === params[0]);
+      return { rows: m ? [{ room_id: m.room_id, is_deleted: m.is_deleted ? 1 : 0 }] : [] };
     }
     if (lower.includes('from messages where room_id = $1 and is_deleted = 0 order by timestamp asc')) {
       const roomId = params[0];
@@ -750,8 +773,14 @@ export async function init(poolOverride?: Pool): Promise<void> {
             id TEXT PRIMARY KEY,
             mime_type TEXT,
             data_base64 TEXT,
+            room_id TEXT,
+            is_encrypted INTEGER DEFAULT 0,
+            uploaded_by TEXT,
             created_at TEXT
           );
+          ALTER TABLE media_blobs ADD COLUMN IF NOT EXISTS room_id TEXT;
+          ALTER TABLE media_blobs ADD COLUMN IF NOT EXISTS is_encrypted INTEGER DEFAULT 0;
+          ALTER TABLE media_blobs ADD COLUMN IF NOT EXISTS uploaded_by TEXT;
           `);
         } catch (e: any) {
           console.warn(
