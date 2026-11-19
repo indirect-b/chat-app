@@ -15,6 +15,7 @@ import { config, verifyAdminSecret } from './src/server/config';
 import * as bale from './src/server/bale';
 import { pool, init } from './src/server/db';
 import { presence } from './src/server/presence';
+import { getRoomId, resolveMediaAccess, canUploadToRoom } from './src/server/media';
 import {
   generateRecoveryCode,
   hashRecoveryCode,
@@ -41,7 +42,7 @@ import {
 } from './src/server/google';
 import { PRIVACY_HTML } from './src/server/privacy';
 
-const APP_VERSION = '6.2.0';
+const APP_VERSION = '6.1.0';
 const recoverRateLimiter = new RecoveryRateLimiter(5, 15 * 60 * 1000);
 // Email OTP requests: 5 per hour, per email address and per IP (same sliding-window style as /api/recover).
 const emailOtpRateLimiter = new RecoveryRateLimiter(
@@ -133,17 +134,33 @@ const io = new SocketIOServer(server);
 app.use(express.json({ limit: '5mb' }));
 
 // آپلود فایل با پشتیبانی ترکیبی (Hybrid Cloud-Safe Media Storage + Disk Stream)
+// توجه: مسیر عمومی /uploads حذف شده — فایل‌ها فقط از طریق /api/media با
+// احراز هویت و بررسی عضویت در چت سرو می‌شوند (به بخش MEDIA در پایین نگاه کن).
 const uploadsDir = path.join(process.cwd(), 'public/uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
-app.use('/uploads', express.static(uploadsDir));
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, uploadsDir),
   filename: (_req, file, cb) => cb(null, uuidv4() + path.extname(file.originalname)),
 });
 const upload = multer({ storage, limits: { fileSize: config.MAX_FILE_SIZE } });
+
+/** Do the first bytes of a file equal `magic`? Used to tell encrypted (PQF1) uploads from raw ones without trusting the client. */
+async function fileStartsWithMagic(filePath: string, magic: string): Promise<boolean> {
+  let fh: fs.promises.FileHandle | null = null;
+  try {
+    fh = await fs.promises.open(filePath, 'r');
+    const buf = Buffer.alloc(magic.length);
+    const { bytesRead } = await fh.read(buf, 0, magic.length, 0);
+    return bytesRead === magic.length && buf.toString('latin1') === magic;
+  } catch {
+    return false;
+  } finally {
+    if (fh) await fh.close().catch(() => undefined);
+  }
+}
 
 // متغیرهای درون‌حافظه‌ای کدهای تایید و توکن‌های موقت
 const otps: Record<string, any> = {};
@@ -183,10 +200,6 @@ function isAdmin(req: Request): boolean {
   const headerToken = req.headers['x-admin-token'];
   const token = Array.isArray(headerToken) ? headerToken[0] : headerToken;
   return verifyAdminSecret(token);
-}
-
-function getRoomId(u1: string, u2: string): string {
-  return [u1, u2].sort().join('__');
 }
 
 function generateOTP(): string {
@@ -266,53 +279,134 @@ async function handleBaleUpdate(update: bale.BaleUpdate): Promise<void> {
 }
 
 // ===== HYBRID PERSISTENT FILE UPLOAD & MEDIA SERVING =====
-app.post('/api/upload', upload.single('file'), async (req: Request, res: Response) => {
-  if (!req.file) return res.json({ ok: false, msg: 'فایل آپلود نشد' });
-  const ext = path.extname(req.file.originalname).toLowerCase();
-  let fileType = 'file';
-  if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) fileType = 'image';
-  else if (['.mp3', '.ogg', '.wav', '.webm', '.m4a'].includes(ext)) fileType = 'voice';
-  else if (['.mp4', '.mov', '.avi'].includes(ext)) fileType = 'video';
-
-  let fileUrl = '/uploads/' + req.file.filename;
-
-  // ذخیره‌سازی پایدار ابری برای فایل‌های زیر ۲ مگابایت (ویس‌ها، آواتارها، تصاویر چت)
-  // جلوگیری از پاک شدن فایل‌ها در محیط‌های کانتینری Ephemeral (مانند Render و Railway)
-  if (config.STORAGE_MODE !== 'disk' && req.file.size <= config.INLINE_MAX_BYTES) {
-    try {
-      const mediaId = req.file.filename;
-      const rawBuffer = await fs.promises.readFile(req.file.path);
-      const base64Data = rawBuffer.toString('base64');
-      await pool.query(
-        'INSERT INTO media_blobs (id, mime_type, data_base64, created_at) VALUES ($1, $2, $3, $4)',
-        [mediaId, req.file.mimetype || 'application/octet-stream', base64Data, new Date().toISOString()]
-      );
-      fileUrl = `/api/media/${mediaId}`;
-    } catch {
-      // در صورت خطا از همان مسیر دیسک استفاده می‌شود
+// Media E2EE: the client encrypts file bytes with the room key BEFORE upload,
+// so the server only ever sees ciphertext and stores it as-is (never decrypts).
+// Backward compat: media uploaded before this change is RAW (the server never
+// had the key, so it cannot retro-encrypt). It stays readable only to members
+// of its chat (resolved through the linking message) — access-controlled but
+// NOT encrypted. New media is both encrypted and access-controlled.
+app.post(
+  '/api/upload',
+  (req: Request, res: Response, next: express.NextFunction) => {
+    // Auth runs BEFORE multer parses the body, so an unauthenticated upload
+    // never writes a file to disk.
+    if (!getSessionUsername(req)) {
+      return res.status(401).json({ ok: false, msg: 'unauthorized' });
     }
-  }
+    next();
+  },
+  upload.single('file'),
+  async (req: Request, res: Response) => {
+    const sessionUser = getSessionUsername(req);
+    if (!sessionUser) return res.status(401).json({ ok: false, msg: 'unauthorized' });
+    if (!req.file) return res.json({ ok: false, msg: 'فایل آپلود نشد' });
+    const kind = String((req.body as any)?.kind || '');
+    const roomId = String((req.body as any)?.room_id || '');
 
-  res.json({ ok: true, fileUrl, fileType, originalName: req.file.originalname });
-});
+    // Avatars have no room: they are public profile pictures, stored raw.
+    // Chat media requires a room and membership in it.
+    let roomIdToStore: string | null = null;
+    if (kind === 'avatar') {
+      roomIdToStore = null;
+    } else {
+      if (!roomId) return res.status(400).json({ ok: false, msg: 'room_id is required' });
+      if (
+        !(await canUploadToRoom(sessionUser, roomId, (sql, params) => pool.query(sql, params)))
+      ) {
+        // Fail closed: do not keep the uploaded file for a forbidden room.
+        try {
+          await fs.promises.unlink(req.file.path);
+        } catch {
+          // ignore
+        }
+        return res.status(403).json({ ok: false, msg: 'not a member of this room' });
+      }
+      roomIdToStore = roomId;
+    }
+
+    // Whether the bytes are encrypted is decided from the bytes themselves
+    // (PQF1 magic — must match FILE_ENCRYPTION_MAGIC in src/utils/crypto.ts),
+    // never from a client claim: a raw file is stored as raw, an encrypted
+    // file as encrypted. Avatars are always raw.
+    const isEncrypted =
+      kind === 'avatar' ? 0 : (await fileStartsWithMagic(req.file.path, 'PQF1')) ? 1 : 0;
+
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    let fileType = 'file';
+    if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) fileType = 'image';
+    else if (['.mp3', '.ogg', '.wav', '.webm', '.m4a'].includes(ext)) fileType = 'voice';
+    else if (['.mp4', '.mov', '.avi'].includes(ext)) fileType = 'video';
+
+    const mediaId = req.file.filename;
+    // The file URL is ALWAYS the authenticated route — never the old public
+    // /uploads path (which no longer exists).
+    const fileUrl = `/api/media/${mediaId}`;
+
+    // A metadata row is ALWAYS written (even for disk files), so /api/media
+    // can enforce membership and report the encryption flag. Inline files
+    // (<2MB, non-disk mode) also store their bytes in the row.
+    const inline =
+      config.STORAGE_MODE !== 'disk' && req.file.size <= config.INLINE_MAX_BYTES;
+    try {
+      const base64Data = inline
+        ? (await fs.promises.readFile(req.file.path)).toString('base64')
+        : null;
+      await pool.query(
+        'INSERT INTO media_blobs (id, mime_type, data_base64, room_id, is_encrypted, uploaded_by, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+        [
+          mediaId,
+          req.file.mimetype || 'application/octet-stream',
+          base64Data,
+          roomIdToStore,
+          isEncrypted,
+          sessionUser,
+          new Date().toISOString(),
+        ]
+      );
+    } catch {
+      // If the row insert fails, the bytes stay on disk and /api/media
+      // resolves the room through the linking message instead.
+    }
+
+    res.json({
+      ok: true,
+      fileUrl,
+      fileType,
+      originalName: req.file.originalname,
+      isEncrypted: isEncrypted === 1,
+    });
+  }
+);
 
 app.get('/api/media/:id', async (req: Request, res: Response) => {
+  const sessionUser = getSessionUsername(req);
+  if (!sessionUser) return res.status(401).json({ ok: false, msg: 'unauthorized' });
   const mediaId = String(req.params.id);
-  try {
-    const { rows } = await pool.query('SELECT * FROM media_blobs WHERE id = $1', [mediaId]);
-    if (rows.length) {
-      const blob = rows[0];
-      const buffer = Buffer.from(blob.data_base64, 'base64');
-      res.setHeader('Content-Type', blob.mime_type || 'application/octet-stream');
-      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-      return res.send(buffer);
-    }
-  } catch {
-    // fallback to disk
+  const access = await resolveMediaAccess(mediaId, sessionUser, (sql, params) =>
+    pool.query(sql, params)
+  );
+  if (access.status === 'forbidden') {
+    return res.status(403).json({ ok: false, msg: 'not a member of this chat' });
+  }
+  if (access.status === 'not-found') return res.status(404).send('Media not found');
+
+  // Backward compat (see the comment above /api/upload): pre-change media is
+  // RAW but members-only; new media is encrypted. The header tells the client
+  // whether to decrypt. Cache is private: these bytes are per-chat, never
+  // shared-cacheable.
+  const encryptedHeader = access.isEncrypted ? '1' : '0';
+  if (access.blob && access.blob.data_base64) {
+    const buffer = Buffer.from(access.blob.data_base64, 'base64');
+    res.setHeader('Content-Type', access.blob.mime_type || 'application/octet-stream');
+    res.setHeader('X-Media-Encrypted', encryptedHeader);
+    res.setHeader('Cache-Control', 'private, max-age=3600, must-revalidate');
+    return res.send(buffer);
   }
 
   const diskFile = path.join(uploadsDir, path.basename(mediaId));
   if (fs.existsSync(diskFile)) {
+    res.setHeader('X-Media-Encrypted', encryptedHeader);
+    res.setHeader('Cache-Control', 'private, max-age=3600, must-revalidate');
     return res.sendFile(diskFile);
   }
   return res.status(404).send('Media not found');
@@ -1242,6 +1336,7 @@ app.get('/robots.txt', (req: Request, res: Response) => {
       'Disallow: /api/',
       'Disallow: /admin-login/',
       'Disallow: /uploads/',
+      'Disallow: /api/media/',
       'Disallow: /socket.io/',
       '',
       `Sitemap: ${baseUrl}/sitemap.xml`,

@@ -1354,7 +1354,8 @@ export async function rotateGroupEpoch(
 async function derivePbkdf2AesKey(
   roomId: string,
   customSecret: string,
-  iterations: number = PBKDF2_ITERATIONS_NEW
+  iterations: number = PBKDF2_ITERATIONS_NEW,
+  purpose: string = ''
 ): Promise<CryptoKey> {
   // (رفع F4، بازیابی‌شده از دور اول) رمز دستی الزامی است؛ عبارت پیش‌فرض عمومی حذف شد. بدون رمز،
   // این تابع صدا زده نمی‌شود و encryptMessageText خطا می‌دهد.
@@ -1373,7 +1374,9 @@ async function derivePbkdf2AesKey(
     ['deriveKey']
   );
 
-  const salt = enc.encode(`persian-messenger-salt::${roomId}`);
+  // purpose جدا می‌کند: کلید پیام (purpose='') با کلید فایل (purpose='file-v1')
+  // از یک رمز ساخته می‌شوند اما با salt متفاوت، پس کاملاً از هم جدایند.
+  const salt = enc.encode(`persian-messenger-salt::${roomId}${purpose ? `::${purpose}` : ''}`);
   return webCrypto.subtle.deriveKey(
     {
       name: 'PBKDF2',
@@ -1915,6 +1918,219 @@ export async function decryptMessageText(
     mode: 'PBKDF2',
     failed: false,
   };
+}
+
+// ===== رمزنگاری سرتاسری فایل (Media E2EE) =====
+//
+// کلید فایل، یک کلید پایدارِ هر اتاق است که با HKDF از «راز مشترکِ تثبیت‌شدهٔ
+// اتاق» مشتق می‌شود و هرگز از راتچت پیام استفاده نمی‌کند — پس آپلود فایل هیچ
+// گام راتچتی مصرف نمی‌کند و ترتیب پیام‌ها به هم نمی‌ریزد:
+//   - اتاق گروهی: کلید ریشهٔ اپوک جاری (همان کلیدی که پیام‌های گروهی با آن
+//     رمز می‌شوند). شمارهٔ اپوک در سربرگ فایل ذخیره می‌شود تا گیرنده کلید
+//     همان اپوک را از Grace Buffer بردارد (مثل پیام‌های گروهی).
+//   - چت خصوصی: بیت‌های مشترک ECDH P-256 (قطعی و پایدار تا وقتی کلید هویت
+//     عوض نشده) با HKDF و info جدا. توجه صادقانه: این کلید از ECDH کلاسیک
+//     مشتق می‌شود، نه از ML-KEM — چون کلید ریشهٔ راتچت PQ پس از هر چرخش
+//     (۵۰ پیام) صفر می‌شود و نگه داشته نمی‌شود، پس نمی‌تواند کلید پایدار فایل
+//     باشد. سرور هرگز این کلید را نمی‌بیند.
+//   - رمز دستی: PBKDF2 با salt جداگانه (purpose='file-v1')، جدا از کلید پیام.
+// قالب باینری فایل رمز شده: 'PQF1' (۴ بایت) + kind (۱ بایت: 1=DM-ECDH،
+// 2=group-epoch، 3=manual) + epoch (۴ بایت BE، فقط گروهی) + iv (۱۲ بایت) +
+// ciphertext با AES-256-GCM (شامل ۱۶ بایت auth tag).
+
+export const FILE_ENCRYPTION_MAGIC = 'PQF1';
+export const FILE_ENCRYPTION_KIND_DM = 1;
+export const FILE_ENCRYPTION_KIND_GROUP = 2;
+export const FILE_ENCRYPTION_KIND_MANUAL = 3;
+const FILE_ENCRYPTION_HEADER_LEN = 21;
+
+export interface FileEncryptionOptions {
+  myUsername?: string;
+  peerPublicKey?: string | null;
+  peerUsername?: string;
+  customSecret?: string;
+  groupMembers?: string[];
+}
+
+interface RoomFileKey {
+  key: CryptoKey;
+  kind: number;
+  epoch: number;
+}
+
+function fileKeyInfo(roomId: string, epoch: number): Uint8Array {
+  const suffix = epoch > 0 ? `:epoch-${epoch}` : '';
+  return new TextEncoder().encode(`PQ-MPRBA-file-v1:${roomId}${suffix}`);
+}
+
+async function getRoomFileKey(
+  roomId: string,
+  options?: FileEncryptionOptions
+): Promise<RoomFileKey> {
+  if (!roomId || typeof roomId !== 'string') {
+    throw new E2EEError('MISSING_KEYS', 'Missing roomId for file encryption');
+  }
+  const webCrypto = getWebCrypto();
+  const manualSecret = options?.customSecret ?? getRoomSecret(roomId);
+
+  // ۱. رمز دستی: PBKDF2 با salt جدا (purpose='file-v1').
+  if (manualSecret) {
+    const key = await derivePbkdf2AesKey(roomId, manualSecret, PBKDF2_ITERATIONS_NEW, 'file-v1');
+    return { key, kind: FILE_ENCRYPTION_KIND_MANUAL, epoch: 0 };
+  }
+
+  // ۲. اتاق گروهی: کلید ریشهٔ اپوک جاری.
+  if (roomId.startsWith('group__')) {
+    const groupId = roomId.replace('group__', '');
+    const fsm = getGroupEpochState(groupId, options?.groupMembers || []);
+    const epochRec = fsm.epochs[fsm.currentEpoch];
+    if (!epochRec) {
+      throw new E2EEError('MISSING_KEYS', 'Current group epoch key is unavailable');
+    }
+    const keyBytes = hkdf(sha256, epochRec.rootKey, new TextEncoder().encode(roomId), fileKeyInfo(roomId, fsm.currentEpoch), 32);
+    try {
+      const key = await webCrypto.subtle.importKey(
+        'raw',
+        keyBytes as unknown as BufferSource,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+      );
+      return { key, kind: FILE_ENCRYPTION_KIND_GROUP, epoch: fsm.currentEpoch };
+    } finally {
+      zeroizeBuffer(keyBytes);
+    }
+  }
+
+  // ۳. چت خصوصی: بیت‌های مشترک ECDH (پایدار، بدون دست‌زدن به راتچت).
+  if (!options?.myUsername || !options?.peerPublicKey) {
+    throw new E2EEError(
+      'MISSING_KEYS',
+      'No room key available for file encryption: peer public key is missing'
+    );
+  }
+  const { ecdhJwk } = parsePeerKeyBundle(options.peerPublicKey, options.peerUsername, { skipCache: true });
+  if (!ecdhJwk) {
+    throw new E2EEError('INVALID_BUNDLE', 'Peer ECDH public key is missing or invalid');
+  }
+  const bits = await deriveECDHSharedBits(options.myUsername, ecdhJwk);
+  try {
+    const keyBytes = hkdf(sha256, bits, new TextEncoder().encode(roomId), fileKeyInfo(roomId, 0), 32);
+    try {
+      const key = await webCrypto.subtle.importKey(
+        'raw',
+        keyBytes as unknown as BufferSource,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+      );
+      return { key, kind: FILE_ENCRYPTION_KIND_DM, epoch: 0 };
+    } finally {
+      zeroizeBuffer(keyBytes);
+    }
+  } finally {
+    zeroizeBuffer(bits);
+  }
+}
+
+/** رمزنگاری بایت‌های خام فایل با کلید پایدار اتاق. بدون کلید اتاق، Fail-Closed (پرتاب E2EEError، هرگز بایت ساده برنمی‌گردد). */
+export async function encryptFileBytes(
+  data: Uint8Array,
+  roomId: string,
+  options?: FileEncryptionOptions
+): Promise<Uint8Array> {
+  const webCrypto = getWebCrypto();
+  const { key, kind, epoch } = await getRoomFileKey(roomId, options);
+  const iv = webCrypto.getRandomValues(new Uint8Array(12));
+  const cipherBuffer = await webCrypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    data as unknown as BufferSource
+  );
+  const out = new Uint8Array(FILE_ENCRYPTION_HEADER_LEN + cipherBuffer.byteLength);
+  out.set(new TextEncoder().encode(FILE_ENCRYPTION_MAGIC), 0);
+  out[4] = kind;
+  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  view.setUint32(5, epoch, false);
+  out.set(iv, 9);
+  out.set(new Uint8Array(cipherBuffer), FILE_ENCRYPTION_HEADER_LEN);
+  return out;
+}
+
+/** رمزگشایی بایت‌های فایل رمز شده (قالب PQF1). سربرگ خراب یا کلید نادرست → E2EEError (Fail-Closed). */
+export async function decryptFileBytes(
+  data: Uint8Array,
+  roomId: string,
+  options?: FileEncryptionOptions
+): Promise<Uint8Array> {
+  const webCrypto = getWebCrypto();
+  if (!isEncryptedFileBytes(data)) {
+    throw new E2EEError('MALFORMED_PAYLOAD', 'Not an encrypted file payload');
+  }
+  const kind = data[4];
+  const epoch = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(5, false);
+  const iv = data.slice(9, FILE_ENCRYPTION_HEADER_LEN);
+  const cipherBytes = data.slice(FILE_ENCRYPTION_HEADER_LEN);
+
+  let key: CryptoKey;
+  if (kind === FILE_ENCRYPTION_KIND_GROUP) {
+    if (!roomId.startsWith('group__')) {
+      throw new E2EEError('MALFORMED_PAYLOAD', 'Group file payload in a non-group room');
+    }
+    const groupId = roomId.replace('group__', '');
+    const fsm = getGroupEpochState(groupId, options?.groupMembers || []);
+    const epochRec = fsm.epochs[epoch];
+    if (!epochRec) {
+      throw new E2EEError('MISSING_KEYS', 'Group epoch key for this file is no longer available');
+    }
+    const keyBytes = hkdf(sha256, epochRec.rootKey, new TextEncoder().encode(roomId), fileKeyInfo(roomId, epoch), 32);
+    try {
+      key = await webCrypto.subtle.importKey(
+        'raw',
+        keyBytes as unknown as BufferSource,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['decrypt']
+      );
+    } finally {
+      zeroizeBuffer(keyBytes);
+    }
+  } else if (kind === FILE_ENCRYPTION_KIND_MANUAL) {
+    const manualSecret = options?.customSecret ?? getRoomSecret(roomId);
+    if (!manualSecret) {
+      throw new E2EEError('MISSING_KEYS', 'Manual passphrase is required to decrypt this file');
+    }
+    key = await derivePbkdf2AesKey(roomId, manualSecret, PBKDF2_ITERATIONS_NEW, 'file-v1');
+  } else if (kind === FILE_ENCRYPTION_KIND_DM) {
+    // کلید را مستقیم از بیت‌های ECDH می‌سازیم (همان مسیر رمزنگاری) تا
+    // نیازی به دانستن kind در زمان رمزگشایی نباشد؛ خطا یعنی کلید نادرست.
+    const derived = await getRoomFileKey(roomId, options);
+    if (derived.kind !== FILE_ENCRYPTION_KIND_DM) {
+      throw new E2EEError('MISSING_KEYS', 'DM file key is unavailable');
+    }
+    key = derived.key;
+  } else {
+    throw new E2EEError('MALFORMED_PAYLOAD', 'Unknown encrypted file kind');
+  }
+
+  try {
+    const plainBuffer = await webCrypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: iv as unknown as BufferSource },
+      key,
+      cipherBytes as unknown as BufferSource
+    );
+    return new Uint8Array(plainBuffer);
+  } catch {
+    throw new E2EEError('DECRYPTION_FAILED', 'File AES-GCM authentication or decryption failed');
+  }
+}
+
+/** آیا این بایت‌ها یک فایل رمز شده با قالب PQF1 هستند؟ */
+export function isEncryptedFileBytes(data: Uint8Array | null | undefined): boolean {
+  if (!data || data.length < FILE_ENCRYPTION_HEADER_LEN) return false;
+  return (
+    data[0] === 0x50 && data[1] === 0x51 && data[2] === 0x46 && data[3] === 0x31 // 'PQF1'
+  );
 }
 
 export function getRoomSecret(roomId: string): string {
