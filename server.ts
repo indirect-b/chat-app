@@ -36,8 +36,13 @@ import {
   GOOGLE_LOGIN_FAILED_MSG,
 } from './src/server/google';
 import { PRIVACY_HTML } from './src/server/privacy';
+import {
+  resolveGoogleProfileSync,
+  resolveProfileUpdate,
+  type GoogleProfile,
+} from './src/server/profileSync';
 
-const APP_VERSION = '6.4.0';
+const APP_VERSION = '6.5.0';
 const recoverRateLimiter = new RecoveryRateLimiter(5, 15 * 60 * 1000);
 
 // کلید سرور برای پروتکل احراز هویت کور Ristretto255-VOPRF (RFC 9497)
@@ -80,7 +85,7 @@ app.use(
         scriptSrc: ["'self'", 'https://accounts.google.com'],
         styleSrc: ["'self'"],
         fontSrc: ["'self'", 'data:'],
-        imgSrc: ["'self'", 'data:', 'blob:'],
+        imgSrc: ["'self'", 'data:', 'blob:', 'https://lh3.googleusercontent.com'],
         mediaSrc: ["'self'", 'data:', 'blob:'],
         connectSrc: [
           "'self'",
@@ -403,8 +408,17 @@ const pendingRecoveryCodes = new PendingRecoveryCodes();
  * issues a 7-day session token. The recovery code is returned to the
  * caller; it is the caller's job to deliver it safely (JSON reply for
  * popup, one-time fetch for redirect — never in a URL).
+ *
+ * Google profile sync: the token's display name and photo become the
+ * chat profile by default. A new user is created with them (flags 0).
+ * An existing user gets them refreshed ONLY for fields they never
+ * edited manually (name_custom / avatar_custom = 0) — a manual edit
+ * always wins and is never overwritten by a later login.
  */
-async function completeGoogleSignIn(email: string): Promise<{
+async function completeGoogleSignIn(
+  email: string,
+  profile: GoogleProfile = { name: null, picture: null }
+): Promise<{
   sessionToken: string;
   username: string;
   isNew: boolean;
@@ -417,9 +431,22 @@ async function completeGoogleSignIn(email: string): Promise<{
     recoveryCode = generateRecoveryCode();
     const recoveryCodeHash = await hashRecoveryCode(recoveryCode);
     await pool.query(
-      'INSERT INTO users (username, bale_chat_id, joined_at, recovery_code_hash, email) VALUES ($1, $2, $3, $4, $5)',
-      [email, null, new Date().toISOString(), recoveryCodeHash, email]
+      'INSERT INTO users (username, bale_chat_id, joined_at, recovery_code_hash, email, display_name, avatar, name_custom, avatar_custom) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+      [email, null, new Date().toISOString(), recoveryCodeHash, email, profile.name, profile.picture, 0, 0]
     );
+  } else {
+    const { rows: stored } = await pool.query(
+      'SELECT display_name, avatar, name_custom, avatar_custom FROM users WHERE username = $1',
+      [email]
+    );
+    const merged = resolveGoogleProfileSync(stored[0] || {}, profile);
+    if (merged) {
+      await pool.query('UPDATE users SET display_name=$1, avatar=$2 WHERE username=$3', [
+        merged.display_name,
+        merged.avatar,
+        email,
+      ]);
+    }
   }
 
   const sessionToken = uuidv4();
@@ -440,12 +467,13 @@ app.post('/api/google-login', async (req: Request, res: Response) => {
   // توکن ID گوگل سمت سرور با کلیدهای گوگل بررسی می‌شود؛ در هر خطایی
   // (امضای نامعتبر، audience اشتباه، توکن منقضی، ایمیل تأییدنشده) پیام
   // کلی برمی‌گردد و هیچ جزئیاتی به بیرون درز نمی‌کند.
-  let email: string;
+  let verified: { email: string; profile: GoogleProfile };
   try {
-    email = await verifyGoogleIdToken(idToken);
+    verified = await verifyGoogleIdToken(idToken);
   } catch {
     return res.json({ ok: false, msg: GOOGLE_LOGIN_FAILED_MSG });
   }
+  const email = verified.email;
 
   if (await isUserBlocked(email)) {
     return res.status(403).json({ ok: false, msg: 'این حساب مسدود شده است.' });
@@ -453,7 +481,10 @@ app.post('/api/google-login', async (req: Request, res: Response) => {
 
   // گوگل خودش مالکیت ایمیل را اثبات کرده است؛ کاربر تازه اتمیک ساخته
   // می‌شود (ثبت‌نام جداگانه‌ای وجود ندارد) و کد بازیابی فقط همین‌بار نمایش داده می‌شود.
-  const { sessionToken, username, isNew, recoveryCode } = await completeGoogleSignIn(email);
+  const { sessionToken, username, isNew, recoveryCode } = await completeGoogleSignIn(
+    email,
+    verified.profile
+  );
 
   res.json({
     ok: true,
@@ -492,18 +523,22 @@ app.post('/api/google-redirect', async (req: Request, res: Response) => {
     return res.status(403).send(GOOGLE_LOGIN_FAILED_MSG);
   }
 
-  let email: string;
+  let verified: { email: string; profile: GoogleProfile };
   try {
-    email = await verifyGoogleIdToken(credential);
+    verified = await verifyGoogleIdToken(credential);
   } catch {
     return res.status(403).send(GOOGLE_LOGIN_FAILED_MSG);
   }
+  const email = verified.email;
 
   if (await isUserBlocked(email)) {
     return res.status(403).send('این حساب مسدود شده است.');
   }
 
-  const { sessionToken, isNew, recoveryCode } = await completeGoogleSignIn(email);
+  const { sessionToken, isNew, recoveryCode } = await completeGoogleSignIn(
+    email,
+    verified.profile
+  );
   if (isNew && recoveryCode) {
     pendingRecoveryCodes.store(sessionToken, recoveryCode, Date.now());
   }
@@ -625,7 +660,7 @@ app.post('/api/voprf/evaluate', (req: Request, res: Response) => {
 // ===== USER & HYBRID POST-QUANTUM PUBLIC KEY DIRECTORY =====
 app.get('/api/user/:username', async (req: Request, res: Response) => {
   const { rows } = await pool.query(
-    'SELECT username, avatar, bio, status, public_key FROM users WHERE username = $1',
+    'SELECT username, display_name, avatar, bio, status, public_key FROM users WHERE username = $1',
     [req.params.username]
   );
   if (!rows.length) return res.json({ ok: false });
@@ -710,17 +745,35 @@ app.get('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
 app.post('/api/user/update', async (req: Request, res: Response) => {
   // A user may only update their OWN profile: without this check anyone
   // could overwrite any user's bio, status and avatar by posting a username.
-  const { username, bio, status, avatar } = req.body || {};
+  // The display name is editable here too; a value that actually differs
+  // from the stored one raises the matching custom flag, so later Google
+  // logins stop overwriting that field (a save that changes nothing
+  // leaves the flags — and future Google sync — untouched).
+  const { username, bio, status, avatar, display_name } = req.body || {};
   const access = checkOwnUsername(getSessionUsername(req), String(username ?? ''));
   if (access !== 'ok') {
     return res.status(403).json({ ok: false, msg: 'unauthorized' });
   }
-  await pool.query('UPDATE users SET bio=$1, status=$2, avatar=$3 WHERE username=$4', [
-    bio || '',
-    status || 'online',
-    avatar || null,
-    username,
-  ]);
+  const { rows } = await pool.query(
+    'SELECT display_name, avatar, name_custom, avatar_custom FROM users WHERE username = $1',
+    [username]
+  );
+  const merged = resolveProfileUpdate(rows[0] || {}, {
+    display_name: 'display_name' in (req.body || {}) ? display_name : undefined,
+    avatar: 'avatar' in (req.body || {}) ? avatar : undefined,
+  });
+  await pool.query(
+    'UPDATE users SET bio=$1, status=$2, avatar=$3, display_name=$4, name_custom=$5, avatar_custom=$6 WHERE username=$7',
+    [
+      bio || '',
+      status || 'online',
+      merged.avatar,
+      merged.display_name,
+      merged.name_custom,
+      merged.avatar_custom,
+      username,
+    ]
+  );
   res.json({ ok: true });
 });
 
@@ -752,13 +805,14 @@ app.get('/api/contacts/:username', async (req: Request, res: Response) => {
     return res.status(403).json({ ok: false, msg: 'unauthorized' });
   }
   const { rows } = await pool.query(
-    'SELECT c.contact, u.avatar, u.status, u.public_key FROM contacts c JOIN users u ON c.contact = u.username WHERE c.username = $1',
+    'SELECT c.contact, u.display_name, u.avatar, u.status, u.public_key FROM contacts c JOIN users u ON c.contact = u.username WHERE c.username = $1',
     [req.params.username]
   );
   res.json({
     ok: true,
     contacts: rows.map((r: any) => ({
       username: r.contact,
+      display_name: r.display_name || null,
       avatar: r.avatar,
       status: r.status,
       public_key: r.public_key || null,

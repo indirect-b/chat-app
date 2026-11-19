@@ -104,11 +104,51 @@ describe('verifyGoogleIdToken (fake verifier — never calls Google)', () => {
   });
 
   it('returns the normalized email for a verified token', async () => {
-    const email = await verifyGoogleIdToken(
+    const verified = await verifyGoogleIdToken(
       'fake.valid.token',
       async () => ({ email: 'User@Example.com', emailVerified: true })
     );
-    assert.equal(email, 'user@example.com');
+    assert.equal(verified.email, 'user@example.com');
+    assert.equal(verified.profile.name, null);
+    assert.equal(verified.profile.picture, null);
+  });
+
+  it('returns the Google display name and photo from the token', async () => {
+    const verified = await verifyGoogleIdToken(
+      'fake.valid.token',
+      async () => ({
+        email: 'user@example.com',
+        emailVerified: true,
+        name: '  Mohammad Taha  ',
+        picture: 'https://lh3.googleusercontent.com/a-/photo123',
+      })
+    );
+    assert.equal(verified.email, 'user@example.com');
+    assert.equal(verified.profile.name, 'Mohammad Taha');
+    assert.equal(verified.profile.picture, 'https://lh3.googleusercontent.com/a-/photo123');
+  });
+
+  it('tolerates a token without name or picture', async () => {
+    const verified = await verifyGoogleIdToken(
+      'fake.valid.token',
+      async () => ({ email: 'user@example.com', emailVerified: true })
+    );
+    assert.equal(verified.profile.name, null);
+    assert.equal(verified.profile.picture, null);
+  });
+
+  it('drops a profile photo from any host other than the Google photo host', async () => {
+    const verified = await verifyGoogleIdToken(
+      'fake.valid.token',
+      async () => ({
+        email: 'user@example.com',
+        emailVerified: true,
+        name: 'User',
+        picture: 'https://evil.example.com/photo.jpg',
+      })
+    );
+    assert.equal(verified.profile.name, 'User');
+    assert.equal(verified.profile.picture, null);
   });
 
   it('rejects when the verifier throws (bad signature / expired token)', async () => {

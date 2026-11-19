@@ -87,7 +87,7 @@ describe('route wiring (server.ts source — server never started in tests)', ()
     assert.ok(contactsHandler.includes("res.status(403)"));
     // The SELECT must come after the gate.
     const gateAt = contactsHandler.indexOf("if (access !== 'ok')");
-    const selectAt = contactsHandler.indexOf('SELECT c.contact, u.avatar');
+    const selectAt = contactsHandler.indexOf('SELECT c.contact, u.display_name, u.avatar');
     assert.ok(gateAt !== -1 && selectAt !== -1 && gateAt < selectAt);
   });
 });
