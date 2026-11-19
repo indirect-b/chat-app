@@ -102,6 +102,26 @@ export async function verifyRecoveryCode(
   }
 }
 
+/**
+ * Account-deletion confirmation (Google-only login).
+ *
+ * Deletion used to be confirmed with a 6-digit OTP sent through the Bale
+ * bot; that channel is gone, so the one-time recovery code is the
+ * confirmation instead. Returns true only when the candidate matches
+ * the stored scrypt hash. Accounts created before recovery codes
+ * existed have no hash (NULL) — for them the already-verified session
+ * is the only proof available, so deletion proceeds on the session
+ * alone. This is a deliberate legacy fallback, not a bypass for
+ * code-holding accounts: a hash, once set, must always verify.
+ */
+export async function canDeleteWithCode(
+  storedHash: string | null | undefined,
+  candidateCode: string
+): Promise<boolean> {
+  if (!storedHash) return true;
+  return verifyRecoveryCode(candidateCode, storedHash);
+}
+
 export interface RateLimitResult {
   allowed: boolean;
   retryAfterSec: number;
