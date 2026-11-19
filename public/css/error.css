@@ -1,0 +1,50 @@
+@font-face{
+  font-family:'Vazirmatn';
+  font-style:normal;
+  font-weight:300 700;
+  font-display:swap;
+  src:url('/fonts/vazirmatn-arabic.woff2') format('woff2');
+  unicode-range:U+0600-06FF,U+0750-077F,U+0870-088E,U+0890-0891,U+0898-08E1,U+08E3-08FF,U+200C-200E,U+2010-2011,U+204F,U+2E41,U+FB50-FDFF,U+FE70-FE74,U+FE76-FEFC;
+}
+@font-face{
+  font-family:'Vazirmatn';
+  font-style:normal;
+  font-weight:300 700;
+  font-display:swap;
+  src:url('/fonts/vazirmatn-latin.woff2') format('woff2');
+  unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  font-family:'Vazirmatn',system-ui,sans-serif;
+  background:linear-gradient(135deg,#0f0f1a,#16213e,#0f3460);
+  color:#f0f0f0;
+  min-height:100vh;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  direction:rtl;
+  padding:20px;
+}
+main{
+  max-width:400px;
+  width:100%;
+  background:rgba(255,255,255,.05);
+  border:1px solid rgba(255,255,255,.12);
+  border-radius:24px;
+  padding:36px 28px;
+  text-align:center;
+}
+.error-icon{font-size:48px}
+h1{font-size:22px;margin:12px 0 8px}
+p{font-size:14px;color:#9ca3af;margin-bottom:24px;line-height:1.7}
+a.home-link{
+  display:inline-block;
+  background:linear-gradient(135deg,#7c3aed,#06b6d4);
+  color:#ffffff;
+  text-decoration:none;
+  padding:12px 24px;
+  border-radius:12px;
+  font-weight:600;
+  font-size:14px;
+}
