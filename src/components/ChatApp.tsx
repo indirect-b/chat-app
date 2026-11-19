@@ -6,8 +6,11 @@ import {
   acquireBlindedIdentityToken,
   rotateGroupEpoch,
   getGroupEpochState,
+  createGroupEpochPacket,
+  decapsulateGroupEpochKey,
   encryptMessageText,
   decryptMessageText,
+  E2EEError,
   isE2EEEnabled,
   setE2EEEnabled,
   getRoomSecret,
@@ -18,9 +21,6 @@ import {
   parsePeerKeyBundle,
   getStoredPeerPublicKey,
   setStoredPeerPublicKey,
-  createGroupEpochPacket,
-  decapsulateGroupEpochKey,
-  E2EEError,
 } from '../utils/crypto';
 import {
   SAFETY_STRINGS_FA,
@@ -293,7 +293,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     [myUsername, syncPeerPublicKeyAndObserve]
   );
 
-  // (رفع F3) تضمین کلید اپوک گروه: اگر بسته کلید برای این اپوک موجود است،
+  // (رفع F3، بازیابی‌شده از دور اول) تضمین کلید اپوک گروه: اگر بسته کلید برای این اپوک موجود است،
   // کپسول خودم را باز می‌کنم و می‌چرخانم؛ اگر نیست و من توزیع‌کننده‌ام
   // (سازنده گروه = اولین عضو)، بسته را می‌سازم و منتشر می‌کنم.
   const ensureGroupEpochPacket = useCallback(
@@ -450,14 +450,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   );
 
   const processDecryption = useCallback(
-    async (
-      msg: ChatMessage,
-      roomId: string,
-      // (رفع F7) allowCache=false یعنی مسیر شبکه: پیام تازه‌رسیده نباید از
-      // کش پیام‌های پیش‌تر رمزگشایی‌شده خوانده شود تا Replay رد شود.
-      // مسیر نمایش (باز کردن اتاق، پیش‌نمایش) مقدار پیش‌فرض true را می‌گیرد.
-      allowCache = true
-    ): Promise<DecryptedChatMessage> => {
+    async (msg: ChatMessage, roomId: string): Promise<DecryptedChatMessage> => {
       let peerPublicKey = getPeerKeyForRoom(roomId);
       const partner = roomId.startsWith('group__') ? undefined : roomId.split('__').find(u => u !== myUsername);
       if (!peerPublicKey && partner) {
@@ -477,25 +470,40 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       const gId = roomId.startsWith('group__') ? roomId.replace('group__', '') : '';
       const groupMembers = gId ? groupMembersRef.current[gId] || [] : undefined;
 
-      const dec = await decryptMessageText(msg.text || '', roomId, {
-        myUsername,
-        peerPublicKey,
-        peerUsername: partner,
-        sender: msg.sender,
-        groupMembers,
-        allowCache,
-      });
-      let decReply = msg.reply_to_text;
-      if (msg.reply_to_text && isE2EEPayload(msg.reply_to_text)) {
-        const rDec = await decryptMessageText(msg.reply_to_text, roomId, {
+      let dec: Awaited<ReturnType<typeof decryptMessageText>>;
+      try {
+        dec = await decryptMessageText(msg.text || '', roomId, {
           myUsername,
           peerPublicKey,
           peerUsername: partner,
           sender: msg.sender,
           groupMembers,
-          allowCache,
         });
-        decReply = rDec.text;
+      } catch (err) {
+        const isSigErr = err instanceof E2EEError && (err.code === 'INVALID_SIGNATURE' || err.code === 'MISSING_SIGNATURE');
+        dec = {
+          text: isSigErr
+            ? '⛔ [پیام رد شد: امضای پساکوانتومی ML-DSA-65 نامعتبر است]'
+            : '🔒 [پیام رمزنگاری‌شده - کلید این نشست در دسترس نیست یا بازنشانی شده است]',
+          isEncrypted: true,
+          mldsaVerified: false,
+          failed: true,
+        };
+      }
+      let decReply = msg.reply_to_text;
+      if (msg.reply_to_text && isE2EEPayload(msg.reply_to_text)) {
+        try {
+          const rDec = await decryptMessageText(msg.reply_to_text, roomId, {
+            myUsername,
+            peerPublicKey,
+            peerUsername: partner,
+            sender: msg.sender,
+            groupMembers,
+          });
+          decReply = rDec.text;
+        } catch {
+          decReply = '🔒 [پیام رمزنگاری‌شده]';
+        }
       }
       return {
         ...msg,
@@ -568,17 +576,10 @@ export const ChatApp: React.FC<ChatAppProps> = ({
 
   // Initial load + Ristretto255-VOPRF Blinded Auth + Post-Quantum Hybrid Key Exchange (ML-KEM-768 + P-256)
   useEffect(() => {
-    // (رفع F2) احراز هویت سوکت با توکن نشست؛ نام کاربری تنها قابل جعل است.
-    socket.emit('auth', {
-      username: myUsername,
-      token: (() => {
-        try {
-          return localStorage.getItem('chat_session_token') || '';
-        } catch {
-          return '';
-        }
-      })(),
-    });
+    const sessionToken = localStorage.getItem('chat_session_token') || '';
+    // (رفع F2، بازیابی‌شده از دور اول) سوکت فقط با توکن نشست معتبر احراز هویت می‌شود؛
+    // نام کاربری تنها قابل جعل است.
+    socket.emit('auth', { username: myUsername, token: sessionToken });
     loadRoomList('chats');
 
     acquireBlindedIdentityToken(myUsername)
@@ -588,14 +589,6 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       })
       .then(pubKey => {
         if (pubKey) {
-          // (رفع F2) انتشار باندل فقط با توکن نشست خود کاربر.
-          const sessionToken = (() => {
-            try {
-              return localStorage.getItem('chat_session_token') || '';
-            } catch {
-              return '';
-            }
-          })();
           fetch('/api/user/public-key', {
             method: 'POST',
             headers: {
@@ -646,9 +639,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         ? roomId.replace('group__', '')
         : roomId.split('__').find(u => u !== myUsername);
 
-      // (رفع F7) مسیر شبکه: پیام تازه‌رسیده با allowCache=false رمزگشایی
-      // می‌شود تا Replayِ همان بار از کش یا از گام مصرف‌شده رد شود.
-      const decMsg = await processDecryption(msg, roomId, false);
+      const decMsg = await processDecryption(msg, roomId);
       const previewStr =
         decMsg.decryptedText ||
         (msg.file_type === 'image' ? '📷 عکس' : msg.file_type === 'voice' ? '🎤 ویس' : '📁 فایل');
@@ -684,10 +675,19 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       newText: string;
     }) => {
       if (roomId !== currentRoomRef.current) return;
-      const dec = await decryptMessageText(newText, roomId, {
-        myUsername,
-        peerPublicKey: getPeerKeyForRoom(roomId),
-      });
+      let dec: Awaited<ReturnType<typeof decryptMessageText>>;
+      try {
+        dec = await decryptMessageText(newText, roomId, {
+          myUsername,
+          peerPublicKey: getPeerKeyForRoom(roomId),
+        });
+      } catch {
+        dec = {
+          text: '🔒 [پیام ویرایش‌شده قابل رمزگشایی نیست]',
+          isEncrypted: true,
+          failed: true,
+        };
+      }
       setMessages(prev =>
         prev.map(m =>
           m.id === msgId
@@ -696,6 +696,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 text: newText,
                 decryptedText: dec.text,
                 isE2EE: dec.isEncrypted,
+                decryptFailed: dec.failed,
                 is_edited: true,
               }
             : m
@@ -942,7 +943,6 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     formatMessageTime,
     syncPeerPublicKeyAndObserve,
     syncGroupMembersPublicKeys,
-    ensureGroupEpochPacket,
   ]);
 
   const handleOpenChat = async (room: RoomSummary) => {
@@ -1009,8 +1009,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     const trimmed = messageText.trim();
     if (!trimmed || !currentRoom || !currentPartner) return;
 
-    // (رفع F5) شکست رمزنگاری = عدم ارسال؛ پیام هرگز به‌صورت متن ساده نمی‌رود.
-    let payloadText: string;
+    let payloadText = trimmed;
     if (e2eeActive) {
       try {
         payloadText = await encryptMessageText(trimmed, currentRoom, {
@@ -1020,13 +1019,11 @@ export const ChatApp: React.FC<ChatAppProps> = ({
           groupMembers: currentIsGroup && currentPartner ? groupMembersRef.current[currentPartner] || [] : undefined,
         });
       } catch (err) {
-        showToast(
-          `⛔ پیام ارسال نشد — رمزنگاری ناموفق بود: ${err instanceof Error ? err.message : 'خطای نامشخص'}`
-        );
+        // F5 Fail-Closed: abort send completely if encryption fails
+        const reason = err instanceof E2EEError ? err.code : 'ENCRYPTION_FAILED';
+        showToast(`⛔ خطا در رمزنگاری سرتاسری (${reason}) — ارسال پیام لغو شد`);
         return;
       }
-    } else {
-      payloadText = trimmed;
     }
 
     socket.emit('send-message', {
@@ -1213,9 +1210,15 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     );
 
     try {
+      // (رفع F2، بازیابی‌شده از دور اول) سرور ساخت گروه را فقط با توکن نشست معتبر می‌پذیرد؛
+      // این هدر در دور اول از کلاینت جا مانده بود (باگ پنهان دور اول — ساخت گروه 401 می‌خورد).
+      const sessionToken = localStorage.getItem('chat_session_token') || '';
       const res = await fetch('/api/create-group', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+        },
         body: JSON.stringify({
           name: trimmedName,
           members,
@@ -1339,8 +1342,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   const handleSubmitEdit = async () => {
     const trimmed = editModal.text.trim();
     if (!trimmed || !currentRoom) return;
-    // (رفع F5) شکست رمزنگاری = عدم ارسال ویرایش؛ متن ساده هرگز نمی‌رود.
-    let payload: string;
+    let payload = trimmed;
     if (e2eeActive) {
       try {
         payload = await encryptMessageText(trimmed, currentRoom, {
@@ -1349,13 +1351,10 @@ export const ChatApp: React.FC<ChatAppProps> = ({
           peerUsername: !currentIsGroup && currentPartner ? currentPartner : undefined,
         });
       } catch (err) {
-        showToast(
-          `⛔ ویرایش ارسال نشد — رمزنگاری ناموفق بود: ${err instanceof Error ? err.message : 'خطای نامشخص'}`
-        );
+        const reason = err instanceof E2EEError ? err.code : 'ENCRYPTION_FAILED';
+        showToast(`⛔ خطا در رمزنگاری ویرایش (${reason}) — ویرایش لغو شد`);
         return;
       }
-    } else {
-      payload = trimmed;
     }
     socket.emit('edit-message', {
       msgId: ctxMenu.msgId,
