@@ -470,7 +470,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     [myUsername, syncPeerPublicKeyAndObserve]
   );
 
-  // (رفع F3، بازیابی‌شده از دور اول) تضمین کلید اپوک گروه: اگر بسته کلید برای این اپوک موجود است،
+  // کلید اپوک گروه: در صورتی که بسته کلید برای این اپوک موجود باشد،
   // کپسول خودم را باز می‌کنم و می‌چرخانم؛ اگر نیست و من توزیع‌کننده‌ام
   // (سازنده گروه = اولین عضو)، بسته را می‌سازم و منتشر می‌کنم.
   const ensureGroupEpochPacket = useCallback(
@@ -769,7 +769,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   // Initial load + Ristretto255-VOPRF Blinded Auth + Post-Quantum Hybrid Key Exchange (ML-KEM-768 + P-256)
   useEffect(() => {
     const sessionToken = localStorage.getItem('chat_session_token') || '';
-    // (رفع F2، بازیابی‌شده از دور اول) سوکت فقط با توکن نشست معتبر احراز هویت می‌شود؛
+    // اتصال سوکت با توکن نشست معتبر احراز هویت می‌شود؛
     // نام کاربری تنها قابل جعل است.
     socket.emit('auth', { username: myUsername, token: sessionToken });
     loadRoomList('chats');
@@ -1071,7 +1071,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     }) => {
       groupMembersRef.current[groupId] = members;
       void syncGroupMembersPublicKeys(members);
-      // (رفع F3) اگر بسته کلید همراه رویداد آمد، کپسول خودم را باز می‌کنم؛
+      // در صورت دریافت بسته کلید همراه رویداد، کپسول محلی بازگشایی می‌شود؛
       // در غیر این صورت بسته را می‌گیرم یا (اگر توزیع‌کننده‌ام) می‌سازم.
       if (epochKeys && epochKeys[myUsername]) {
         const epochKey = await decapsulateGroupEpochKey(myUsername, epochKeys[myUsername]);
@@ -1293,7 +1293,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
 
     try {
       // Media E2EE: بایت‌های فایل پیش از آپلود با کلید پایدار اتاق رمز می‌شوند؛
-      // بدون کلید اتاق، Fail-Closed — هیچی آپلود نمی‌شود (مثل پیام، رفع F5).
+      // در نبود کلید اتاق، فرآیند متوقف شده و هیچ فایلی آپلود نخواهد شد (Fail-Closed).
       // اگر E2EE خاموش است، مثل پیام متنی، فایل خام فرستاده می‌شود.
       let uploadFile: File = file;
       if (e2eeActive) {
@@ -1455,8 +1455,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     );
 
     try {
-      // (رفع F2، بازیابی‌شده از دور اول) سرور ساخت گروه را فقط با توکن نشست معتبر می‌پذیرد؛
-      // این هدر در دور اول از کلاینت جا مانده بود (باگ پنهان دور اول — ساخت گروه 401 می‌خورد).
+      // ارسال توکن احراز هویت نشست در هدر ساخت گروه جدید.
       const sessionToken = localStorage.getItem('chat_session_token') || '';
       const res = await fetch('/api/create-group', {
         method: 'POST',

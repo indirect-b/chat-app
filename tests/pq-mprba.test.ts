@@ -404,7 +404,7 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
   it('supports Group Epoch FSM rotation with ML-KEM-768 epoch packets, 3-epoch grace buffer, and expires older epochs', async () => {
     const roomId = 'group__sec-team';
     const members = ['alice', 'bob', 'carol'];
-    // باندل‌های تأییدشده اعضا برای ساخت بسته کلید اپوک (رفع F3)
+    // باندل‌های تأییدشده اعضا برای ساخت بسته کلید اپوک
     const bundles: Record<string, ReturnType<typeof parsePeerKeyBundle>> = {};
     for (const m of members) {
       const bundleStr = (await ensureUserHybridKeyPair(m))!;

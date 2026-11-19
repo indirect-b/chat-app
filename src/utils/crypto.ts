@@ -39,8 +39,8 @@ const VOPRF_TOKEN_PREFIX = 'chat_voprf_token_';
 const MAX_SKIP = 100; // حداکثر پرش مجاز برای پیام‌های خارج از نوبت (محافظت در برابر DoS)
 const SKIPPED_KEY_TTL_MS = 10 * 60 * 1000; // ۱۰ دقیقه نگهداری کلیدهای پرش‌خورده در RAM
 const GROUP_EPOCH_GRACE_BUFFER = 3; // نگهداری ۳ اپوک قبلی برای رمزگشایی پیام‌های در حال پرواز هنگام تغییر اعضا
-const PQ_REKEY_AFTER_MESSAGES = 50; // (رفع F9، بازیابی‌شده از دور اول) چرخش نشست راتچت پس از هر ۵۰ پیام ارسالی
-const PBKDF2_ITERATIONS_NEW = 600000; // (رفع F4، بازیابی‌شده از دور اول) OWASP 2023 برای PBKDF2-HMAC-SHA-256
+const PQ_REKEY_AFTER_MESSAGES = 50; // چرخش دوره‌ای نشست راتچت پس از هر ۵۰ پیام ارسالی (Forward Secrecy)
+const PBKDF2_ITERATIONS_NEW = 600000; // تعداد تکرار بر اساس استاندارد OWASP برای PBKDF2-HMAC-SHA-256
 const PBKDF2_ITERATIONS_LEGACY = 50000; // مقدار پیشین؛ فقط برای رمزگشایی تاریخچه قدیمی
 const MAX_VERIFIED_BUNDLE_CACHE = 256;
 const MAX_SENT_PLAINTEXT_CACHE = 500;
@@ -122,7 +122,7 @@ interface RatchetSessionState {
   recvChainKey: Uint8Array;
   sendStep: number;
   recvStep: number;
-  sentSinceRekey: number; // پیام‌های ارسالی از آخرین چرخش (رفع F9)
+  sentSinceRekey: number; // پیام‌های ارسالی از آخرین چرخش کلید
   seenRecvSteps: Set<number>;
   kemCipherTextB64: string; // کپسول ML-KEM-768 برای همگام‌سازی طرف مقابل
   peerKemFingerprint: string;
@@ -134,7 +134,7 @@ export interface GroupEpochKeyRecord {
   rootKey: Uint8Array;
   createdAt: number;
   membersHash: string;
-  seenMessageKeys?: string[]; // هش پیام‌های گروهی تحویل‌شده در این اپوک — ضد Replay (رفع F7)
+  seenMessageKeys?: string[]; // شناسه پیام‌های تحویل‌شده در این اپوک جهت جلوگیری از Replay
 }
 
 export interface GroupEpochState {
@@ -720,7 +720,7 @@ async function deriveECDHSharedAesKey(
   }
   const bits = await deriveECDHSharedBits(myUsername, ecdhJwk);
   try {
-    // (رفع F10، بازیابی‌شده از دور اول) خروجی خام ECDH مستقیم به‌عنوان کلید AES استفاده نمی‌شود؛
+    // خروجی خام ECDH مستقیم به‌عنوان کلید AES استفاده نمی‌شود؛ مشتق‌سازی با HKDF انجام می‌شود؛
     // نخست از HKDF با salt شناسه اتاق و info وابسته به هویت مخاطب می‌گذرد،
     // تا کلید هر اتاق جدا باشد.
     const keyBytes = hkdf(
@@ -1174,7 +1174,7 @@ function computeMembersHash(members: string[]): string {
 }
 
 /**
- * (رفع F3، بازیابی‌شده از دور اول) کلید اپوک گروه هرگز به‌صورت قطعی از ورودی‌های عمومی مشتق نمی‌شود.
+ * کلید اپوک گروه هرگز به‌صورت قطعی از ورودی‌های عمومی مشتق نمی‌شود.
  * توزیع‌کننده اپوک (سازنده گروه) یک کلید تصادفی ۳۲ بایتی می‌سازد و آن را
  * برای هر عضو با ML-KEM-768 به کلید عمومی تأییدشده باندل او کپسوله می‌کند؛
  * سرور فقط کپسول‌ها را جابه‌جا می‌کند و کلید را نمی‌بیند.
@@ -1281,7 +1281,7 @@ export function getGroupEpochState(groupId: string, members: string[] = []): Gro
   const existing = groupFsmMap.get(groupId);
   if (existing) return existing;
 
-  // (رفع F3، بازیابی‌شده از دور اول) بدون بسته کلید اپوک، هیچ کلیدی ساخته نمی‌شود؛ اپوک ۱ هم
+  // بدون بسته کلید اپوک، هیچ کلیدی ساخته نمی‌شود؛ اپوک ۱ هم
   // باید از طریق بسته ML-KEM برسد. تا آن زمان پیام گروهی ارسال نمی‌شود.
   const initial: GroupEpochState = {
     groupId,
@@ -1357,7 +1357,7 @@ async function derivePbkdf2AesKey(
   iterations: number = PBKDF2_ITERATIONS_NEW,
   purpose: string = ''
 ): Promise<CryptoKey> {
-  // (رفع F4، بازیابی‌شده از دور اول) رمز دستی الزامی است؛ عبارت پیش‌فرض عمومی حذف شد. بدون رمز،
+  // تعیین رمز عبور الزامی است؛ بدون رمز،
   // این تابع صدا زده نمی‌شود و encryptMessageText خطا می‌دهد.
   if (!customSecret) {
     throw new E2EEError('MISSING_KEYS', 'A manual passphrase is required: no default passphrase exists.');
@@ -1484,7 +1484,7 @@ export async function encryptMessageText(
           options.peerUsername
         );
 
-        // (رفع F9، بازیابی‌شده از دور اول) چرخش دوره‌ای نشست پس از PQ_REKEY_AFTER_MESSAGES پیام ارسالی —
+        // چرخش دوره‌ای نشست پس از PQ_REKEY_AFTER_MESSAGES پیام ارسالی —
         // کلید زنجیره قدیمی صفر می‌شود و کپسول تازه برای طرف مقابل ارسال می‌شود.
         if (ratchetState.sentSinceRekey >= PQ_REKEY_AFTER_MESSAGES) {
           ratchetState = await ensurePQRatchetSession(
@@ -1792,7 +1792,7 @@ export async function decryptMessageText(
     const groupId = roomId.replace('group__', '');
     const fsm = getGroupEpochState(groupId, options?.groupMembers || []);
 
-    // (رفع F3، بازیابی‌شده از دور اول) بدون کلید اپوک ذخیره‌شده، پیام قفل می‌ماند؛
+    // بدون کلید اپوک ذخیره‌شده، پیام قفل می‌ماند؛
     // مشتق قطعی کلید از ورودی‌های عمومی حذف شد.
     const epochRec = fsm.epochs[msgEpoch];
     if (!epochRec) {
@@ -1802,7 +1802,7 @@ export async function decryptMessageText(
       throw new E2EEError('DECRYPTION_FAILED', 'Group epoch membersHash mismatch');
     }
 
-    // (رفع F7، بازیابی‌شده از دور اول) Replay پیام گروهی: همان بار نباید دو بار پذیرفته شود.
+    // جلوگیری از Replay پیام گروهی: همان بار نباید دو بار پذیرفته شود.
     if (epochRec.seenMessageKeys?.includes(payloadHashKey)) {
       throw new E2EEError('REPLAY_DETECTED', 'Replayed group message rejected');
     }
@@ -1893,7 +1893,7 @@ export async function decryptMessageText(
   if (!manualSecret) {
     throw new E2EEError('MISSING_KEYS', 'Missing manual room secret for PBKDF2 decryption');
   }
-  // (رفع F4) رمزگذاری تازه با ۶۰۰٬۰۰۰ تکرار انجام می‌شود؛ برای تاریخچه قدیمی (۵۰٬۰۰۰ تکرار) هم تلاش کن.
+  // رمزگذاری داده‌های جدید با ۶۰۰٬۰۰۰ تکرار انجام می‌شود؛ سازگاری با داده‌های قدیمی (۵۰٬۰۰۰ تکرار) هم حفظ می‌شود.
   let decryptedBuffer: ArrayBuffer | null = null;
   for (const iterations of [PBKDF2_ITERATIONS_NEW, PBKDF2_ITERATIONS_LEGACY]) {
     try {

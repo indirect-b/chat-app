@@ -142,7 +142,7 @@ describe('Fuzz Tests — Fail-Closed Parsing & Decryption', () => {
 
     const groupRoom = 'group__fuzz-room';
     const groupMembers = ['alice', 'bob'];
-    // (رفع F3) رمزگذاری گروهی بدون بسته کلید اپوک خطا می‌دهد؛ نخست بسته را بساز و بچرخان.
+    // رمزگذاری گروهی نیازمند بسته کلید معتبر اپوک است؛ ابتدا بسته ساخته و فعال شود.
     const groupBundles: Record<string, ReturnType<typeof parsePeerKeyBundle>> = {};
     for (const m of groupMembers) {
       groupBundles[m] = parsePeerKeyBundle(m === 'alice' ? aliceBundle : bobBundle, m);

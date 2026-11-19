@@ -46,7 +46,7 @@ const APP_VERSION = '6.5.0';
 const recoverRateLimiter = new RecoveryRateLimiter(5, 15 * 60 * 1000);
 
 // کلید سرور برای پروتکل احراز هویت کور Ristretto255-VOPRF (RFC 9497)
-// (رفع F12، بازیابی‌شده از دور اول) بذر اختصاصی VOPRF_SEED (۳۲ بایت Base64) در اولویت است؛ در غیاب
+// در صورت وجود VOPRF_SEED اختصاصی (۳۲ بایت Base64) از آن استفاده می‌شود؛ در غیاب
 // آن، مشتق HKDF از رمز مدیر با salt ثابت — نه یک SHA-256 مستقیم از رمز.
 function resolveVoprfSeed(): Uint8Array {
   const envSeed = process.env.VOPRF_SEED;
@@ -652,7 +652,7 @@ app.post('/api/voprf/evaluate', (req: Request, res: Response) => {
       serverPublicKeyB64: Buffer.from(serverVoprfKeys.publicKey).toString('base64'),
     });
   } catch {
-    // (رفع F12، بازیابی‌شده از دور اول) پیام خطای داخلی به بیرون درز نمی‌کند.
+    // جلوگیری از انتشار جزئیات خطای داخلی سرور به پاسخ کلاینت.
     res.status(400).json({ ok: false });
   }
 });
@@ -670,7 +670,7 @@ app.get('/api/user/:username', async (req: Request, res: Response) => {
 app.post('/api/user/public-key', async (req: Request, res: Response) => {
   const { username, publicKey } = req.body;
   if (!username || !publicKey) return res.json({ ok: false });
-  // (رفع F2، بازیابی‌شده از دور اول) فقط خود کاربر با نشست معتبر می‌تواند باندل خودش را منتشر کند؛
+  // فقط کاربر احراز هویت شده با نشست معتبر امکان ثبت و تغییر باندل را دارد؛
   // در غیر این صورت هر کسی می‌توانست باندل هر کاربری را جایگزین کند.
   const sessionUser = getSessionUsername(req);
   if (!sessionUser || sessionUser !== username) {
@@ -687,7 +687,7 @@ app.post('/api/user/public-key', async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
-// ===== GROUP EPOCH KEY PACKETS (F3، بازیابی‌شده از دور اول) =====
+// ===== GROUP EPOCH KEY PACKETS =====
 // بسته کلید اپوک گروه: توزیع‌کننده (سازنده گروه) کلید تصادفی اپوک را با
 // ML-KEM-768 به هر عضو کپسوله می‌کند؛ سرور فقط کپسول‌ها را نگه می‌دارد و
 // جابه‌جا می‌کند و کلید را نمی‌بیند.
@@ -1063,7 +1063,7 @@ app.delete('/api/admin/message', async (req: Request, res: Response) => {
 app.post('/api/create-group', async (req: Request, res: Response) => {
   const { name, members, creator } = req.body;
   if (!name || !name.trim()) return res.json({ ok: false, msg: 'نام گروه را وارد کنید' });
-  // (رفع F2، بازیابی‌شده از دور اول) فقط کاربر واردشده می‌تواند گروهی به نام خودش بسازد.
+  // ایجاد گروه صرفاً با شناسه کاربری معتبر انجام می‌شود.
   const sessionUser = getSessionUsername(req);
   if (!sessionUser || sessionUser !== creator) {
     return res.status(401).json({ ok: false });
@@ -1333,7 +1333,7 @@ io.on('connection', async (socket) => {
   }
 
   socket.on('auth', async (authData: string | { username?: string; token?: string }) => {
-    // (رفع F2، بازیابی‌شده از دور اول) احراز هویت سوکت باید با توکن نشست معتبر باشد؛
+    // احراز هویت سوکت با توکن نشست معتبر بررسی می‌شود؛
     // نام کاربریِ تنها قابل جعل است (جعل حضور و دریافت پیام‌های دیگران).
     const username = typeof authData === 'string' ? authData : authData?.username;
     const token = typeof authData === 'string' ? undefined : authData?.token;

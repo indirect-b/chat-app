@@ -244,6 +244,13 @@ Full details in [CHANGELOG.md](CHANGELOG.md).
 - **v2.0** — Cluster-ready presence service
 - **v1.0** — Admin & environment security hardening
 
+## 🔄 Development & Release Workflow
+
+Development on `chat-app` follows an **offline milestone & staging model**:
+- Feature development, protocol refactoring, cryptanalysis, and benchmark testing are conducted locally in intensive iterative cycles (often over several weeks to a full month of offline R&D).
+- Once a release milestone is fully stabilized, fuzz-tested, and verified against NIST KAT vectors, the accumulated work is organized into structured, staged commits and uploaded to GitHub in managed, sequenced intervals.
+- Consequently, the Git commit history reflects concentrated milestone deployments rather than fragmented continuous commits.
+
 ---
 
 ## 🇮🇷 درباره پروژه (فارسی)
@@ -253,6 +260,10 @@ Full details in [CHANGELOG.md](CHANGELOG.md).
 **ML-KEM-768 + ECDH P-256** و احراز هویت کور **Ristretto255-VOPRF** است و هویت‌ها با امضای **ML-DSA-65** تأیید می‌شوند؛ یعنی سرور نه متن پیام‌ها
 را می‌بیند و نه می‌تواند هویت کاربران را به هم گره بزند. ورود با آیدی بله (کد تأیید از طریق ربات بله)
 انجام می‌شود و برای تست، ورود سریع بدون کد هم وجود دارد.
+
+### 🔄 چرخه توسعه و انتشار
+فرآیند توسعه این پروژه مبتنی بر **توسعه متمرکز محلی و انتشار تجمیعی (Milestone-based Staging)** است:
+کدنویسی، بازطراحی پروتکل‌ها، بهینه‌سازی‌های امنیتی و تست‌ها در دوره‌های زمانی فشرده (گاهاً در طول یک ماه کار مداوم آفلاین) روی سیستم محلی پیاده‌سازی و آزمایش می‌شوند. پس از دستیابی به نسخه پایدار و عبور موفق از تمامی تست‌های امنیتی و بنچمارک‌ها، تغییرات در قالب کامیت‌ها و شاخه‌های مشخص در فواصل زمانی مدیریت‌شده روی مخزن گیت‌هاب آپلود و ثبت می‌گردند.
 
 **اجرای سریع:** `npm install` ← ساخت فایل `.env` از روی `.env.example` ← `npm run dev`
 
