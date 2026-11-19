@@ -16,6 +16,7 @@ export interface DbUser {
   block_until: string | null;
   last_seen: string;
   recovery_code_hash?: string | null;
+  email?: string | null;
 }
 
 export interface DbContact {
@@ -226,7 +227,7 @@ export class PersistentFallbackDatabase {
       return { rows: list };
     }
     if (lower.startsWith('insert into users (username, bale_chat_id, joined_at')) {
-      const [username, bale_chat_id, joined_at, recovery_code_hash] = params;
+      const [username, bale_chat_id, joined_at, recovery_code_hash, email] = params;
       const user: DbUser = {
         username,
         bale_chat_id: bale_chat_id || null,
@@ -241,6 +242,7 @@ export class PersistentFallbackDatabase {
         block_until: null,
         last_seen: new Date().toISOString(),
         recovery_code_hash: recovery_code_hash || null,
+        email: email || null,
       };
       this.users.set(username, user);
       this.scheduleSave();
@@ -647,10 +649,12 @@ export async function init(): Promise<void> {
             block_type TEXT,
             block_until TEXT,
             last_seen TEXT,
-            recovery_code_hash TEXT
+            recovery_code_hash TEXT,
+            email TEXT
           );
           ALTER TABLE users ADD COLUMN IF NOT EXISTS public_key TEXT;
           ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_code_hash TEXT;
+          ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
 
           CREATE TABLE IF NOT EXISTS contacts (
             username TEXT,
