@@ -56,6 +56,27 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   const [baleIdError, setBaleIdError] = useState('');
   const [otpError, setOtpError] = useState('');
 
+  // Email signup/login (alternative to Bale)
+  const [authMethod, setAuthMethod] = useState<'bale' | 'email'>('bale');
+  const [email, setEmail] = useState('');
+  const [verifiedEmail, setVerifiedEmail] = useState('');
+  const [emailError, setEmailError] = useState('');
+
+  const isValidEmailFormat = (value: string): boolean =>
+    /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(value.trim().toLowerCase());
+
+  const toggleBtnStyle = (active: boolean): React.CSSProperties => ({
+    flex: 1,
+    padding: '10px 0',
+    borderRadius: '12px',
+    border: active ? '1px solid #06b6d4' : '1px solid #374151',
+    background: active ? 'rgba(6, 182, 212, 0.18)' : 'transparent',
+    color: active ? '#67e8f9' : '#d1d5db',
+    fontSize: '15px',
+    fontWeight: 600,
+    cursor: 'pointer',
+  });
+
   const handleSendOTP = async () => {
     const clean = baleId.trim().replace(/^@+/, '');
     if (!clean) {
@@ -115,6 +136,44 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
     }
   };
 
+  const handleSendEmailOTP = async () => {
+    const clean = email.trim().toLowerCase();
+    if (!clean || !isValidEmailFormat(clean)) {
+      const errText = 'لطفاً یک ایمیل معتبر وارد کنید.';
+      setEmailError(errText);
+      setMsg({ text: errText, isOk: false });
+      return;
+    }
+    setEmailError('');
+    try {
+      const res = await fetch('/api/request-email-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: clean }),
+      }).then(r => r.json());
+
+      if (res.ok) {
+        setVerifiedEmail(clean);
+        setStep2Desc('کد ارسال شده به ایمیل رو وارد کن');
+        setMsg({ text: res.msg, isOk: true });
+        setTimeout(() => {
+          setMsg({ text: '', isOk: false });
+          setOtpError('');
+          setStep(2);
+          startTimer();
+        }, 600);
+      } else {
+        const errText = res.msg || 'خطا در ارسال کد تأیید.';
+        setEmailError(errText);
+        setMsg({ text: errText, isOk: false });
+      }
+    } catch {
+      const errText = 'ارتباط با سرور برقرار نشد. لطفاً بعداً دوباره تلاش کنید.';
+      setEmailError(errText);
+      setMsg({ text: errText, isOk: false });
+    }
+  };
+
   const handleVerifyOTP = async () => {
     const cleanCode = otp.trim();
     if (!cleanCode) {
@@ -130,10 +189,15 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
       return;
     }
     setOtpError('');
-    const res = await fetch('/api/verify-otp', {
+    const verifyUrl = authMethod === 'email' ? '/api/verify-email-otp' : '/api/verify-otp';
+    const verifyBody =
+      authMethod === 'email'
+        ? { email: verifiedEmail, code: cleanCode }
+        : { baleId: verifiedBaleId, code: cleanCode };
+    const res = await fetch(verifyUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ baleId: verifiedBaleId, code: cleanCode }),
+      body: JSON.stringify(verifyBody),
     }).then(r => r.json());
 
     if (!res.ok) {
@@ -161,10 +225,12 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   };
 
   const handleRegister = async () => {
+    const registerBody =
+      authMethod === 'email' ? { email: verifiedEmail } : { baleId: verifiedBaleId };
     const res = await fetch('/api/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ baleId: verifiedBaleId }),
+      body: JSON.stringify(registerBody),
     }).then(r => r.json());
 
     if (res.ok) {
@@ -186,9 +252,19 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   };
 
   const handleRecoverLogin = async () => {
-    const cleanId = baleId.trim().replace(/^@+/, '');
+    // Recovery login accepts the account identifier: Bale ID in Bale mode,
+    // email address in email mode (the username of an email account is its email).
+    const cleanId =
+      authMethod === 'email'
+        ? baleId.trim().toLowerCase()
+        : baleId.trim().replace(/^@+/, '');
     const cleanCode = recoveryCodeInput.trim();
-    if (!cleanId || !/^[a-zA-Z0-9_]{3,64}$/.test(cleanId)) {
+    if (authMethod === 'email') {
+      if (!cleanId || !isValidEmailFormat(cleanId)) {
+        setRecoveryError('ایمیل معتبر وارد کنید.');
+        return;
+      }
+    } else if (!cleanId || !/^[a-zA-Z0-9_]{3,64}$/.test(cleanId)) {
       setRecoveryError('آیدی بله معتبر وارد کنید.');
       return;
     }
@@ -275,16 +351,59 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                   💬
                 </div>
                 <h1>پیام‌رسان</h1>
-                <p>ورود با آیدی بله • مجهز به رمزنگاری E2EE</p>
+                <p>
+                  {authMethod === 'email'
+                    ? 'ورود با ایمیل • مجهز به رمزنگاری E2EE'
+                    : 'ورود با آیدی بله • مجهز به رمزنگاری E2EE'}
+                </p>
+              </div>
+              <div
+                className="auth-method-toggle"
+                role="tablist"
+                aria-label="روش ورود"
+                style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={authMethod === 'bale'}
+                  onClick={() => {
+                    setAuthMethod('bale');
+                    setMsg({ text: '', isOk: false });
+                    setEmailError('');
+                  }}
+                  style={toggleBtnStyle(authMethod === 'bale')}
+                >
+                  بله
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={authMethod === 'email'}
+                  onClick={() => {
+                    setAuthMethod('email');
+                    setMsg({ text: '', isOk: false });
+                    setBaleIdError('');
+                  }}
+                  style={toggleBtnStyle(authMethod === 'email')}
+                >
+                  ایمیل
+                </button>
               </div>
               <form
                 className="auth-form"
                 noValidate
                 onSubmit={e => {
                   e.preventDefault();
-                  handleSendOTP();
+                  if (authMethod === 'email') {
+                    handleSendEmailOTP();
+                  } else {
+                    handleSendOTP();
+                  }
                 }}
               >
+                {authMethod === 'bale' ? (
+                  <>
                 <label htmlFor="baleIdInput">
                   آیدی بله <span aria-hidden="true">*</span>
                 </label>
@@ -321,6 +440,44 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                   آیدی بله خود را بدون <bdi dir="ltr">@</bdi> وارد کنید (مثال:{' '}
                   <bdi dir="ltr">username123</bdi>)
                 </p>
+                  </>
+                ) : (
+                  <>
+                <label htmlFor="emailInput">
+                  ایمیل <span aria-hidden="true">*</span>
+                </label>
+                <input
+                  type="email"
+                  id="emailInput"
+                  name="email"
+                  aria-label="ایمیل"
+                  required
+                  aria-required="true"
+                  aria-invalid={emailError ? 'true' : 'false'}
+                  aria-describedby="emailHint emailError"
+                  placeholder="you@example.com"
+                  dir="ltr"
+                  autoComplete="email"
+                  className={emailError ? 'input-invalid' : ''}
+                  value={email}
+                  onChange={e => {
+                    setEmail(e.target.value);
+                    if (emailError) setEmailError('');
+                  }}
+                />
+                <p
+                  id="emailError"
+                  role="alert"
+                  aria-live="assertive"
+                  className={`field-error ${emailError ? 'visible' : ''}`}
+                >
+                  {emailError}
+                </p>
+                <p id="emailHint" className="input-hint">
+                  کد تأیید ۶ رقمی به این ایمیل فرستاده می‌شود.
+                </p>
+                  </>
+                )}
                 <button type="submit">دریافت کد تأیید</button>
 
                 <button
@@ -332,9 +489,13 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                     setStep(5);
                   }}
                 >
-                  🔑 ورود با کد بازیابی (در صورت اختلال بله)
+                  {authMethod === 'email'
+                    ? '🔑 ورود با کد بازیابی'
+                    : '🔑 ورود با کد بازیابی (در صورت اختلال بله)'}
                 </button>
 
+                {authMethod === 'bale' && (
+                  <>
                 <div className="test-login-divider" role="separator" aria-label="یا">
                   <span className="divider-line" aria-hidden="true" />
                   <span className="divider-text">یا</span>
@@ -363,6 +524,8 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                   </a>{' '}
                   ثبت‌نام کنید.
                 </p>
+                  </>
+                )}
 
                 {msg.needStart ? (
                   <p id="msg1" role="alert" className="auth-msg">
@@ -450,7 +613,11 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                   className="btn-ghost"
                   disabled={resendTimer > 0}
                   onClick={() => {
-                    handleSendOTP();
+                    if (authMethod === 'email') {
+                      handleSendEmailOTP();
+                    } else {
+                      handleSendOTP();
+                    }
                     startTimer();
                   }}
                 >
@@ -494,7 +661,11 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
               </div>
               <div className="auth-form">
                 <div className="id-preview" id="idPreview">
-                  <bdi dir="ltr">@{verifiedBaleId}</bdi>
+                  {authMethod === 'email' ? (
+                    <bdi dir="ltr">{verifiedEmail}</bdi>
+                  ) : (
+                    <bdi dir="ltr">@{verifiedBaleId}</bdi>
+                  )}
                 </div>
                 <div className="rules-check">
                   <input
@@ -625,15 +796,16 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                 }}
               >
                 <label htmlFor="recoverBaleIdInput">
-                  آیدی بله <span aria-hidden="true">*</span>
+                  {authMethod === 'email' ? 'ایمیل' : 'آیدی بله'}{' '}
+                  <span aria-hidden="true">*</span>
                 </label>
                 <div className="input-prefix">
-                  <span aria-hidden="true">@</span>
+                  {authMethod === 'bale' && <span aria-hidden="true">@</span>}
                   <input
                     type="text"
                     id="recoverBaleIdInput"
                     name="recoverBaleId"
-                    placeholder="username123"
+                    placeholder={authMethod === 'email' ? 'you@example.com' : 'username123'}
                     dir="ltr"
                     autoComplete="username"
                     value={baleId}
@@ -681,7 +853,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                     setStep(1);
                   }}
                 >
-                  برگشت به ورود با بله
+                  برگشت به {authMethod === 'email' ? 'ورود با ایمیل' : 'ورود با بله'}
                 </button>
               </form>
             </>
