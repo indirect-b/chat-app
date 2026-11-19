@@ -10,22 +10,17 @@
  * کپسوله‌سازی (ML-KEM-768)، کلید کلاسیک (ECDH P-256)، کلید نشست (Session Key) یا کلید پیام
  * را در محاسبه هش وارد نمی‌کند.
  *
- * وضعیت فعلی پیوند امضای ML-DSA-65 با کلید کپسوله‌سازی ML-KEM-768 در کد کلاینت (`src/utils/crypto.ts`)
- * پس از سخت‌افزاری نوامبر ۲۰۲۶:
- * ۱. در مسیر تولید باندل (`ensureUserHybridKeyPair`) و اعتبارسنجی باندل
- *    (`parsePeerKeyBundle`)، کلاینت رشتهٔ
- *    `MLDSA-BUNDLE-v2:<username>:<crv>:<x>:<y>:<mlkemPubB64>` را با کلید خصوصی ML-DSA-65 امضا
- *    و با `ml_dsa65.verify` بررسی می‌کند؛ نام کاربری باندل باید برابر مخاطب
- *    موردانتظار باشد (بدون fallback تهی).
- * ۲. برقراری نشست تازه یا چرخش به کپسول تازه فقط با باندل کاملاً پساکوانتومی
- *    (`isFullyPostQuantum`) انجام می‌شود، و امضای پیام (`MLDSA-MSG-v2`) پیش از
- *    رمزگشایی بررسی و در صورت نامعتبر بودن، پیام رد می‌شود.
- * ۳. محدودیت باقی‌مانده: شماره ایمنی به‌تنهایی فقط کلید هویت ML-DSA-65 را
- *    تأیید می‌کند؛ پیوند آن با کلید ML-KEM-768 از طریق امضای باندل است و
- *    امنیت توزیع باندل همچنان به صداقت سرور (دایرکتوری کلید) وابسته است —
- *    سرور مخرب می‌تواند باندل را جایگزین کند و تنها مقایسه برون‌باندی
- *    شماره ایمنی آن را آشکار می‌کند (TOFU). انتشار باندل اکنون نیازمند
- *    توکن نشست معتبر است، ولی این جای شفافیت کلید (Key Transparency) را نمی‌گیرد.
+ * وضعیت پیوند امضای ML-DSA-65 با کلید کپسوله‌سازی ML-KEM-768 در کد کلاینت (`src/utils/crypto.ts` — نسخه v4):
+ * - در تولید باندل (`ensureUserHybridKeyPair`)، کلاینت رشتهٔ
+ *   `MLDSA-BUNDLE-v2:<username>:<crv>:<x>:<y>:<mlkemPubB64>` را با کلید خصوصی ML-DSA-65
+ *   (نگهداری‌شده در IndexedDB با پوشش AES-GCM غیرقابل‌استخراج) امضا می‌کند.
+ * - در اعتبارسنجی باندل (`parsePeerKeyBundle` / `parsePeerKeyBundleStrict`) و پیش از ایجاد نشست
+ *   (`ensurePQRatchetSession`) و پیش از رمزگشایی (`decryptMessageText`)، امضای ML-DSA-65 باندل
+ *   (با تطبیق نام کاربری بدون fallback تهی) و امضای ML-DSA-65 خود پیام به‌صورت مسدودکننده (Fail-Closed)
+ *   بررسی می‌شوند و هرگونه عدم تطابق باعث پرتاب `E2EEError` می‌گردد.
+ * - با این حال، شماره ایمنی همچنان فقط کلید عمومی هویت ML-DSA-65 را نمایش می‌دهد و در مدل اعتماد وب
+ *   در برابر سرور مخرب (که می‌تواند کد JS را تغییر دهد)، تأیید حضوری/خارج‌ازباند شماره ایمنی پس از
+ *   تغییر کلید همچنان لایه دفاعی ضروری کاربر است.
  * ============================================================================
  */
 
@@ -33,6 +28,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import {
   base64ToBuf,
   bufToBase64,
+  clearRatchetSession,
   getMyMLDSAPublicKey,
   parsePeerKeyBundle,
 } from './crypto';
@@ -685,11 +681,7 @@ export function getGroupVerificationSummary(
  */
 export function rotateSessionRatchetOnly(myUsername: string, roomId: string): void {
   if (!myUsername || !roomId) return;
-  try {
-    localStorage.removeItem(`chat_pq_ratchet_${myUsername}_${roomId}`);
-  } catch {
-    // ignore
-  }
+  clearRatchetSession(myUsername, roomId);
 }
 
 

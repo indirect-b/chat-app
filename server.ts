@@ -15,9 +15,18 @@ import { config, verifyAdminSecret } from './src/server/config';
 import * as bale from './src/server/bale';
 import { pool, init } from './src/server/db';
 import { presence } from './src/server/presence';
+import {
+  generateRecoveryCode,
+  hashRecoveryCode,
+  verifyRecoveryCode,
+  RecoveryRateLimiter,
+} from './src/server/recovery';
+
+const APP_VERSION = '6.1.0';
+const recoverRateLimiter = new RecoveryRateLimiter(5, 15 * 60 * 1000);
 
 // کلید سرور برای پروتکل احراز هویت کور Ristretto255-VOPRF (RFC 9497)
-// (رفع F12) بذر اختصاصی VOPRF_SEED (۳۲ بایت Base64) در اولویت است؛ در غیاب
+// (رفع F12، بازیابی‌شده از دور اول) بذر اختصاصی VOPRF_SEED (۳۲ بایت Base64) در اولویت است؛ در غیاب
 // آن، مشتق HKDF از رمز مدیر با salt ثابت — نه یک SHA-256 مستقیم از رمز.
 function resolveVoprfSeed(): Uint8Array {
   const envSeed = process.env.VOPRF_SEED;
@@ -45,6 +54,7 @@ const serverVoprfKeys = ristretto255_oprf.voprf.deriveKeyPair(
 
 const app = express();
 app.disable('x-powered-by');
+app.set('trust proxy', 1);
 
 app.use(
   helmet({
@@ -53,15 +63,13 @@ app.use(
       directives: {
         defaultSrc: ["'self'"],
         scriptSrc: ["'self'"],
-        styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
-        fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
+        styleSrc: ["'self'"],
+        fontSrc: ["'self'", 'data:'],
         imgSrc: ["'self'", 'data:', 'blob:'],
         mediaSrc: ["'self'", 'data:', 'blob:'],
         connectSrc: [
           "'self'",
           'wss://chatapp-server-1i2a.onrender.com',
-          'https://fonts.googleapis.com',
-          'https://fonts.gstatic.com',
         ],
         objectSrc: ["'none'"],
         baseUri: ["'self'"],
@@ -275,6 +283,31 @@ app.get('/api/media/:id', async (req: Request, res: Response) => {
   return res.status(404).send('Media not found');
 });
 
+// ===== HEALTH CHECK (Bale API + DB telemetry) =====
+app.get('/api/health', async (_req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
+  let dbOk = true;
+  try {
+    await pool.query('SELECT COUNT(*) as c FROM users');
+  } catch {
+    dbOk = false;
+  }
+  const baleStatus = bale.getBaleHealthStatus();
+  return res.status(dbOk ? 200 : 503).json({
+    ok: dbOk,
+    version: APP_VERSION,
+    uptimeSec: Math.floor(process.uptime()),
+    database: dbOk ? 'ok' : 'degraded',
+    bale: {
+      configured: baleStatus.configured,
+      reachable: baleStatus.reachable,
+      consecutiveFailures: baleStatus.consecutiveFailures,
+      lastCheckedAt: baleStatus.lastCheckedAt,
+      lastErrorAt: baleStatus.lastErrorAt,
+    },
+  });
+});
+
 // ===== AUTH =====
 app.post('/api/send-otp', async (req: Request, res: Response) => {
   const { baleId } = req.body;
@@ -285,7 +318,17 @@ app.post('/api/send-otp', async (req: Request, res: Response) => {
 
   const chatId = otps[`__chatid__${key}`];
   if (chatId) {
-    await bale.sendMessage(chatId, `🔐 کد تأیید:\n\n${code}\n\n⏱ ${config.OTP_EXPIRE} ثانیه معتبر است.`);
+    const sent = await bale.sendMessage(
+      chatId,
+      `🔐 کد تأیید:\n\n${code}\n\n⏱ ${config.OTP_EXPIRE} ثانیه معتبر است.`
+    );
+    if (!sent) {
+      return res.status(503).json({
+        ok: false,
+        baleUnavailable: true,
+        msg: 'ارسال کد از طریق بله با خطا مواجه شد. می‌توانید با کد بازیابی وارد شوید.',
+      });
+    }
     res.json({ ok: true, msg: '✅ کد به بله‌ات فرستاده شد' });
   } else {
     if (!config.BALE_BOT_TOKEN) {
@@ -320,18 +363,84 @@ app.post('/api/verify-otp', async (req: Request, res: Response) => {
 });
 
 app.post('/api/register', async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
   const { baleId } = req.body;
   const key = String(baleId || '').toLowerCase().replace('@', '').trim();
+  if (!key) return res.status(400).json({ ok: false, msg: 'آیدی بله نامعتبر است' });
   const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [key]);
   if (rows.length) return res.json({ ok: false, msg: 'این حساب قبلاً ثبت‌نام کرده' });
 
+  // تولید کد بازیابی یک‌بارمصرف؛ فقط هش scrypt آن در سرور ذخیره می‌شود و کد اصلی یک‌بار به کاربر نمایش داده می‌شود
+  const recoveryCode = generateRecoveryCode();
+  const recoveryCodeHash = await hashRecoveryCode(recoveryCode);
+
   const chatId = otps[`__chatid__${key}`] || null;
-  await pool.query('INSERT INTO users (username, bale_chat_id, joined_at) VALUES ($1, $2, $3)', [
-    key,
-    chatId,
-    new Date().toISOString(),
-  ]);
-  res.json({ ok: true, username: key });
+  await pool.query(
+    'INSERT INTO users (username, bale_chat_id, joined_at, recovery_code_hash) VALUES ($1, $2, $3, $4)',
+    [key, chatId, new Date().toISOString(), recoveryCodeHash]
+  );
+  res.json({ ok: true, username: key, recoveryCode });
+});
+
+app.post('/api/recover', async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
+  const { baleId, recoveryCode } = req.body || {};
+  const key = String(baleId || '').toLowerCase().replace(/^@+/, '').trim();
+  const code = String(recoveryCode || '').trim();
+
+  const clientIp =
+    (typeof req.ip === 'string' && req.ip) ||
+    req.socket?.remoteAddress ||
+    'unknown';
+
+  const limit = recoverRateLimiter.checkAndConsume(clientIp, key || 'empty');
+  if (!limit.allowed) {
+    res.setHeader('Retry-After', String(limit.retryAfterSec));
+    return res.status(429).json({
+      ok: false,
+      msg: 'تعداد تلاش‌های ناموفق بیش از حد مجاز است. لطفاً دقایقی دیگر دوباره تلاش کنید.',
+    });
+  }
+
+  if (!key || !code) {
+    return res.status(400).json({ ok: false, msg: 'آیدی بله و کد بازیابی الزامی است.' });
+  }
+
+  const { rows } = await pool.query(
+    'SELECT username, recovery_code_hash FROM users WHERE username = $1',
+    [key]
+  );
+  const user = rows[0];
+  if (!user || !user.recovery_code_hash) {
+    return res.status(401).json({ ok: false, msg: 'آیدی یا کد بازیابی نامعتبر است.' });
+  }
+
+  if (await isUserBlocked(key)) {
+    return res.status(403).json({ ok: false, msg: 'این حساب مسدود شده است.' });
+  }
+
+  const valid = await verifyRecoveryCode(code, user.recovery_code_hash);
+  if (!valid) {
+    return res.status(401).json({ ok: false, msg: 'آیدی یا کد بازیابی نامعتبر است.' });
+  }
+
+  // مصرف یک‌بارمصرف کد و چرخش فوری به کد بازیابی جدید (فقط هش scrypt جدید ذخیره می‌شود)
+  const nextRecoveryCode = generateRecoveryCode();
+  const nextHash = await hashRecoveryCode(nextRecoveryCode);
+  await pool.query('UPDATE users SET recovery_code_hash=$1 WHERE username=$2', [nextHash, key]);
+
+  const sessionToken = uuidv4();
+  userSessions[sessionToken] = {
+    username: key,
+    expire: Date.now() + 7 * 24 * 60 * 60 * 1000,
+  };
+
+  return res.json({
+    ok: true,
+    username: key,
+    sessionToken,
+    nextRecoveryCode,
+  });
 });
 
 app.post('/api/quick-login', (_req: Request, res: Response) => {
@@ -357,7 +466,7 @@ app.post('/api/voprf/evaluate', (req: Request, res: Response) => {
       serverPublicKeyB64: Buffer.from(serverVoprfKeys.publicKey).toString('base64'),
     });
   } catch {
-    // (رفع F12) پیام خطای داخلی به بیرون درز نمی‌کند.
+    // (رفع F12، بازیابی‌شده از دور اول) پیام خطای داخلی به بیرون درز نمی‌کند.
     res.status(400).json({ ok: false });
   }
 });
@@ -375,7 +484,7 @@ app.get('/api/user/:username', async (req: Request, res: Response) => {
 app.post('/api/user/public-key', async (req: Request, res: Response) => {
   const { username, publicKey } = req.body;
   if (!username || !publicKey) return res.json({ ok: false });
-  // (رفع F2) فقط خود کاربر با نشست معتبر می‌تواند باندل خودش را منتشر کند؛
+  // (رفع F2، بازیابی‌شده از دور اول) فقط خود کاربر با نشست معتبر می‌تواند باندل خودش را منتشر کند؛
   // در غیر این صورت هر کسی می‌توانست باندل هر کاربری را جایگزین کند.
   const sessionUser = getSessionUsername(req);
   if (!sessionUser || sessionUser !== username) {
@@ -390,6 +499,61 @@ app.post('/api/user/public-key', async (req: Request, res: Response) => {
   });
 
   res.json({ ok: true });
+});
+
+// ===== GROUP EPOCH KEY PACKETS (F3، بازیابی‌شده از دور اول) =====
+// بسته کلید اپوک گروه: توزیع‌کننده (سازنده گروه) کلید تصادفی اپوک را با
+// ML-KEM-768 به هر عضو کپسوله می‌کند؛ سرور فقط کپسول‌ها را نگه می‌دارد و
+// جابه‌جا می‌کند و کلید را نمی‌بیند.
+app.post('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
+  const sessionUser = getSessionUsername(req);
+  if (!sessionUser) return res.status(401).json({ ok: false });
+  const { epoch, keys } = req.body as { epoch?: unknown; keys?: unknown };
+  if (typeof epoch !== 'number' || !Number.isInteger(epoch) || epoch < 1) {
+    return res.json({ ok: false, msg: 'invalid epoch' });
+  }
+  if (!keys || typeof keys !== 'object' || Array.isArray(keys)) {
+    return res.json({ ok: false, msg: 'invalid keys' });
+  }
+  for (const [u, ct] of Object.entries(keys as Record<string, unknown>)) {
+    if (typeof u !== 'string' || !u || typeof ct !== 'string' || !/^[A-Za-z0-9+/=]+$/.test(ct)) {
+      return res.json({ ok: false, msg: 'invalid key entry' });
+    }
+  }
+  const { rows } = await pool.query('SELECT * FROM groups WHERE id = $1', [req.params.id]);
+  if (!rows.length) return res.json({ ok: false, msg: 'group not found' });
+  const members: string[] = JSON.parse(rows[0].members);
+  if (!members.includes(sessionUser)) return res.status(403).json({ ok: false });
+  const packet = { epoch, keys, postedBy: sessionUser, postedAt: new Date().toISOString() };
+  await setSetting(`group_epoch_packet_${req.params.id}`, JSON.stringify(packet));
+  // پخش فوری به اعضای آنلاین
+  members.forEach(m => {
+    presence.emitToUser(io, m, 'group-epoch-rotated', {
+      groupId: req.params.id,
+      name: rows[0].name,
+      epoch,
+      members,
+      epochKeys: keys,
+    });
+  });
+  res.json({ ok: true });
+});
+
+app.get('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
+  const sessionUser = getSessionUsername(req);
+  if (!sessionUser) return res.status(401).json({ ok: false });
+  const { rows } = await pool.query('SELECT * FROM groups WHERE id = $1', [req.params.id]);
+  if (!rows.length) return res.json({ ok: false });
+  const members: string[] = JSON.parse(rows[0].members);
+  if (!members.includes(sessionUser)) return res.status(403).json({ ok: false });
+  const raw = await getSetting(`group_epoch_packet_${req.params.id}`);
+  if (!raw) return res.json({ ok: false });
+  try {
+    const packet = JSON.parse(raw);
+    res.json({ ok: true, epoch: packet.epoch, keys: packet.keys });
+  } catch {
+    res.json({ ok: false });
+  }
 });
 
 app.post('/api/user/update', async (req: Request, res: Response) => {
@@ -453,61 +617,6 @@ app.get('/api/groups/:username', async (req: Request, res: Response) => {
       members: JSON.parse(g.members),
     })),
   });
-});
-
-// ===== GROUP EPOCH KEY PACKETS (F3) =====
-// بسته کلید اپوک گروه: توزیع‌کننده (سازنده گروه) کلید تصادفی اپوک را با
-// ML-KEM-768 به هر عضو کپسوله می‌کند؛ سرور فقط کپسول‌ها را نگه می‌دارد و
-// جابه‌جا می‌کند و کلید را نمی‌بیند.
-app.post('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
-  const sessionUser = getSessionUsername(req);
-  if (!sessionUser) return res.status(401).json({ ok: false });
-  const { epoch, keys } = req.body as { epoch?: unknown; keys?: unknown };
-  if (typeof epoch !== 'number' || !Number.isInteger(epoch) || epoch < 1) {
-    return res.json({ ok: false, msg: 'invalid epoch' });
-  }
-  if (!keys || typeof keys !== 'object' || Array.isArray(keys)) {
-    return res.json({ ok: false, msg: 'invalid keys' });
-  }
-  for (const [u, ct] of Object.entries(keys as Record<string, unknown>)) {
-    if (typeof u !== 'string' || !u || typeof ct !== 'string' || !/^[A-Za-z0-9+/=]+$/.test(ct)) {
-      return res.json({ ok: false, msg: 'invalid key entry' });
-    }
-  }
-  const { rows } = await pool.query('SELECT * FROM groups WHERE id = $1', [req.params.id]);
-  if (!rows.length) return res.json({ ok: false, msg: 'group not found' });
-  const members: string[] = JSON.parse(rows[0].members);
-  if (!members.includes(sessionUser)) return res.status(403).json({ ok: false });
-  const packet = { epoch, keys, postedBy: sessionUser, postedAt: new Date().toISOString() };
-  await setSetting(`group_epoch_packet_${req.params.id}`, JSON.stringify(packet));
-  // پخش فوری به اعضای آنلاین
-  members.forEach(m => {
-    presence.emitToUser(io, m, 'group-epoch-rotated', {
-      groupId: req.params.id,
-      name: rows[0].name,
-      epoch,
-      members,
-      epochKeys: keys,
-    });
-  });
-  res.json({ ok: true });
-});
-
-app.get('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
-  const sessionUser = getSessionUsername(req);
-  if (!sessionUser) return res.status(401).json({ ok: false });
-  const { rows } = await pool.query('SELECT * FROM groups WHERE id = $1', [req.params.id]);
-  if (!rows.length) return res.json({ ok: false });
-  const members: string[] = JSON.parse(rows[0].members);
-  if (!members.includes(sessionUser)) return res.status(403).json({ ok: false });
-  const raw = await getSetting(`group_epoch_packet_${req.params.id}`);
-  if (!raw) return res.json({ ok: false });
-  try {
-    const packet = JSON.parse(raw);
-    res.json({ ok: true, epoch: packet.epoch, keys: packet.keys });
-  } catch {
-    res.json({ ok: false });
-  }
 });
 
 // ===== REPORT =====
@@ -717,7 +826,7 @@ app.delete('/api/admin/message', async (req: Request, res: Response) => {
 app.post('/api/create-group', async (req: Request, res: Response) => {
   const { name, members, creator } = req.body;
   if (!name || !name.trim()) return res.json({ ok: false, msg: 'نام گروه را وارد کنید' });
-  // (رفع F2) فقط کاربر واردشده می‌تواند گروهی به نام خودش بسازد.
+  // (رفع F2، بازیابی‌شده از دور اول) فقط کاربر واردشده می‌تواند گروهی به نام خودش بسازد.
   const sessionUser = getSessionUsername(req);
   if (!sessionUser || sessionUser !== creator) {
     return res.status(401).json({ ok: false });
@@ -899,7 +1008,7 @@ app.get('/api/admin-login-as/:token', async (req: Request, res: Response) => {
   if (!data || Date.now() > data.expire) {
     if (data) delete adminTokens[token];
     return res.send(
-      `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>لینک منقضی</title></head><body style="font-family:Vazirmatn,sans-serif;direction:rtl;text-align:center;padding:60px"><div style="font-size:60px">⏱️</div><h1>لینک منقضی شده</h1><p>این لینک دیگر معتبر نیست.</p></body></html>`
+      `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><title>لینک منقضی</title><link rel="stylesheet" href="/css/error.css"/></head><body><main><div class="error-icon" aria-hidden="true">⏱️</div><h1>لینک منقضی شده</h1><p>این لینک دیگر معتبر نیست.</p></main></body></html>`
     );
   }
 
@@ -907,12 +1016,13 @@ app.get('/api/admin-login-as/:token', async (req: Request, res: Response) => {
   delete adminTokens[token];
   if (!rows.length) {
     return res.send(
-      `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>کاربر یافت نشد</title></head><body style="font-family:Vazirmatn,sans-serif;direction:rtl;text-align:center;padding:60px"><div style="font-size:60px">❌</div><h1>کاربر یافت نشد</h1><p>کاربر "${data.username}" وجود ندارد.</p></body></html>`
+      `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><title>کاربر یافت نشد</title><link rel="stylesheet" href="/css/error.css"/></head><body><main><div class="error-icon" aria-hidden="true">❌</div><h1>کاربر یافت نشد</h1><p>کاربر مورد نظر وجود ندارد.</p></main></body></html>`
     );
   }
 
+  const safeAttr = String(data.username).replace(/[^a-zA-Z0-9_.-]/g, '');
   res.send(
-    `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>ورود موقت ادمین</title></head><body style="margin:0"><script>sessionStorage.setItem('adminLoginToken','${data.username}'); location.href='/';</script></body></html>`
+    `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><title>ورود موقت ادمین</title><link rel="stylesheet" href="/css/error.css"/></head><body data-admin-login-user="${safeAttr}"><script src="/js/admin-login-redirect.js" defer></script></body></html>`
   );
 });
 
@@ -969,7 +1079,7 @@ io.on('connection', async (socket) => {
   }
 
   socket.on('auth', async (authData: string | { username?: string; token?: string }) => {
-    // (رفع F2) احراز هویت سوکت باید با توکن نشست معتبر باشد؛
+    // (رفع F2، بازیابی‌شده از دور اول) احراز هویت سوکت باید با توکن نشست معتبر باشد؛
     // نام کاربریِ تنها قابل جعل است (جعل حضور و دریافت پیام‌های دیگران).
     const username = typeof authData === 'string' ? authData : authData?.username;
     const token = typeof authData === 'string' ? undefined : authData?.token;
@@ -1314,18 +1424,11 @@ async function start(): Promise<void> {
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>۴۰۴ - صفحه یافت نشد | پیام‌رسان</title>
-  <style>
-    *{margin:0;padding:0;box-sizing:border-box}
-    body{font-family:'Vazirmatn',system-ui,sans-serif;background:linear-gradient(135deg,#0f0f1a,#16213e,#0f3460);color:#f0f0f0;min-height:100vh;display:flex;align-items:center;justify-content:center;direction:rtl;padding:20px}
-    main{max-width:400px;width:100%;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);border-radius:24px;padding:36px 28px;text-align:center}
-    h1{font-size:22px;margin:12px 0 8px}
-    p{font-size:14px;color:#9ca3af;margin-bottom:24px;line-height:1.7}
-    a.home-link{display:inline-block;background:linear-gradient(135deg,#7c3aed,#06b6d4);color:#ffffff;text-decoration:none;padding:12px 24px;border-radius:12px;font-weight:600;font-size:14px}
-  </style>
+  <link rel="stylesheet" href="/css/error.css"/>
 </head>
 <body>
   <main id="main-content">
-    <div style="font-size:48px" aria-hidden="true">🔍</div>
+    <div class="error-icon" aria-hidden="true">🔍</div>
     <h1>۴۰۴ - صفحه مورد نظر یافت نشد</h1>
     <p>آدرسی که وارد کرده‌اید در پیام‌رسان وجود ندارد یا جابه‌جا شده است.</p>
     <a href="/" class="home-link">بازگشت به صفحه اصلی پیام‌رسان</a>
@@ -1430,9 +1533,14 @@ async function start(): Promise<void> {
   }
 
   server.listen(config.PORT, '0.0.0.0', () => {
-    console.log(`✅ سرور TypeScript + React روی پورت ${config.PORT}`);
+    console.log(`✅ سرور TypeScript + React نسخه ${APP_VERSION} روی پورت ${config.PORT}`);
     console.log(`🌐 http://localhost:${config.PORT}`);
     console.log(`🔐 پنل مدیریت: http://localhost:${config.PORT}${config.ADMIN_PATH}`);
+    void bale.checkBaleHealth();
+    const healthTimer = setInterval(() => {
+      void bale.checkBaleHealth();
+    }, 5 * 60 * 1000);
+    healthTimer.unref();
     startBalePolling();
   });
 }

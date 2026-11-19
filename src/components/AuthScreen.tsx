@@ -4,8 +4,10 @@ interface AuthScreenProps {
   onAuthenticated: (username: string) => void;
 }
 
+type AuthStep = 1 | 2 | 3 | 4 | 5;
+
 export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
-  const [step, setStep] = useState<1 | 2 | 3>(1);
+  const [step, setStep] = useState<AuthStep>(1);
   const [baleId, setBaleId] = useState('');
   const [verifiedBaleId, setVerifiedBaleId] = useState('');
   const [otp, setOtp] = useState('');
@@ -15,7 +17,16 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   const [rulesModalOpen, setRulesModalOpen] = useState(false);
   const [rulesText, setRulesText] = useState('');
 
-  const [msg, setMsg] = useState<{ text: string; isOk: boolean; html?: boolean }>({
+  // Recovery code fallback (Item 3.1)
+  const [recoveryCodeInput, setRecoveryCodeInput] = useState('');
+  const [recoveryError, setRecoveryError] = useState('');
+  const [issuedRecoveryCode, setIssuedRecoveryCode] = useState('');
+  const [pendingAuthUsername, setPendingAuthUsername] = useState('');
+  const [recoverySavedChecked, setRecoverySavedChecked] = useState(false);
+  const [recoveryCopied, setRecoveryCopied] = useState(false);
+  const [recoveryHeading, setRecoveryHeading] = useState('کد بازیابی یک‌بارمصرف شما');
+
+  const [msg, setMsg] = useState<{ text: string; isOk: boolean; needStart?: boolean }>({
     text: '',
     isOk: false,
   });
@@ -60,38 +71,45 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
       return;
     }
     setBaleIdError('');
-    const res = await fetch('/api/send-otp', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ baleId: clean }),
-    }).then(r => r.json());
+    try {
+      const res = await fetch('/api/send-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ baleId: clean }),
+      }).then(r => r.json());
 
-    if (res.ok) {
-      setVerifiedBaleId(clean);
-      if (res.needStart) {
-        setMsg({
-          text: '⚠️ ابتدا <a href="https://ble.ir/Optcodebot" target="_blank" rel="noopener noreferrer" style="color:#9d5cff">@Optcodebot</a> را در بله استارت کن',
-          isOk: false,
-          html: true,
-        });
-      } else {
-        setMsg({ text: res.msg, isOk: true });
-        if (res.msg && res.msg.includes('آزمایشی')) {
-          const match = res.msg.match(/\d{6}/);
-          if (match) {
-            setStep2Desc(res.msg);
-            setOtp(match[0]);
+      if (res.ok) {
+        setVerifiedBaleId(clean);
+        if (res.needStart) {
+          setMsg({
+            text: '',
+            isOk: false,
+            needStart: true,
+          });
+        } else {
+          setMsg({ text: res.msg, isOk: true });
+          if (res.msg && res.msg.includes('آزمایشی')) {
+            const match = res.msg.match(/\d{6}/);
+            if (match) {
+              setStep2Desc(res.msg);
+              setOtp(match[0]);
+            }
           }
+          setTimeout(() => {
+            setMsg({ text: '', isOk: false });
+            setOtpError('');
+            setStep(2);
+            startTimer();
+          }, 600);
         }
-        setTimeout(() => {
-          setMsg({ text: '', isOk: false });
-          setOtpError('');
-          setStep(2);
-          startTimer();
-        }, 600);
+      } else {
+        const errText = res.msg || 'خطا در ارسال کد تأیید.';
+        setBaleIdError(errText);
+        setMsg({ text: errText, isOk: false });
       }
-    } else {
-      const errText = res.msg || 'خطا در ارسال کد تأیید.';
+    } catch {
+      const errText =
+        'ارتباط با سرور یا سرویس بله برقرار نشد. در صورت داشتن کد بازیابی، از گزینه «ورود با کد بازیابی» استفاده کنید.';
       setBaleIdError(errText);
       setMsg({ text: errText, isOk: false });
     }
@@ -150,10 +168,80 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
     }).then(r => r.json());
 
     if (res.ok) {
-      setMsg({ text: '✅ حساب ساخته شد!', isOk: true });
-      setTimeout(() => onAuthenticated(res.username), 400);
+      if (res.recoveryCode) {
+        setIssuedRecoveryCode(res.recoveryCode);
+        setPendingAuthUsername(res.username);
+        setRecoverySavedChecked(false);
+        setRecoveryCopied(false);
+        setRecoveryHeading('کد بازیابی یک‌بارمصرف شما');
+        setMsg({ text: '', isOk: false });
+        setStep(4);
+      } else {
+        setMsg({ text: '✅ حساب ساخته شد!', isOk: true });
+        setTimeout(() => onAuthenticated(res.username), 400);
+      }
     } else {
       setMsg({ text: res.msg, isOk: false });
+    }
+  };
+
+  const handleRecoverLogin = async () => {
+    const cleanId = baleId.trim().replace(/^@+/, '');
+    const cleanCode = recoveryCodeInput.trim();
+    if (!cleanId || !/^[a-zA-Z0-9_]{3,64}$/.test(cleanId)) {
+      setRecoveryError('آیدی بله معتبر وارد کنید.');
+      return;
+    }
+    if (!cleanCode) {
+      setRecoveryError('کد بازیابی یک‌بارمصرف را وارد کنید.');
+      return;
+    }
+    setRecoveryError('');
+
+    try {
+      const response = await fetch('/api/recover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ baleId: cleanId, recoveryCode: cleanCode }),
+      });
+      const res = await response.json();
+
+      if (!res.ok) {
+        setRecoveryError(res.msg || 'آیدی یا کد بازیابی نامعتبر است.');
+        return;
+      }
+
+      if (res.sessionToken) {
+        try {
+          localStorage.setItem('chat_session_token', res.sessionToken);
+        } catch {
+          // ignore
+        }
+      }
+
+      if (res.nextRecoveryCode) {
+        setIssuedRecoveryCode(res.nextRecoveryCode);
+        setPendingAuthUsername(res.username);
+        setRecoverySavedChecked(false);
+        setRecoveryCopied(false);
+        setRecoveryHeading('کد بازیابی جدید (جایگزین کد مصرف‌شده)');
+        setRecoveryCodeInput('');
+        setStep(4);
+      } else {
+        onAuthenticated(res.username);
+      }
+    } catch {
+      setRecoveryError('خطا در ارتباط با سرور هنگام بررسی کد بازیابی.');
+    }
+  };
+
+  const handleCopyRecoveryCode = async () => {
+    if (!issuedRecoveryCode) return;
+    try {
+      await navigator.clipboard.writeText(issuedRecoveryCode);
+      setRecoveryCopied(true);
+    } catch {
+      setRecoveryCopied(false);
     }
   };
 
@@ -235,6 +323,18 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                 </p>
                 <button type="submit">دریافت کد تأیید</button>
 
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  onClick={() => {
+                    setMsg({ text: '', isOk: false });
+                    setRecoveryError('');
+                    setStep(5);
+                  }}
+                >
+                  🔑 ورود با کد بازیابی (در صورت اختلال بله)
+                </button>
+
                 <div className="test-login-divider" role="separator" aria-label="یا">
                   <span className="divider-line" aria-hidden="true" />
                   <span className="divider-text">یا</span>
@@ -264,13 +364,19 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                   ثبت‌نام کنید.
                 </p>
 
-                {msg.html ? (
-                  <p
-                    id="msg1"
-                    role="alert"
-                    className={`auth-msg ${msg.isOk ? 'ok' : ''}`}
-                    dangerouslySetInnerHTML={{ __html: msg.text }}
-                  />
+                {msg.needStart ? (
+                  <p id="msg1" role="alert" className="auth-msg">
+                    ⚠️ ابتدا{' '}
+                    <a
+                      href="https://ble.ir/Optcodebot"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="rules-link"
+                    >
+                      <bdi dir="ltr">@Optcodebot</bdi>
+                    </a>{' '}
+                    را در بله استارت کن
+                  </p>
                 ) : (
                   <p
                     id="msg1"
@@ -428,6 +534,156 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                   {msg.text}
                 </p>
               </div>
+            </>
+          )}
+
+          {step === 4 && (
+            <>
+              <div className="auth-logo">
+                <div
+                  className="logo-circle"
+                  style={{ background: 'linear-gradient(135deg,#f59e0b,#ef4444)' }}
+                  aria-hidden="true"
+                >
+                  🗝️
+                </div>
+                <h1>{recoveryHeading}</h1>
+                <p>این کد فقط یک‌بار نمایش داده می‌شود و در سرور به‌صورت هش نگهداری می‌گردد.</p>
+              </div>
+              <div className="auth-form">
+                <div
+                  dir="ltr"
+                  style={{
+                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                    fontSize: '14px',
+                    letterSpacing: '1px',
+                    padding: '14px 12px',
+                    borderRadius: '12px',
+                    background: 'rgba(245, 158, 11, 0.12)',
+                    border: '1px solid rgba(245, 158, 11, 0.4)',
+                    color: '#fef3c7',
+                    textAlign: 'center',
+                    wordBreak: 'break-all',
+                    userSelect: 'all',
+                  }}
+                >
+                  {issuedRecoveryCode}
+                </div>
+                <p className="input-hint">
+                  در صورتی که سرویس بله در دسترس نباشد، می‌توانید با این کد یک‌بارمصرف وارد حساب خود
+                  شوید. پس از هر بار استفاده، کد جدیدی جایگزین آن می‌شود.
+                </p>
+                <button type="button" className="btn-ghost" onClick={handleCopyRecoveryCode}>
+                  {recoveryCopied ? '✅ کپی شد' : '📋 کپی کد بازیابی'}
+                </button>
+                <div className="rules-check">
+                  <input
+                    type="checkbox"
+                    id="recoverySavedCheck"
+                    checked={recoverySavedChecked}
+                    onChange={e => setRecoverySavedChecked(e.target.checked)}
+                  />
+                  <label htmlFor="recoverySavedCheck">
+                    کد بازیابی را در جای امن ذخیره کردم
+                  </label>
+                </div>
+                <button
+                  type="button"
+                  disabled={!recoverySavedChecked}
+                  className={!recoverySavedChecked ? 'btn-disabled' : ''}
+                  onClick={() => {
+                    const user = pendingAuthUsername || verifiedBaleId;
+                    setIssuedRecoveryCode('');
+                    onAuthenticated(user);
+                  }}
+                >
+                  ادامه به پیام‌رسان
+                </button>
+              </div>
+            </>
+          )}
+
+          {step === 5 && (
+            <>
+              <div className="auth-logo">
+                <div
+                  className="logo-circle"
+                  style={{ background: 'linear-gradient(135deg,#06b6d4,#7c3aed)' }}
+                  aria-hidden="true"
+                >
+                  🔑
+                </div>
+                <h1>ورود با کد بازیابی</h1>
+                <p>در صورت عدم دسترسی به سرویس بله از کد بازیابی یک‌بارمصرف استفاده کنید</p>
+              </div>
+              <form
+                className="auth-form"
+                noValidate
+                onSubmit={e => {
+                  e.preventDefault();
+                  void handleRecoverLogin();
+                }}
+              >
+                <label htmlFor="recoverBaleIdInput">
+                  آیدی بله <span aria-hidden="true">*</span>
+                </label>
+                <div className="input-prefix">
+                  <span aria-hidden="true">@</span>
+                  <input
+                    type="text"
+                    id="recoverBaleIdInput"
+                    name="recoverBaleId"
+                    placeholder="username123"
+                    dir="ltr"
+                    autoComplete="username"
+                    value={baleId}
+                    onChange={e => {
+                      setBaleId(e.target.value);
+                      if (recoveryError) setRecoveryError('');
+                    }}
+                  />
+                </div>
+                <label htmlFor="recoveryCodeInput">
+                  کد بازیابی یک‌بارمصرف <span aria-hidden="true">*</span>
+                </label>
+                <input
+                  type="text"
+                  id="recoveryCodeInput"
+                  name="recoveryCode"
+                  dir="ltr"
+                  placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"
+                  autoComplete="off"
+                  value={recoveryCodeInput}
+                  onChange={e => {
+                    setRecoveryCodeInput(e.target.value);
+                    if (recoveryError) setRecoveryError('');
+                  }}
+                  style={{
+                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                    fontSize: '13px',
+                    textAlign: 'center',
+                  }}
+                />
+                <p
+                  id="recoveryError"
+                  role="alert"
+                  aria-live="assertive"
+                  className={`field-error ${recoveryError ? 'visible' : ''}`}
+                >
+                  {recoveryError}
+                </p>
+                <button type="submit">ورود با کد بازیابی</button>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  onClick={() => {
+                    setRecoveryError('');
+                    setStep(1);
+                  }}
+                >
+                  برگشت به ورود با بله
+                </button>
+              </form>
             </>
           )}
         </main>
