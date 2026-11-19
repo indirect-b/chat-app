@@ -1,5 +1,6 @@
 export interface UserProfile {
   username: string;
+  display_name?: string | null;
   avatar: string | null;
   bio: string;
   status: 'online' | 'busy' | 'away' | string;
@@ -8,6 +9,7 @@ export interface UserProfile {
 
 export interface ContactItem {
   username: string;
+  display_name?: string | null;
   avatar: string | null;
   status: string;
   online?: boolean;
