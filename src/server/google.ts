@@ -1,4 +1,9 @@
 import { OAuth2Client, type TokenPayload } from 'google-auth-library';
+import {
+  normalizeGooglePicture,
+  normalizeGoogleProfileName,
+  type GoogleProfile,
+} from './profileSync';
 
 /**
  * Strict email validation. Returns the normalized (trimmed, lowercased)
@@ -59,6 +64,10 @@ export function isGoogleConfigured(): boolean {
 export interface GoogleIdPayload {
   email: string;
   emailVerified: boolean;
+  /** Google display name from the token (absent → null, never an error). */
+  name?: string | null;
+  /** Google profile photo URL from the token (absent → null). */
+  picture?: string | null;
 }
 
 type TokenVerifier = (
@@ -77,31 +86,41 @@ async function defaultVerifier(
   return {
     email: payload?.email || '',
     emailVerified: payload?.email_verified === true,
+    name: normalizeGoogleProfileName(payload?.name),
+    picture: normalizeGooglePicture(payload?.picture),
   };
 }
 
 /**
  * Verify a Google ID token and return the verified email address
- * (normalized, lowercased). Throws on ANY failure — bad signature,
- * wrong audience, expired token, unverified email, missing email —
- * so callers fail closed with a generic message (no details leaked).
- * The `verifier` parameter exists only for tests (a fake that never
- * calls Google); production always uses the default verifier.
+ * (normalized, lowercased) plus the Google profile carried by the token
+ * (display name and photo URL, each null when the token does not carry
+ * one). Throws on ANY failure — bad signature, wrong audience, expired
+ * token, unverified email, missing email — so callers fail closed with
+ * a generic message (no details leaked). The `verifier` parameter
+ * exists only for tests (a fake that never calls Google); production
+ * always uses the default verifier.
  */
 export async function verifyGoogleIdToken(
   idToken: string,
   verifier: TokenVerifier = defaultVerifier
-): Promise<string> {
+): Promise<{ email: string; profile: GoogleProfile }> {
   const audience = getGoogleClientId();
   if (!audience) throw new Error('google_not_configured');
   if (typeof idToken !== 'string' || !idToken.trim()) {
     throw new Error('invalid_token');
   }
-  const { email, emailVerified } = await verifier(idToken.trim(), audience);
+  const { email, emailVerified, name, picture } = await verifier(idToken.trim(), audience);
   if (!emailVerified) throw new Error('email_not_verified');
   const normalized = validateEmail(email);
   if (!normalized) throw new Error('invalid_email');
-  return normalized;
+  return {
+    email: normalized,
+    profile: {
+      name: normalizeGoogleProfileName(name),
+      picture: normalizeGooglePicture(picture),
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------

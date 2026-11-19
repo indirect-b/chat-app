@@ -17,6 +17,12 @@ export interface DbUser {
   last_seen: string;
   recovery_code_hash?: string | null;
   email?: string | null;
+  /** Chat display name (from the Google profile, or set manually). */
+  display_name?: string | null;
+  /** 1 once the user edits their display name manually (Google sync then stops touching it). */
+  name_custom?: number;
+  /** 1 once the user edits their avatar manually (Google sync then stops touching it). */
+  avatar_custom?: number;
 }
 
 export interface DbContact {
@@ -247,10 +253,17 @@ export class PersistentFallbackDatabase {
     }
     if (lower.startsWith('insert into users (username, bale_chat_id, joined_at')) {
       const [username, bale_chat_id, joined_at, recovery_code_hash, email] = params;
+      // Google profile sync (v6.5.0): extra params when the insert comes
+      // from completeGoogleSignIn — display_name, avatar, name_custom,
+      // avatar_custom. Older 5-param inserts leave them at the defaults.
+      const display_name = params.length > 5 ? params[5] ?? null : null;
+      const avatar = params.length > 6 ? params[6] ?? null : null;
+      const name_custom = params.length > 7 ? Number(params[7]) || 0 : 0;
+      const avatar_custom = params.length > 8 ? Number(params[8]) || 0 : 0;
       const user: DbUser = {
         username,
         bale_chat_id: bale_chat_id || null,
-        avatar: null,
+        avatar,
         bio: '',
         status: 'online',
         public_key: null,
@@ -262,6 +275,9 @@ export class PersistentFallbackDatabase {
         last_seen: new Date().toISOString(),
         recovery_code_hash: recovery_code_hash || null,
         email: email || null,
+        display_name,
+        name_custom,
+        avatar_custom,
       };
       this.users.set(username, user);
       this.scheduleSave();
@@ -285,12 +301,29 @@ export class PersistentFallbackDatabase {
       }
       return { rows: [] };
     }
-    if (lower.includes('update users set bio=$1, status=$2, avatar=$3 where username=$4')) {
-      const [bio, status, avatar, username] = params;
+    if (
+      lower.includes(
+        'update users set bio=$1, status=$2, avatar=$3, display_name=$4, name_custom=$5, avatar_custom=$6 where username=$7'
+      )
+    ) {
+      const [bio, status, avatar, display_name, name_custom, avatar_custom, username] = params;
       const u = this.users.get(username);
       if (u) {
         u.bio = bio;
         u.status = status;
+        u.avatar = avatar;
+        u.display_name = display_name;
+        u.name_custom = Number(name_custom) || 0;
+        u.avatar_custom = Number(avatar_custom) || 0;
+        this.scheduleSave();
+      }
+      return { rows: [] };
+    }
+    if (lower.includes('update users set display_name=$1, avatar=$2 where username=$3')) {
+      const [display_name, avatar, username] = params;
+      const u = this.users.get(username);
+      if (u) {
+        u.display_name = display_name;
         u.avatar = avatar;
         this.scheduleSave();
       }
@@ -718,11 +751,17 @@ export async function init(poolOverride?: Pool): Promise<void> {
             block_until TEXT,
             last_seen TEXT,
             recovery_code_hash TEXT,
-            email TEXT
+            email TEXT,
+            display_name TEXT,
+            name_custom INTEGER DEFAULT 0,
+            avatar_custom INTEGER DEFAULT 0
           );
           ALTER TABLE users ADD COLUMN IF NOT EXISTS public_key TEXT;
           ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_code_hash TEXT;
           ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
+          ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;
+          ALTER TABLE users ADD COLUMN IF NOT EXISTS name_custom INTEGER DEFAULT 0;
+          ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_custom INTEGER DEFAULT 0;
 
           CREATE TABLE IF NOT EXISTS contacts (
             username TEXT,
