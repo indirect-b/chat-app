@@ -15,6 +15,7 @@ export interface DbUser {
   block_type: string | null;
   block_until: string | null;
   last_seen: string;
+  recovery_code_hash?: string | null;
 }
 
 export interface DbContact {
@@ -224,8 +225,8 @@ export class PersistentFallbackDatabase {
       );
       return { rows: list };
     }
-    if (lower.startsWith('insert into users (username, bale_chat_id, joined_at)')) {
-      const [username, bale_chat_id, joined_at] = params;
+    if (lower.startsWith('insert into users (username, bale_chat_id, joined_at')) {
+      const [username, bale_chat_id, joined_at, recovery_code_hash] = params;
       const user: DbUser = {
         username,
         bale_chat_id: bale_chat_id || null,
@@ -239,9 +240,19 @@ export class PersistentFallbackDatabase {
         block_type: null,
         block_until: null,
         last_seen: new Date().toISOString(),
+        recovery_code_hash: recovery_code_hash || null,
       };
       this.users.set(username, user);
       this.scheduleSave();
+      return { rows: [] };
+    }
+    if (lower.includes('update users set recovery_code_hash=$1 where username=$2')) {
+      const [recovery_code_hash, username] = params;
+      const u = this.users.get(username);
+      if (u) {
+        u.recovery_code_hash = recovery_code_hash;
+        this.scheduleSave();
+      }
       return { rows: [] };
     }
     if (lower.includes('update users set public_key=$1 where username=$2')) {
@@ -635,9 +646,11 @@ export async function init(): Promise<void> {
             block_reason TEXT,
             block_type TEXT,
             block_until TEXT,
-            last_seen TEXT
+            last_seen TEXT,
+            recovery_code_hash TEXT
           );
           ALTER TABLE users ADD COLUMN IF NOT EXISTS public_key TEXT;
+          ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_code_hash TEXT;
 
           CREATE TABLE IF NOT EXISTS contacts (
             username TEXT,
