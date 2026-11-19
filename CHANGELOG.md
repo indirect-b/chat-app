@@ -2,7 +2,15 @@
 
 ---
 
-## v6.2.0 (Latest) — Login without Bale: email + Google Sign-In, privacy page, database hardening
+## v6.3.0 (Latest) — Media end-to-end encryption: files encrypted with the room key, members-only media links
+- Files (photos, voice, video) are now encrypted with the room key before upload (PQF1 + AES-256-GCM); the server only ever stores ciphertext. The message ratchet is untouched — the file key comes from stable per-room material.
+- Media links open only for logged-in members of that chat: /api/media requires a session token and room membership; the public /uploads route is gone; deleted messages' media is denied; orphan media is denied. Avatars stay visible to logged-in users (public profile pictures by design, never anonymous).
+- Old media: access-controlled through its message's room, but NOT encrypted — the server never had the key, so it cannot retro-encrypt. Re-upload a file to encrypt it.
+- Room and profile access control: /api/messages/:roomId now requires a session and room membership; /api/groups/:username, /api/contacts/:username, POST /api/user/update and POST /api/add-contact now require a session and only let a user act on their own data (anyone could previously read any room's messages or overwrite any user's profile).
+- 123/123 tests pass.
+- Known limits: the 1:1 file key is ECDH-derived (classical) — the PQ ratchet key is wiped on every rekey and cannot serve as a stable file key; group files use the ML-KEM-distributed epoch key. A member can still re-share a decrypted file outside the app.
+
+## v6.2.0 — Login without Bale: email + Google Sign-In, privacy page, database hardening
 - Email signup: one-time code by email (Gmail SMTP, env-gated), same one-time recovery code at registration. Bale stays as the other path.
 - Google Sign-In (primary): the server verifies the Google ID token; a new account is created atomically from the verified email. No client secret anywhere.
 - Security fix: /api/register now requires a verified one-time code first — before, anyone could register any Bale ID or email without proving ownership and receive its recovery code.
