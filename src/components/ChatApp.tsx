@@ -691,9 +691,12 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   const loadRoomList = useCallback(
     async (tab: 'chats' | 'groups') => {
       if (tab === 'chats') {
-        const res = await fetch('/api/contacts/' + encodeURIComponent(myUsername)).then(r =>
-          r.json()
-        );
+        // (profile-auth) the contact list is the user's own data: the server
+        // only serves it to the session owner, so the token must be sent.
+        const sessionToken = getSessionToken();
+        const res = await fetch('/api/contacts/' + encodeURIComponent(myUsername), {
+          headers: sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {},
+        }).then(r => r.json());
         if (res.ok) {
           res.contacts.forEach((c: any) => {
             if (c.public_key) {
@@ -713,9 +716,10 @@ export const ChatApp: React.FC<ChatAppProps> = ({
           );
         }
       } else {
-        const res = await fetch('/api/groups/' + encodeURIComponent(myUsername)).then(r =>
-          r.json()
-        );
+        const sessionToken = getSessionToken();
+        const res = await fetch('/api/groups/' + encodeURIComponent(myUsername), {
+          headers: sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {},
+        }).then(r => r.json());
         if (res.ok) {
           res.groups.forEach((g: any) => {
             if (Array.isArray(g.members)) {
@@ -884,7 +888,10 @@ export const ChatApp: React.FC<ChatAppProps> = ({
 
       // Refresh chat-list preview after delete
       try {
-        const res = await fetch('/api/messages/' + encodeURIComponent(roomId)).then(r => r.json());
+        const sessionToken = getSessionToken();
+        const res = await fetch('/api/messages/' + encodeURIComponent(roomId), {
+          headers: sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {},
+        }).then(r => r.json());
         if (res.ok && Array.isArray(res.messages)) {
           if (res.messages.length > 0) {
             const lastMsg = res.messages[res.messages.length - 1];
@@ -1158,9 +1165,10 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     setCustomSecretInput(getRoomSecret(roomId));
     if (isMobile) setMobileChatOpen(true);
 
-    const res = await fetch('/api/messages/' + encodeURIComponent(roomId)).then(r =>
-      r.json()
-    );
+    const sessionToken = getSessionToken();
+    const res = await fetch('/api/messages/' + encodeURIComponent(roomId), {
+      headers: sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {},
+    }).then(r => r.json());
     if (res.ok && Array.isArray(res.messages)) {
       const decryptedList: DecryptedChatMessage[] = [];
       for (const m of res.messages as ChatMessage[]) {
@@ -1372,9 +1380,14 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   const handleAddContact = async () => {
     const clean = newContactInput.trim().replace('@', '');
     if (!clean) return;
+    // (profile-auth) the server only accepts adding to your own contact list.
+    const sessionToken = getSessionToken();
     const res = await fetch('/api/add-contact', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+      },
       body: JSON.stringify({ myUsername, contactUsername: clean }),
     }).then(r => r.json());
 
@@ -1482,9 +1495,14 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   };
 
   const handleSaveProfile = async () => {
+    // (profile-auth) the server only accepts updating your own profile.
+    const sessionToken = getSessionToken();
     await fetch('/api/user/update', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+      },
       body: JSON.stringify({
         username: myUsername,
         bio: bioInput,
