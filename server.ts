@@ -16,6 +16,7 @@ import * as bale from './src/server/bale';
 import { pool, init } from './src/server/db';
 import { presence } from './src/server/presence';
 import { getRoomId, resolveMediaAccess, canUploadToRoom } from './src/server/media';
+import { checkRoomReadAccess, checkOwnGroupsAccess, checkOwnUsername } from './src/server/roomAccess';
 import {
   generateRecoveryCode,
   hashRecoveryCode,
@@ -42,7 +43,7 @@ import {
 } from './src/server/google';
 import { PRIVACY_HTML } from './src/server/privacy';
 
-const APP_VERSION = '6.1.0';
+const APP_VERSION = '6.2.0';
 const recoverRateLimiter = new RecoveryRateLimiter(5, 15 * 60 * 1000);
 // Email OTP requests: 5 per hour, per email address and per IP (same sliding-window style as /api/recover).
 const emailOtpRateLimiter = new RecoveryRateLimiter(
@@ -848,7 +849,13 @@ app.get('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
 });
 
 app.post('/api/user/update', async (req: Request, res: Response) => {
-  const { username, bio, status, avatar } = req.body;
+  // A user may only update their OWN profile: without this check anyone
+  // could overwrite any user's bio, status and avatar by posting a username.
+  const { username, bio, status, avatar } = req.body || {};
+  const access = checkOwnUsername(getSessionUsername(req), String(username ?? ''));
+  if (access !== 'ok') {
+    return res.status(403).json({ ok: false, msg: 'unauthorized' });
+  }
   await pool.query('UPDATE users SET bio=$1, status=$2, avatar=$3 WHERE username=$4', [
     bio || '',
     status || 'online',
@@ -859,7 +866,13 @@ app.post('/api/user/update', async (req: Request, res: Response) => {
 });
 
 app.post('/api/add-contact', async (req: Request, res: Response) => {
-  const { myUsername, contactUsername } = req.body;
+  // A user may only add contacts to their OWN list — otherwise anyone could
+  // insert contact rows for any account (and harvest public keys in return).
+  const { myUsername, contactUsername } = req.body || {};
+  const access = checkOwnUsername(getSessionUsername(req), String(myUsername ?? ''));
+  if (access !== 'ok') {
+    return res.status(403).json({ ok: false, msg: 'unauthorized' });
+  }
   const { rows } = await pool.query('SELECT username, public_key FROM users WHERE username = $1', [
     contactUsername,
   ]);
@@ -873,6 +886,12 @@ app.post('/api/add-contact', async (req: Request, res: Response) => {
 });
 
 app.get('/api/contacts/:username', async (req: Request, res: Response) => {
+  // A user may only list their OWN contacts: without this check anyone could
+  // enumerate any user's contact list with public keys, statuses and online state.
+  const access = checkOwnUsername(getSessionUsername(req), String(req.params.username));
+  if (access !== 'ok') {
+    return res.status(403).json({ ok: false, msg: 'unauthorized' });
+  }
   const { rows } = await pool.query(
     'SELECT c.contact, u.avatar, u.status, u.public_key FROM contacts c JOIN users u ON c.contact = u.username WHERE c.username = $1',
     [req.params.username]
@@ -889,15 +908,33 @@ app.get('/api/contacts/:username', async (req: Request, res: Response) => {
   });
 });
 
+// ===== ROOM MESSAGES (access-controlled: session + membership) =====
+// A room id is guessable (DM rooms are `user1__user2`, groups `group__<id>`),
+// so the endpoint must not serve messages to anyone who knows the id.
+// No session and non-member both get 403 (and so does an unknown room),
+// so the response never leaks whether a room exists. Content stays E2EE.
 app.get('/api/messages/:roomId', async (req: Request, res: Response) => {
+  const roomId = String(req.params.roomId);
+  const access = await checkRoomReadAccess(getSessionUsername(req), roomId, (sql, params) =>
+    pool.query(sql, params)
+  );
+  if (access !== 'ok') {
+    return res.status(403).json({ ok: false, msg: 'not a member of this chat' });
+  }
   const { rows } = await pool.query(
     'SELECT * FROM messages WHERE room_id = $1 AND is_deleted = 0 ORDER BY timestamp ASC',
-    [req.params.roomId]
+    [roomId]
   );
   res.json({ ok: true, messages: rows.map(parseMsg) });
 });
 
 app.get('/api/groups/:username', async (req: Request, res: Response) => {
+  // A user may only list their own groups: the session username must equal
+  // the username in the URL, otherwise anyone could enumerate anyone's groups.
+  const access = checkOwnGroupsAccess(getSessionUsername(req), String(req.params.username));
+  if (access !== 'ok') {
+    return res.status(403).json({ ok: false, msg: 'unauthorized' });
+  }
   const { rows } = await pool.query('SELECT * FROM groups');
   const myGroups = rows.filter((g: any) => JSON.parse(g.members).includes(req.params.username));
   res.json({
