@@ -1,378 +1,628 @@
-// PQ-MPRBA hardened-protocol tests (Bun).
-// Each simulated user is a separate driver process (own localStorage, own
-// module state) — the closest thing to two devices without a browser.
-// Run: bun test tests/pq-mprba.test.ts
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { ml_kem768 } from '@noble/post-quantum/ml-kem.js';
-import { ristretto255_oprf } from '@noble/curves/ed25519.js';
-import { sha256 } from '@noble/hashes/sha2.js';
+import { describe, it, beforeEach } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js';
+import {
+  E2EEError,
+  KEY_STORAGE_VERSION,
+  bufToBase64,
+  clearRatchetSession,
+  clearVerifiedBundleCache,
+  createGroupEpochPacket,
+  decapsulateGroupEpochKey,
+  decryptMessageText,
+  encryptMessageText,
+  ensureUserHybridKeyPair,
+  getVerifiedBundleCacheStats,
+  parsePeerKeyBundle,
+  parsePeerKeyBundleStrict,
+  resetAllCryptoStateForTests,
+  rotateGroupEpoch,
+  serializeMessageForSigning,
+  withUnwrappedMLDSASecretKey,
+  zeroizeBuffer,
+} from '../src/utils/crypto';
+import {
+  KEY_STORAGE_VERSION_MARKER,
+  loadIdentityRecordV4,
+} from '../src/utils/keystore';
+import {
+  computeSafetyNumberForContact,
+  markContactVerified,
+  observeContactPublicKey,
+  rotateSessionRatchetOnly,
+} from '../src/utils/safetyNumber';
+import {
+  RecoveryRateLimiter,
+  generateRecoveryCode,
+  hashRecoveryCode,
+  verifyRecoveryCode,
+} from '../src/server/recovery';
 
-const DRIVER = new URL('./harness/client-driver.ts', import.meta.url).pathname;
-
-function b64(buf: Uint8Array): string {
-  let s = '';
-  for (let i = 0; i < buf.length; i++) s += String.fromCharCode(buf[i]);
-  return btoa(s);
-}
-function unb64(s: string): Uint8Array {
-  const bin = atob(s);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
-class Client {
-  proc: any;
-  username: string;
-  private nextId = 1;
-  private pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>();
-  private buf = '';
-
-  constructor(username: string) {
-    this.username = username;
-    this.proc = Bun.spawn([process.execPath, DRIVER], { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' });
-    const reader = this.proc.stdout.getReader();
-    (async () => {
-      const dec = new TextDecoder();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        this.buf += dec.decode(value, { stream: true });
-        let idx: number;
-        while ((idx = this.buf.indexOf('\n')) >= 0) {
-          const line = this.buf.slice(0, idx).trim();
-          this.buf = this.buf.slice(idx + 1);
-          if (!line) continue;
-          const msg = JSON.parse(line);
-          const p = this.pending.get(msg.id);
-          if (p) {
-            this.pending.delete(msg.id);
-            if (msg.ok) p.resolve(msg.result);
-            else p.reject(new Error(`${msg.error || 'driver error'}${msg.name ? ` [${msg.name}]` : ''}`));
-          }
-        }
-      }
-    })();
+class MemoryStorage implements Storage {
+  private map = new Map<string, string>();
+  get length(): number {
+    return this.map.size;
   }
-
-  call(cmd: string, args: any = {}): Promise<any> {
-    const id = this.nextId++;
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.proc.stdin.write(JSON.stringify({ id, cmd, args }) + '\n');
-    });
+  clear(): void {
+    this.map.clear();
   }
-
-  kill() {
-    try {
-      this.proc.kill();
-    } catch {}
+  getItem(key: string): string | null {
+    return this.map.has(key) ? this.map.get(key)! : null;
+  }
+  key(index: number): string | null {
+    return Array.from(this.map.keys())[index] ?? null;
+  }
+  removeItem(key: string): void {
+    this.map.delete(key);
+  }
+  setItem(key: string, value: string): void {
+    this.map.set(key, String(value));
   }
 }
 
-function roomId(a: string, b: string) {
-  return [a, b].sort().join('__');
-}
-
-describe('PQ-MPRBA hardened protocol', () => {
-  let alice: Client;
-  let bob: Client;
-  let carol: Client;
-  let aliceBundle: string;
-  let bobBundle: string;
-  let carolBundle: string;
-  const room = roomId('alice', 'bob');
-
-  beforeAll(async () => {
-    alice = new Client('alice');
-    bob = new Client('bob');
-    carol = new Client('carol');
-    aliceBundle = (await alice.call('init', { username: 'alice' })).bundle;
-    bobBundle = (await bob.call('init', { username: 'bob' })).bundle;
-    carolBundle = (await carol.call('init', { username: 'carol' })).bundle;
-  }, 30000);
-
-  afterAll(() => {
-    alice.kill();
-    bob.kill();
-    carol.kill();
-  });
-
-  test('F1: keys are random, not derivable from the username', async () => {
-    // Same username in a fresh process must get different keys.
-    const alice2 = new Client('alice');
-    const bundle2 = (await alice2.call('init', { username: 'alice' })).bundle;
-    expect(bundle2).not.toBe(aliceBundle);
-    // The old deterministic derivation must not reproduce the stored keys.
-    const stored = await alice.call('getSecretKeys', { username: 'alice' });
-    const old = await alice.call('oldDerivation', { username: 'alice' });
-    expect(stored.mlkemSecretB64).not.toBe(old.mlkemSecretB64);
-    expect(stored.mldsaSecretB64).not.toBe(old.mldsaSecretB64);
-    expect(stored.ecdhPrivD).not.toBe(
-      b64(unb64(old.ecdhPrivB64)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-    );
-    expect(stored.versions).toEqual({ ecdh: 3, kem: 3, dsa: 3 });
-    alice2.kill();
-  }, 30000);
-
-  test('interop: two clients exchange PQ messages, signatures verify', async () => {
-    const p1 = (await alice.call('encrypt', { roomId: room, text: 'hello bob', peerBundle: bobBundle, peerUsername: 'bob', username: 'alice' })).payload;
-    expect(p1.startsWith('e2ee:pq:v2:')).toBe(true);
-    const d1 = await bob.call('decrypt', { payload: p1, roomId: room, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice' });
-    expect(d1.text).toBe('hello bob');
-    expect(d1.mode).toBe('PQ-MLKEM-RATCHET');
-    expect(d1.mldsaVerified).toBe(true);
-    expect(d1.failed).toBe(false);
-
-    const p2 = (await bob.call('encrypt', { roomId: room, text: 'hello alice', peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob' })).payload;
-    const d2 = await alice.call('decrypt', { payload: p2, roomId: room, peerBundle: bobBundle, peerUsername: 'bob', username: 'alice', sender: 'bob' });
-    expect(d2.text).toBe('hello alice');
-    expect(d2.mldsaVerified).toBe(true);
-
-    const st = await alice.call('roomStatus', { roomId: room, isGroup: false, peerBundle: bobBundle, peerUsername: 'bob', username: 'alice' });
-    expect(st.isPQ).toBe(true);
-    expect(st.type).toBe('PQ_HYBRID_VERIFIED');
-    expect(st.badge).toContain('PQ-KEM');
-  }, 30000);
-
-  test('tampered ciphertext / capsule / signature must fail', async () => {
-    const p = (await alice.call('encrypt', { roomId: room, text: 'tamper me', peerBundle: bobBundle, peerUsername: 'bob', username: 'alice' })).payload;
-    const parts = p.split(':');
-    // e2ee:pq:v2:<step>:<kem>:<iv>:<cipher>:<sig>  ->  [3]=step [4]=kem [5]=iv [6]=cipher [7]=sig
-    const flip = (s: string) => {
-      const bytes = unb64(s);
-      bytes[0] ^= 0x01;
-      return b64(bytes);
-    };
-    const tamperCipher = [...parts];
-    tamperCipher[6] = flip(parts[6]);
-    const d1 = await bob.call('decrypt', { payload: tamperCipher.join(':'), roomId: room, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice', allowCache: false });
-    expect(d1.failed).toBe(true);
-
-    const tamperSig = [...parts];
-    tamperSig[7] = flip(parts[7]);
-    const d2 = await bob.call('decrypt', { payload: tamperSig.join(':'), roomId: room, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice', allowCache: false });
-    expect(d2.failed).toBe(true);
-
-    const tamperCapsule = [...parts];
-    tamperCapsule[4] = flip(parts[4]);
-    const d3 = await bob.call('decrypt', { payload: tamperCapsule.join(':'), roomId: room, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice', allowCache: false });
-    expect(d3.failed).toBe(true);
-
-    // Stripped signature must fail when the sender has an ML-DSA key.
-    const stripped = parts.slice(0, 7).join(':');
-    const d4 = await bob.call('decrypt', { payload: stripped, roomId: room, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice', allowCache: false });
-    expect(d4.failed).toBe(true);
-  }, 30000);
-
-  test('F7: replayed message must fail on the network path', async () => {
-    const p = (await alice.call('encrypt', { roomId: room, text: 'do not replay me', peerBundle: bobBundle, peerUsername: 'bob', username: 'alice' })).payload;
-    const d1 = await bob.call('decrypt', { payload: p, roomId: room, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice', allowCache: false });
-    expect(d1.text).toBe('do not replay me');
-    const d2 = await bob.call('decrypt', { payload: p, roomId: room, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice', allowCache: false });
-    expect(d2.failed).toBe(true);
-  }, 30000);
-
-  test('F7: display path still re-reads an already-decrypted message from cache', async () => {
-    const p = (await alice.call('encrypt', { roomId: room, text: 'read me twice', peerBundle: bobBundle, peerUsername: 'bob', username: 'alice' })).payload;
-    const d1 = await bob.call('decrypt', { payload: p, roomId: room, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice', allowCache: false });
-    expect(d1.text).toBe('read me twice');
-    // Re-opening the room (display path, allowCache default true) shows it again.
-    const d2 = await bob.call('decrypt', { payload: p, roomId: room, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice' });
-    expect(d2.failed).toBe(false);
-    expect(d2.text).toBe('read me twice');
-  }, 30000);
-
-  test('wrong key (third party) must fail', async () => {
-    const p = (await alice.call('encrypt', { roomId: room, text: 'for bob only', peerBundle: bobBundle, peerUsername: 'bob', username: 'alice' })).payload;
-    const d = await carol.call('decrypt', { payload: p, roomId: room, peerBundle: aliceBundle, peerUsername: 'alice', username: 'carol', sender: 'alice' });
-    expect(d.failed).toBe(true);
-    // Wrong room must fail too.
-    const dRoom = await bob.call('decrypt', { payload: p, roomId: roomId('alice', 'carol'), peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice' });
-    expect(dRoom.failed).toBe(true);
-  }, 30000);
-
-  test('out-of-order messages all decrypt (skipped keys)', async () => {
-    const p1 = (await alice.call('encrypt', { roomId: room, text: 'one', peerBundle: bobBundle, peerUsername: 'bob', username: 'alice' })).payload;
-    const p2 = (await alice.call('encrypt', { roomId: room, text: 'two', peerBundle: bobBundle, peerUsername: 'bob', username: 'alice' })).payload;
-    const p3 = (await alice.call('encrypt', { roomId: room, text: 'three', peerBundle: bobBundle, peerUsername: 'bob', username: 'alice' })).payload;
-    // Deliver 3, then 1, then 2.
-    expect((await bob.call('decrypt', { payload: p3, roomId: room, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice' })).text).toBe('three');
-    expect((await bob.call('decrypt', { payload: p1, roomId: room, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice' })).text).toBe('one');
-    expect((await bob.call('decrypt', { payload: p2, roomId: room, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice' })).text).toBe('two');
-  }, 30000);
-
-  test('F5/F4: encrypt without a peer bundle or secret throws, never returns plaintext', async () => {
-    let threw = false;
-    try {
-      await alice.call('encrypt', { roomId: roomId('alice', 'dave'), text: 'secret text', peerBundle: null, peerUsername: 'dave', username: 'alice' });
-    } catch (e: any) {
-      threw = true;
-      expect(e.message).toContain('E2EEError');
-    }
-    expect(threw).toBe(true);
-  }, 30000);
-
-  test('F6: forged bundle signature / missing ML-DSA cannot start a PQ session', async () => {
-    // Bundle with a forged ML-DSA signature (flip a byte in the signature).
-    const parsed = JSON.parse(bobBundle);
-    const sigBytes = unb64(parsed.mldsaSigB64);
-    sigBytes[0] ^= 0x01;
-    parsed.mldsaSigB64 = b64(sigBytes);
-    const forged = JSON.stringify(parsed);
-    const flags = await alice.call('parseBundle', { bundle: forged, expected: 'bob' });
-    expect(flags.isFullyPostQuantum).toBe(false);
-    expect(flags.isMldsaSignatureInvalid).toBe(true);
-    const st = await alice.call('roomStatus', { roomId: room, isGroup: false, peerBundle: forged, peerUsername: 'bob', username: 'alice' });
-    expect(st.isPQ).toBe(false);
-    expect(st.reason).toBe('INVALID_MLDSA_SIGNATURE');
-    // Sending to the forged bundle falls back to explicit ECDH, never PQ.
-    const p = (await alice.call('encrypt', { roomId: room, text: 'fallback?', peerBundle: forged, peerUsername: 'bob', username: 'alice' })).payload;
-    expect(p.startsWith('e2ee:ecdh:')).toBe(true);
-  }, 30000);
-
-  test('F9: forward secrecy — compromised old state cannot read post-rotation messages', async () => {
-    // Fresh room (distinct localStorage key + HKDF salt) so the 50-message
-    // rotation boundary is exact and independent of other tests.
-    const room2 = 'alice__bob__fs-test';
-    // Send 10 messages, snapshot Bob's state (the "compromise").
-    for (let i = 0; i < 10; i++) {
-      const p = (await alice.call('encrypt', { roomId: room2, text: `m${i}`, peerBundle: bobBundle, peerUsername: 'bob', username: 'alice' })).payload;
-      await bob.call('decrypt', { payload: p, roomId: room2, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice' });
-    }
-    const compromised = (await bob.call('getState', { username: 'bob', roomId: room2 })).state;
-    expect(compromised).not.toBeNull();
-    expect(compromised.sessionEpoch).toBe(1);
-
-    // Keep sending until rotation (50 sent messages trigger it).
-    let postRotationPayload = '';
-    for (let i = 10; i < 56; i++) {
-      const p = (await alice.call('encrypt', { roomId: room2, text: `m${i}`, peerBundle: bobBundle, peerUsername: 'bob', username: 'alice' })).payload;
-      const d = await bob.call('decrypt', { payload: p, roomId: room2, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice' });
-      expect(d.text).toBe(`m${i}`);
-      if (i === 55) postRotationPayload = p;
-    }
-    const bobState = (await bob.call('getState', { username: 'bob', roomId: room2 })).state;
-    expect(bobState.sessionEpoch).toBeGreaterThan(1);
-
-    // Eve: Bob's old ratchet state, but fresh long-term keys (she never had them).
-    const eve = new Client('bob');
-    await eve.call('init', { username: 'bob' });
-    await eve.call('setState', { username: 'bob', roomId: room2, state: compromised });
-    const dEve = await eve.call('decrypt', { payload: postRotationPayload, roomId: room2, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice' });
-    expect(dEve.failed).toBe(true);
-    eve.kill();
-  }, 60000);
-
-  test('F9: late pre-rotation message still decrypts via the previous session slot', async () => {
-    const room3 = 'alice__bob__late-msg';
-    const payloads: string[] = [];
-    for (let i = 0; i < 52; i++) {
-      const p = (await alice.call('encrypt', { roomId: room3, text: `g${i}`, peerBundle: bobBundle, peerUsername: 'bob', username: 'alice' })).payload;
-      payloads.push(p);
-      if (i < 50) {
-        await bob.call('decrypt', { payload: p, roomId: room3, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice' });
-      }
-    }
-    // Messages 51, 52 rotate Bob to epoch 2; now deliver 50 (epoch 1) late.
-    expect((await bob.call('decrypt', { payload: payloads[50], roomId: room3, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice' })).text).toBe('g50');
-    expect((await bob.call('decrypt', { payload: payloads[51], roomId: room3, peerBundle: aliceBundle, peerUsername: 'alice', username: 'bob', sender: 'alice' })).text).toBe('g51');
-  }, 60000);
-
-  test('F3: group epoch key via ML-KEM encapsulation', async () => {
-    const groupId = 'test-group-1';
-    const groupRoom = `group__${groupId}`;
-    const members = ['alice', 'bob', 'carol'];
-    const bundles = { alice: aliceBundle, bob: bobBundle, carol: carolBundle };
-    // Alice (creator) makes the packet for epoch 1.
-    const packet = await alice.call('groupPacket', { members: bundles });
-    expect(packet.missing).toEqual([]);
-    expect(Object.keys(packet.keys).sort()).toEqual(['alice', 'bob', 'carol']);
-    // Bob decapsulates his capsule and rotates.
-    const bobKey = (await bob.call('groupDecap', { username: 'bob', ctB64: packet.keys['bob'] })).keyB64;
-    expect(bobKey).toBe(packet.epochKeyB64);
-    await bob.call('groupRotate', { groupId, epoch: 1, members, keyB64: bobKey });
-    // Carol decapsulates too.
-    const carolKey = (await carol.call('groupDecap', { username: 'carol', ctB64: packet.keys['carol'] })).keyB64;
-    await carol.call('groupRotate', { groupId, epoch: 1, members, keyB64: carolKey });
-    // Alice rotates with her raw key.
-    await alice.call('groupRotate', { groupId, epoch: 1, members, keyB64: packet.epochKeyB64 });
-
-    const gp = (await alice.call('encryptGroup', { roomId: groupRoom, text: 'hello group', username: 'alice', groupMembers: members })).payload;
-    expect(gp.startsWith('e2ee:gep:v2:1:')).toBe(true);
-    const dBob = await bob.call('decryptGroup', { payload: gp, roomId: groupRoom, username: 'bob', groupMembers: members, allowCache: false });
-    expect(dBob.text).toBe('hello group');
-    expect(dBob.mode).toBe('GROUP-EPOCH-FSM');
-    const dCarol = await carol.call('decryptGroup', { payload: gp, roomId: groupRoom, username: 'carol', groupMembers: members, allowCache: false });
-    expect(dCarol.text).toBe('hello group');
-
-    // F7 (group): replaying the same group payload on the network path fails.
-    const dReplay = await bob.call('decryptGroup', { payload: gp, roomId: groupRoom, username: 'bob', groupMembers: members, allowCache: false });
-    expect(dReplay.failed).toBe(true);
-    // ...but the display path still re-reads it from cache.
-    const dDisplay = await bob.call('decryptGroup', { payload: gp, roomId: groupRoom, username: 'bob', groupMembers: members });
-    expect(dDisplay.failed).toBe(false);
-    expect(dDisplay.text).toBe('hello group');
-
-    // A non-member (Dave) cannot decapsulate or decrypt.
-    const dave = new Client('dave');
-    await dave.call('init', { username: 'dave' });
-    const daveKey = (await dave.call('groupDecap', { username: 'dave', ctB64: packet.keys['bob'] })).keyB64;
-    expect(daveKey).toBeNull();
-    const dDave = await dave.call('decryptGroup', { payload: gp, roomId: groupRoom, username: 'dave', groupMembers: members, allowCache: false });
-    expect(dDave.failed).toBe(true);
-    dave.kill();
-
-    // Tampered capsule fails to decapsulate (flip a byte in the KEM ciphertext part).
-    const ctParts = packet.keys['bob'].split(':');
-    const ctBytes = unb64(ctParts[0]);
-    ctBytes[0] ^= 0x01;
-    ctParts[0] = b64(ctBytes);
-    const bad = (await bob.call('groupDecap', { username: 'bob', ctB64: ctParts.join(':') })).keyB64;
-    expect(bad).toBeNull();
-  }, 60000);
-
-  test('safety numbers: same keys both sides, change on key rotation', async () => {
-    const s1 = await alice.call('safetyNumber', { username: 'alice', peerBundle: bobBundle, peerUsername: 'bob' });
-    const s2 = await bob.call('safetyNumber', { username: 'bob', peerBundle: aliceBundle, peerUsername: 'alice' });
-    expect(s1.digits60).toBe(s2.digits60);
-    expect(s1.groups12.length).toBe(12);
-    expect(s1.digits60.length).toBe(60);
-    // Bob rotates identity (fresh keys) -> safety number changes.
-    await bob.call('reset', {});
-    const bobBundle2 = (await bob.call('init', { username: 'bob' })).bundle;
-    const s3 = await alice.call('safetyNumber', { username: 'alice', peerBundle: bobBundle2, peerUsername: 'bob' });
-    expect(s3.digits60).not.toBe(s1.digits60);
-  }, 30000);
+const mockLocalStorage = new MemoryStorage();
+Object.defineProperty(globalThis, 'localStorage', {
+  value: mockLocalStorage,
+  configurable: true,
+  writable: true,
 });
 
-describe('VOPRF (RFC 9497) round-trip', () => {
-  test('blind -> evaluate -> finalize verifies; wrong server key fails', () => {
-    const serverSeed = sha256(new TextEncoder().encode('test-server-seed'));
-    const serverKeys = ristretto255_oprf.voprf.deriveKeyPair(
-      serverSeed,
-      new TextEncoder().encode('PersianMessenger-Ristretto255-VOPRF-v2')
+describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
+  beforeEach(() => {
+    mockLocalStorage.clear();
+    resetAllCryptoStateForTests();
+  });
+
+  it('stores v4 identity & wrapping keys as non-extractable WebCrypto CryptoKeys and never writes private keys to localStorage', async () => {
+    const bundleStr = await ensureUserHybridKeyPair('alice');
+    assert.ok(bundleStr, 'Bundle should be generated');
+    const parsed = JSON.parse(bundleStr);
+    assert.equal(parsed.v, 4);
+    assert.equal(KEY_STORAGE_VERSION, 4);
+
+    const record = await loadIdentityRecordV4('alice');
+    assert.ok(record, 'IndexedDB v4 identity record must exist');
+    assert.equal(record.v, 4);
+    assert.equal(record.ecdhPrivateKey.extractable, false, 'ECDH private CryptoKey must be non-extractable');
+    assert.equal(record.wrappingKey.extractable, false, 'AES-GCM wrapping CryptoKey must be non-extractable');
+
+    await assert.rejects(
+      () => globalThis.crypto.subtle.exportKey('jwk', record.ecdhPrivateKey),
+      'Exporting non-extractable ECDH private key must reject'
     );
-    const rawInput = new TextEncoder().encode('blind-identity::alice::v2');
-    const { blind, blinded } = ristretto255_oprf.voprf.blind(rawInput);
-    const { evaluated, proof } = ristretto255_oprf.voprf.blindEvaluate(
-      serverKeys.secretKey,
-      serverKeys.publicKey,
-      blinded
+    await assert.rejects(
+      () => globalThis.crypto.subtle.exportKey('raw', record.wrappingKey),
+      'Exporting non-extractable AES-GCM wrapping key must reject'
     );
-    const out = ristretto255_oprf.voprf.finalize(rawInput, blind, evaluated, blinded, serverKeys.publicKey, proof);
-    // Ristretto255-SHA512 OPRF output is Nh = 64 bytes; the app hashes it
-    // with SHA-256 and uses the first 22 base64 chars as the anonymous token id.
-    expect(out.length).toBe(64);
-    const tokenId = b64(sha256(out)).slice(0, 22);
-    expect(tokenId.length).toBe(22);
-    // Wrong server public key must throw.
-    const wrongKeys = ristretto255_oprf.voprf.deriveKeyPair(
-      sha256(new TextEncoder().encode('other-seed')),
-      new TextEncoder().encode('PersianMessenger-Ristretto255-VOPRF-v2')
+
+    // Ensure no private key material or ratchet state leaked into localStorage
+    for (let i = 0; i < mockLocalStorage.length; i++) {
+      const k = mockLocalStorage.key(i)!;
+      const v = mockLocalStorage.getItem(k) || '';
+      assert.equal(k.startsWith('chat_ecdh_kp_'), false);
+      assert.equal(k.startsWith('chat_mlkem768_kp_'), false);
+      assert.equal(k.startsWith('chat_mldsa65_kp_'), false);
+      assert.equal(k.startsWith('chat_pq_ratchet_'), false);
+      assert.equal(v.includes('"d":'), false, 'No private JWK "d" parameter allowed in localStorage');
+      assert.equal(v.includes('secretKey'), false, 'No secretKey field allowed in localStorage');
+    }
+  });
+
+  it('discards legacy v2/v3 plaintext localStorage keys and bumps storage marker to v4', async () => {
+    mockLocalStorage.setItem(KEY_STORAGE_VERSION_MARKER, '3');
+    mockLocalStorage.setItem('chat_ecdh_kp_alice', '{"privateKey":{"d":"SECRET"}}');
+    mockLocalStorage.setItem('chat_mlkem768_kp_alice', '{"secretKey":"SECRET"}');
+    mockLocalStorage.setItem('chat_mldsa65_kp_alice', '{"secretKey":"SECRET"}');
+    mockLocalStorage.setItem('chat_pq_ratchet_alice_alice__bob', '{"sendChainKey":"SECRET"}');
+    mockLocalStorage.setItem('chat_identity_v3_alice', '{"v":3,"secret":"SECRET"}');
+    mockLocalStorage.setItem('chat_decrypted_v2_alice_room', '{"k":"plaintext"}');
+
+    const bundleStr = await ensureUserHybridKeyPair('alice');
+    assert.ok(bundleStr);
+    assert.equal(mockLocalStorage.getItem(KEY_STORAGE_VERSION_MARKER), '4');
+    assert.equal(mockLocalStorage.getItem('chat_ecdh_kp_alice'), null);
+    assert.equal(mockLocalStorage.getItem('chat_mlkem768_kp_alice'), null);
+    assert.equal(mockLocalStorage.getItem('chat_mldsa65_kp_alice'), null);
+    assert.equal(mockLocalStorage.getItem('chat_pq_ratchet_alice_alice__bob'), null);
+    assert.equal(mockLocalStorage.getItem('chat_identity_v3_alice'), null);
+    assert.equal(mockLocalStorage.getItem('chat_decrypted_v2_alice_room'), null);
+  });
+
+  it('generates fresh CSPRNG identity keys rather than deterministic username-derived keys', async () => {
+    const first = JSON.parse((await ensureUserHybridKeyPair('alice'))!);
+    resetAllCryptoStateForTests();
+    mockLocalStorage.clear();
+    const second = JSON.parse((await ensureUserHybridKeyPair('alice'))!);
+
+    assert.notEqual(first.mlkemPubB64, second.mlkemPubB64);
+    assert.notEqual(first.mldsaPubB64, second.mldsaPubB64);
+    assert.notEqual(first.ecdhJwk.x, second.ecdhJwk.x);
+  });
+
+  it('binds ML-KEM-768 and ECDH P-256 public keys under a verified ML-DSA-65 bundle signature', async () => {
+    const aliceBundleStr = (await ensureUserHybridKeyPair('alice'))!;
+    const valid = parsePeerKeyBundleStrict(aliceBundleStr, 'alice', { skipCache: true });
+    assert.equal(valid.isFullyPostQuantum, true);
+    assert.equal(valid.isMldsaVerified, true);
+
+    // Tamper username binding
+    assert.throws(
+      () => parsePeerKeyBundleStrict(aliceBundleStr, 'mallory', { skipCache: true }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'INVALID_SIGNATURE'
     );
-    expect(() =>
-      ristretto255_oprf.voprf.finalize(rawInput, blind, evaluated, blinded, wrongKeys.publicKey, proof)
-    ).toThrow();
+
+    // Tamper ML-KEM public key inside bundle
+    const tampered = JSON.parse(aliceBundleStr);
+    const kemBuf = Buffer.from(tampered.mlkemPubB64, 'base64');
+    kemBuf[0] ^= 0xff;
+    tampered.mlkemPubB64 = kemBuf.toString('base64');
+
+    assert.throws(
+      () => parsePeerKeyBundleStrict(JSON.stringify(tampered), 'alice', { skipCache: true }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'INVALID_SIGNATURE'
+    );
+  });
+
+  it('encryptMessageText fails closed (throws E2EEError, never returns plaintext)', async () => {
+    const aliceBundleStr = (await ensureUserHybridKeyPair('alice'))!;
+
+    await assert.rejects(
+      () => encryptMessageText('secret message', 'alice__bob', { myUsername: 'alice' }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'MISSING_KEYS'
+    );
+
+    await assert.rejects(
+      () => encryptMessageText('secret message', '', { myUsername: 'alice' }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'ENCRYPTION_FAILED'
+    );
+
+    const forged = JSON.parse(aliceBundleStr);
+    forged.ecdhJwk = { ...forged.ecdhJwk, x: 'AAAA' };
+    await assert.rejects(
+      () =>
+        encryptMessageText('secret message', 'alice__bob', {
+          myUsername: 'alice',
+          peerUsername: 'bob',
+          peerPublicKey: JSON.stringify(forged),
+        }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'INVALID_SIGNATURE'
+    );
+  });
+
+  it('completes bidirectional PQ-MPRBA v2 round-trip with RAM-only ratchet state', async () => {
+    const aliceBundle = (await ensureUserHybridKeyPair('alice'))!;
+    const bobBundle = (await ensureUserHybridKeyPair('bob'))!;
+    const roomId = 'alice__bob';
+
+    const c1 = await encryptMessageText('سلام باب! پیام اول پساکوانتومی', roomId, {
+      myUsername: 'alice',
+      peerUsername: 'bob',
+      peerPublicKey: bobBundle,
+    });
+    assert.ok(c1.startsWith('e2ee:pq:v2:0:'));
+
+    const d1 = await decryptMessageText(c1, roomId, {
+      myUsername: 'bob',
+      peerUsername: 'alice',
+      peerPublicKey: aliceBundle,
+      sender: 'alice',
+    });
+    assert.equal(d1.text, 'سلام باب! پیام اول پساکوانتومی');
+    assert.equal(d1.mode, 'PQ-MLKEM-RATCHET');
+    assert.equal(d1.mldsaVerified, true);
+    assert.equal(d1.ratchetStep, 0);
+
+    // Bob replies back to Alice
+    const c2 = await encryptMessageText('سلام آلیس! دریافت شد.', roomId, {
+      myUsername: 'bob',
+      peerUsername: 'alice',
+      peerPublicKey: aliceBundle,
+    });
+    const d2 = await decryptMessageText(c2, roomId, {
+      myUsername: 'alice',
+      peerUsername: 'bob',
+      peerPublicKey: bobBundle,
+      sender: 'bob',
+    });
+    assert.equal(d2.text, 'سلام آلیس! دریافت شد.');
+    assert.equal(d2.mldsaVerified, true);
+
+    // Ratchet state must stay RAM-only
+    for (let i = 0; i < mockLocalStorage.length; i++) {
+      const k = mockLocalStorage.key(i)!;
+      assert.equal(k.includes('ratchet'), false);
+    }
+  });
+
+  it('verifies ML-DSA-65 signature BEFORE decrypting or advancing ratchet state', async () => {
+    const aliceBundle = (await ensureUserHybridKeyPair('alice'))!;
+    const bobBundle = (await ensureUserHybridKeyPair('bob'))!;
+    const roomId = 'alice__bob';
+
+    const validCipher = await encryptMessageText('authentic payload', roomId, {
+      myUsername: 'alice',
+      peerUsername: 'bob',
+      peerPublicKey: bobBundle,
+    });
+
+    // Tamper ciphertext field without re-signing
+    const prefix = 'e2ee:pq:v2:';
+    const parts = validCipher.slice(prefix.length).split(':');
+    const ctBuf = Buffer.from(parts[3], 'base64');
+    ctBuf[0] ^= 0x01;
+    parts[3] = ctBuf.toString('base64');
+    const tamperedCipher = prefix + parts.join(':');
+
+    await assert.rejects(
+      () =>
+        decryptMessageText(tamperedCipher, roomId, {
+          myUsername: 'bob',
+          peerUsername: 'alice',
+          peerPublicKey: aliceBundle,
+          sender: 'alice',
+        }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'INVALID_SIGNATURE'
+    );
+
+    // Because signature failed before ratchet mutation, the original valid message must still decrypt!
+    const ok = await decryptMessageText(validCipher, roomId, {
+      myUsername: 'bob',
+      peerUsername: 'alice',
+      peerPublicKey: aliceBundle,
+      sender: 'alice',
+    });
+    assert.equal(ok.text, 'authentic payload');
+  });
+
+  it('rejects replayed PQ messages with E2EEError(REPLAY_DETECTED)', async () => {
+    const aliceBundle = (await ensureUserHybridKeyPair('alice'))!;
+    const bobBundle = (await ensureUserHybridKeyPair('bob'))!;
+    const roomId = 'alice__bob';
+
+    const msg = await encryptMessageText('one-time command', roomId, {
+      myUsername: 'alice',
+      peerUsername: 'bob',
+      peerPublicKey: bobBundle,
+    });
+
+    const first = await decryptMessageText(msg, roomId, {
+      myUsername: 'bob',
+      peerUsername: 'alice',
+      peerPublicKey: aliceBundle,
+      sender: 'alice',
+    });
+    assert.equal(first.text, 'one-time command');
+
+    await assert.rejects(
+      () =>
+        decryptMessageText(msg, roomId, {
+          myUsername: 'bob',
+          peerUsername: 'alice',
+          peerPublicKey: aliceBundle,
+          sender: 'alice',
+        }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'REPLAY_DETECTED'
+    );
+  });
+
+  it('handles out-of-order messages via skipped keys and burns each skipped key after single use', async () => {
+    const aliceBundle = (await ensureUserHybridKeyPair('alice'))!;
+    const bobBundle = (await ensureUserHybridKeyPair('bob'))!;
+    const roomId = 'alice__bob';
+
+    const m0 = await encryptMessageText('msg-0', roomId, {
+      myUsername: 'alice',
+      peerUsername: 'bob',
+      peerPublicKey: bobBundle,
+    });
+    const m1 = await encryptMessageText('msg-1', roomId, {
+      myUsername: 'alice',
+      peerUsername: 'bob',
+      peerPublicKey: bobBundle,
+    });
+    const m2 = await encryptMessageText('msg-2', roomId, {
+      myUsername: 'alice',
+      peerUsername: 'bob',
+      peerPublicKey: bobBundle,
+    });
+
+    // Deliver out of order: 2 -> 0 -> 1
+    assert.equal(
+      (await decryptMessageText(m2, roomId, { myUsername: 'bob', peerUsername: 'alice', peerPublicKey: aliceBundle, sender: 'alice' })).text,
+      'msg-2'
+    );
+    assert.equal(
+      (await decryptMessageText(m0, roomId, { myUsername: 'bob', peerUsername: 'alice', peerPublicKey: aliceBundle, sender: 'alice' })).text,
+      'msg-0'
+    );
+    assert.equal(
+      (await decryptMessageText(m1, roomId, { myUsername: 'bob', peerUsername: 'alice', peerPublicKey: aliceBundle, sender: 'alice' })).text,
+      'msg-1'
+    );
+
+    // Replaying skipped message 0 must fail closed
+    await assert.rejects(
+      () =>
+        decryptMessageText(m0, roomId, {
+          myUsername: 'bob',
+          peerUsername: 'alice',
+          peerPublicKey: aliceBundle,
+          sender: 'alice',
+        }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'REPLAY_DETECTED'
+    );
+  });
+
+  it('enforces MAX_SKIP bound (100) to prevent ratchet DoS', async () => {
+    const aliceBundle = (await ensureUserHybridKeyPair('alice'))!;
+    const bobBundle = (await ensureUserHybridKeyPair('bob'))!;
+    const roomId = 'alice__bob';
+
+    // پیام قانونی اول — نشست را نزد گیرنده برقرار می‌کند (recvStep = 1 پس از رمزگشایی)
+    const first = await encryptMessageText('step-0', roomId, {
+      myUsername: 'alice',
+      peerUsername: 'bob',
+      peerPublicKey: bobBundle,
+    });
+    await decryptMessageText(first, roomId, {
+      myUsername: 'bob',
+      peerUsername: 'alice',
+      peerPublicKey: aliceBundle,
+      sender: 'alice',
+    });
+
+    // حمله: فرستنده (با کلید امضای واقعی خودش) پیامی با قدم ۱۵۱ می‌سازد.
+    // چرخش دوره‌ای پس از ۵۰ پیام، پرش بیش از ۱۰۰ قدم را در مسیر عادی ناممکن کرده،
+    // پس مرز MAX_SKIP فقط در برابر چنین بار جعلی معنا دارد — و باید بسته بماند.
+    const parts = first.split(':');
+    // قالب بار: e2ee:pq:v2:{step}:{kem}:{iv}:{cipher}:{sig}
+    const forgedStep = 151;
+    const signTarget = serializeMessageForSigning({
+      roomId,
+      step: forgedStep,
+      kemCipherB64: parts[4],
+      ivB64: parts[5],
+      cipherB64: parts[6],
+    });
+    const sig = await withUnwrappedMLDSASecretKey('alice', sec => ml_dsa65.sign(signTarget, sec));
+    const forged = `e2ee:pq:v2:${forgedStep}:${parts[4]}:${parts[5]}:${parts[6]}:${bufToBase64(sig)}`;
+
+    await assert.rejects(
+      () =>
+        decryptMessageText(forged, roomId, {
+          myUsername: 'bob',
+          peerUsername: 'alice',
+          peerPublicKey: aliceBundle,
+          sender: 'alice',
+        }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'MAX_SKIP_EXCEEDED'
+    );
+  });
+
+  it('supports Group Epoch FSM rotation with ML-KEM-768 epoch packets, 3-epoch grace buffer, and expires older epochs', async () => {
+    const roomId = 'group__sec-team';
+    const members = ['alice', 'bob', 'carol'];
+    // باندل‌های تأییدشده اعضا برای ساخت بسته کلید اپوک (رفع F3)
+    const bundles: Record<string, ReturnType<typeof parsePeerKeyBundle>> = {};
+    for (const m of members) {
+      const bundleStr = (await ensureUserHybridKeyPair(m))!;
+      bundles[m] = parsePeerKeyBundle(bundleStr, m);
+    }
+    const rotateWithPacket = async (epoch: number) => {
+      const packet = await createGroupEpochPacket(bundles);
+      await rotateGroupEpoch('sec-team', epoch, members, packet.epochKeyB64);
+      return packet;
+    };
+
+    const p1 = await rotateWithPacket(1);
+    const e1 = await encryptMessageText('epoch-1-msg', roomId, { groupMembers: members });
+    await rotateWithPacket(2);
+    await rotateWithPacket(3);
+    const e3 = await encryptMessageText('epoch-3-msg', roomId, { groupMembers: members });
+    await rotateWithPacket(4);
+    await rotateWithPacket(5);
+    const e5 = await encryptMessageText('epoch-5-msg', roomId, { groupMembers: members });
+
+    // Epochs 3 and 5 are inside the 3-epoch window (3, 4, 5)
+    assert.equal((await decryptMessageText(e5, roomId, { groupMembers: members })).text, 'epoch-5-msg');
+    assert.equal((await decryptMessageText(e3, roomId, { groupMembers: members })).text, 'epoch-3-msg');
+
+    // Epoch 1 is evicted & outside grace window
+    await assert.rejects(
+      () => decryptMessageText(e1, roomId, { groupMembers: members }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'DECRYPTION_FAILED'
+    );
+
+    // بسته کلید اپوک: هر عضو کپسول خودش را باز می‌کند و به همان کلید توزیع‌کننده می‌رسد
+    assert.equal(await decapsulateGroupEpochKey('bob', p1.keys['bob']), p1.epochKeyB64);
+    assert.equal(await decapsulateGroupEpochKey('carol', p1.keys['carol']), p1.epochKeyB64);
+    // کپسول خراب باز نمی‌شود
+    assert.equal(await decapsulateGroupEpochKey('bob', 'AAAA:BBBB:CCCC'), null);
+  });
+
+  it('refuses to encrypt a group message without an epoch key, refuses keyless rotation (F3), and rejects replayed group messages (F7)', async () => {
+    const roomId = 'group__replay-team';
+    const members = ['alice', 'bob'];
+
+    // بدون کلید اپوک، رمزگذاری گروهی خطا می‌دهد — هرگز کلید مشتق‌شده از ورودی عمومی نمی‌سازد
+    await assert.rejects(
+      () => encryptMessageText('no-key-msg', roomId, { groupMembers: members }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'MISSING_KEYS'
+    );
+    // چرخش بدون کلید کپسوله‌شده خطا می‌دهد
+    await assert.rejects(
+      () => rotateGroupEpoch('replay-team', 2, members),
+      (err: unknown) => err instanceof E2EEError && err.code === 'MISSING_KEYS'
+    );
+
+    const bundles: Record<string, ReturnType<typeof parsePeerKeyBundle>> = {};
+    for (const m of members) {
+      bundles[m] = parsePeerKeyBundle((await ensureUserHybridKeyPair(m))!, m);
+    }
+    const packet = await createGroupEpochPacket(bundles);
+    await rotateGroupEpoch('replay-team', 1, members, packet.epochKeyB64);
+    const payload = await encryptMessageText('once-only', roomId, { groupMembers: members });
+    assert.equal((await decryptMessageText(payload, roomId, { groupMembers: members })).text, 'once-only');
+    await assert.rejects(
+      () => decryptMessageText(payload, roomId, { groupMembers: members }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'REPLAY_DETECTED'
+    );
+  });
+
+  it('rotates the PQ ratchet session after 50 sent messages (F9)', async () => {
+    const bobBundle = (await ensureUserHybridKeyPair('bob'))!;
+    const aliceBundle = (await ensureUserHybridKeyPair('alice'))!;
+    const roomId = 'alice__bob';
+    const payloads: string[] = [];
+    for (let i = 0; i < 51; i++) {
+      payloads.push(
+        await encryptMessageText(`msg-${i}`, roomId, {
+          myUsername: 'alice',
+          peerUsername: 'bob',
+          peerPublicKey: bobBundle,
+        })
+      );
+    }
+    // قالب بار: e2ee:pq:v2:{step}:{kemCipher}:{iv}:{cipher}:{sig} — کپسول در بخش ۴ است
+    const capsule = (p: string) => p.split(':')[4];
+    assert.equal(capsule(payloads[0]), capsule(payloads[49]));
+    assert.notEqual(capsule(payloads[50]), capsule(payloads[49]));
+    // همه پیام‌ها هنوز رمزگشایی می‌شوند
+    for (let i = 0; i < 51; i++) {
+      const out = await decryptMessageText(payloads[i], roomId, {
+        myUsername: 'bob',
+        peerUsername: 'alice',
+        peerPublicKey: aliceBundle,
+        sender: 'alice',
+      });
+      assert.equal(out.text, `msg-${i}`);
+    }
+  });
+
+  it('requires an explicit manual passphrase for PBKDF2 and never uses a public default (F4)', async () => {
+    const roomId = 'alice__bob';
+    // بدون کلید مخاطب و بدون رمز دستی، رمزگذاری خطا می‌دهد
+    await assert.rejects(
+      () => encryptMessageText('hello', roomId, { myUsername: 'alice' }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'MISSING_KEYS'
+    );
+    // با رمز دستی صریح، رمزگذاری و رمزگشایی کار می‌کند
+    const payload = await encryptMessageText('secret-note', roomId, {
+      myUsername: 'alice',
+      customSecret: 'correct horse battery staple',
+    });
+    const out = await decryptMessageText(payload, roomId, {
+      myUsername: 'bob',
+      customSecret: 'correct horse battery staple',
+    });
+    assert.equal(out.text, 'secret-note');
+    assert.equal(out.mode, 'PBKDF2');
+  });
+
+  it('caches verified bundles for UI reads while forcing fresh verification when skipCache is true', async () => {
+    clearVerifiedBundleCache();
+    const aliceBundle = (await ensureUserHybridKeyPair('alice'))!;
+
+    const b1 = parsePeerKeyBundle(aliceBundle, 'alice');
+    assert.equal(b1.isMldsaVerified, true);
+    assert.equal(getVerifiedBundleCacheStats().hits, 0);
+
+    const b2 = parsePeerKeyBundle(aliceBundle, 'alice');
+    assert.equal(b2.isMldsaVerified, true);
+    assert.equal(getVerifiedBundleCacheStats().hits, 1);
+
+    // Session establishment path uses skipCache: true and must not increment cache hits
+    const b3 = parsePeerKeyBundleStrict(aliceBundle, 'alice', { skipCache: true });
+    assert.equal(b3.isMldsaVerified, true);
+    assert.equal(getVerifiedBundleCacheStats().hits, 1);
+  });
+
+  it('computes symmetric Safety Numbers, preserves VERIFIED on session rekey, and marks CHANGED on identity key rotation', async () => {
+    const aliceBundle = (await ensureUserHybridKeyPair('alice'))!;
+    const bobBundle = (await ensureUserHybridKeyPair('bob'))!;
+
+    const snAlice = computeSafetyNumberForContact('alice', bobBundle, 'bob');
+    const snBob = computeSafetyNumberForContact('bob', aliceBundle, 'alice');
+    assert.ok(snAlice && snBob);
+    assert.equal(snAlice.digits60, snBob.digits60);
+    assert.equal(snAlice.sha256Hex, snBob.sha256Hex);
+    assert.equal(snAlice.groups12.length, 12);
+
+    const verified = markContactVerified('alice', 'bob', bobBundle);
+    assert.equal(verified?.state, 'VERIFIED');
+
+    // Rekeying session ratchet must NOT change safety number or clear VERIFIED
+    rotateSessionRatchetOnly('alice', 'alice__bob');
+    clearRatchetSession('alice', 'alice__bob');
+    const afterRekey = observeContactPublicKey('alice', 'bob', bobBundle);
+    assert.equal(afterRekey.state, 'VERIFIED');
+
+    // Simulate Bob logging in on a second device (brand-new CSPRNG identity key)
+    resetAllCryptoStateForTests();
+    const bobNewBundle = (await ensureUserHybridKeyPair('bob'))!;
+    assert.notEqual(bobNewBundle, bobBundle);
+
+    const afterKeyChange = observeContactPublicKey('alice', 'bob', bobNewBundle);
+    assert.equal(afterKeyChange.state, 'CHANGED');
+    assert.equal(afterKeyChange.verifiedMldsaPubB64, null);
+    assert.equal(afterKeyChange.auditHistory.length, 1);
+  });
+
+  it('zeroizes sensitive Uint8Array buffers in place', () => {
+    const secret = new Uint8Array([1, 2, 3, 4, 255, 128, 64, 32]);
+    zeroizeBuffer(secret);
+    assert.deepEqual(Array.from(secret), [0, 0, 0, 0, 0, 0, 0, 0]);
+  });
+
+  it('hashes Bale fallback recovery codes with salted scrypt and enforces strict RecoveryRateLimiter bounds', async () => {
+    const code = generateRecoveryCode();
+    assert.match(code, /^[0-9A-F]{4}(-[0-9A-F]{4}){7}$/);
+
+    const hash1 = await hashRecoveryCode(code);
+    const hash2 = await hashRecoveryCode(code);
+    assert.ok(hash1.startsWith('scrypt$16384$8$1$'));
+    assert.notEqual(hash1, hash2, 'Salted scrypt hashes must differ for identical inputs');
+
+    assert.equal(await verifyRecoveryCode(code, hash1), true);
+    assert.equal(await verifyRecoveryCode(code.toLowerCase().replace(/-/g, ''), hash1), true);
+    assert.equal(await verifyRecoveryCode('0000-0000-0000-0000-0000-0000-0000-0000', hash1), false);
+    assert.equal(await verifyRecoveryCode('not-a-code', hash1), false);
+
+    const limiter = new RecoveryRateLimiter(5, 15 * 60 * 1000);
+    const t0 = 1_700_000_000_000;
+    for (let i = 0; i < 5; i++) {
+      const r = limiter.checkAndConsume('203.0.113.10', 'alice', t0 + i * 1000);
+      assert.equal(r.allowed, true);
+    }
+    // 6th attempt from same IP must be blocked
+    const blockedIp = limiter.checkAndConsume('203.0.113.10', 'bob', t0 + 6000);
+    assert.equal(blockedIp.allowed, false);
+    assert.ok(blockedIp.retryAfterSec > 0);
+
+    // 6th attempt targeting same username from a different IP must also be blocked
+    const blockedUser = limiter.checkAndConsume('198.51.100.22', 'alice', t0 + 7000);
+    assert.equal(blockedUser.allowed, false);
+    assert.ok(blockedUser.retryAfterSec > 0);
+
+    // After window passes, requests are allowed again
+    const afterWindow = limiter.checkAndConsume('203.0.113.10', 'alice', t0 + 16 * 60 * 1000);
+    assert.equal(afterWindow.allowed, true);
+  });
+
+  it('enforces strict Helmet CSP without unsafe-inline, unsafe-eval, or unpinned CDN assets', () => {
+    const serverSrc = fs.readFileSync(path.resolve(process.cwd(), 'server.ts'), 'utf8');
+    const adminHtml = fs.readFileSync(path.resolve(process.cwd(), 'public/admin.html'), 'utf8');
+
+    assert.match(serverSrc, /defaultSrc:\s*\["'self'"\]/);
+    assert.equal(serverSrc.includes('unsafe-inline'), false, 'CSP must not allow unsafe-inline');
+    assert.equal(serverSrc.includes('unsafe-eval'), false, 'CSP must not allow unsafe-eval');
+    assert.equal(serverSrc.includes('fonts.googleapis.com'), false, 'CSP must not allow unpinned Google Fonts CDN');
+    assert.equal(serverSrc.includes('fonts.gstatic.com'), false, 'CSP must not allow unpinned Google Fonts CDN');
+
+    assert.equal(adminHtml.includes('fonts.googleapis.com'), false, 'admin.html must not load unpinned Google Fonts CDN');
+    assert.equal(/<style[\s>]/i.test(adminHtml), false, 'admin.html must not contain inline <style> blocks');
+    assert.equal(/<script(?![^>]*\bsrc=)[^>]*>/i.test(adminHtml), false, 'admin.html must not contain inline <script> blocks');
   });
 });
