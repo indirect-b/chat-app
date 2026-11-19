@@ -591,6 +591,44 @@ export class PersistentFallbackDatabase {
   }
 }
 
+export const APP_TABLES: readonly string[] = [
+  'users',
+  'contacts',
+  'messages',
+  'groups',
+  'reports',
+  'settings',
+  'media_blobs',
+];
+
+/**
+ * SSL config for the Postgres pool. Production must verify the database
+ * server's certificate (rejectUnauthorized: true) — without it a
+ * man-in-the-middle could impersonate the database. Dev keeps SSL off.
+ */
+export function getPoolSslConfig(
+  nodeEnv: string | undefined
+): false | { rejectUnauthorized: boolean } {
+  return nodeEnv === 'production' ? { rejectUnauthorized: true } : false;
+}
+
+/** Idempotent: enabling RLS twice is a no-op. */
+export function buildRlsEnableSql(table: string): string {
+  return `ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`;
+}
+
+/**
+ * Idempotent policy (the DO block swallows duplicate_object on re-runs).
+ * Only the app role `chatapp` gets access; anon/authenticated have no
+ * policy and are therefore denied once RLS is enabled.
+ */
+export function buildAppPolicySql(table: string): string {
+  return `DO $$ BEGIN
+  CREATE POLICY app_all ON ${table} FOR ALL TO chatapp USING (true) WITH CHECK (true);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;`;
+}
+
 const rawDbUrl = process.env.DATABASE_URL || '';
 const isPlaceholderUrl = !rawDbUrl || rawDbUrl.includes('user:password@host:5432');
 
@@ -602,7 +640,7 @@ if (!isPlaceholderUrl) {
   try {
     pgPool = new Pool({
       connectionString: rawDbUrl,
-      ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+      ssl: getPoolSslConfig(process.env.NODE_ENV),
       max: 10,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 2000,
@@ -630,12 +668,19 @@ export const pool = {
   },
 };
 
-export async function init(): Promise<void> {
-  if (!useFallback && pgPool) {
+export async function init(poolOverride?: Pool): Promise<void> {
+  const poolToUse = poolOverride ?? pgPool;
+  if (poolToUse && (poolOverride || !useFallback)) {
     try {
-      const client = await pgPool.connect();
+      const client = await poolToUse.connect();
       try {
-        await client.query(`
+        // DDL is best-effort: tables are created by migration, and a
+        // least-privilege role (chatapp) is not the table owner, so
+        // CREATE / ALTER may throw for permission reasons. That must
+        // never trigger the silent JSON fallback while the tables
+        // themselves are fine.
+        try {
+          await client.query(`
           CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
             bale_chat_id TEXT,
@@ -707,7 +752,50 @@ export async function init(): Promise<void> {
             data_base64 TEXT,
             created_at TEXT
           );
-        `);
+          `);
+        } catch (e: any) {
+          console.warn(
+            '⚠️ به‌روزرسانی اسکیمای دیتابیس انجام نشد (جدول‌ها ممکن است از قبل موجود باشند):',
+            e.message
+          );
+        }
+
+        // Row Level Security: enabled on all app tables so PostgREST anon
+        // access is denied by default on Supabase. The table owner
+        // (Render/Supabase postgres) bypasses RLS, so enabling it is
+        // harmless where the app still connects as the owner.
+        for (const t of APP_TABLES) {
+          try {
+            await client.query(buildRlsEnableSql(t));
+          } catch (e: any) {
+            console.warn(
+              `⚠️ فعال‌سازی RLS برای جدول ${t} انجام نشد:`,
+              e.message
+            );
+          }
+        }
+
+        // Policies allow only the app role `chatapp`. That role does not
+        // exist on the current Render database, so a failure here must
+        // never break startup or trigger the JSON fallback.
+        for (const t of APP_TABLES) {
+          try {
+            await client.query(buildAppPolicySql(t));
+          } catch (e: any) {
+            console.warn(
+              `⚠️ RLS policy for table ${t} skipped (app role chatapp may not exist yet):`,
+              e.message
+            );
+          }
+        }
+
+        // Probe: the database is only usable if the app tables are
+        // readable. A DDL permission error above does not matter if this
+        // passes; if it fails, the DB is genuinely unusable and we fall
+        // back (outer catch).
+        for (const t of APP_TABLES) {
+          await client.query(`SELECT 1 FROM ${t} LIMIT 1`);
+        }
 
         const defaults: [string, string][] = [
           ['server_mode', 'normal'],
