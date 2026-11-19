@@ -1,5 +1,27 @@
 import React, { useState, useEffect, useRef } from 'react';
 
+// Google Identity Services (loaded dynamically from accounts.google.com;
+// the button is hidden entirely when there is no Client ID or the
+// script fails to load). Minimal typing for the GIS button API only.
+declare global {
+  interface Window {
+    google?: {
+      accounts: {
+        id: {
+          initialize: (options: {
+            client_id: string;
+            callback: (response: { credential: string }) => void;
+          }) => void;
+          renderButton: (
+            parent: HTMLElement,
+            options: { theme?: string; size?: string; width?: number; text?: string }
+          ) => void;
+        };
+      };
+    };
+  }
+}
+
 interface AuthScreenProps {
   onAuthenticated: (username: string) => void;
 }
@@ -61,6 +83,73 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   const [email, setEmail] = useState('');
   const [verifiedEmail, setVerifiedEmail] = useState('');
   const [emailError, setEmailError] = useState('');
+
+  // Google Sign-In (primary login). The button renders only when the
+  // server reports a Client ID AND the GIS script loaded successfully.
+  const [googleClientId, setGoogleClientId] = useState<string | null>(null);
+  const [googleReady, setGoogleReady] = useState(false);
+  const googleBtnRef = useRef<HTMLDivElement | null>(null);
+  const googleRenderedRef = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/config')
+      .then(r => r.json())
+      .then(cfg => {
+        if (
+          !cancelled &&
+          cfg &&
+          typeof cfg.googleClientId === 'string' &&
+          cfg.googleClientId
+        ) {
+          setGoogleClientId(cfg.googleClientId);
+        }
+      })
+      .catch(() => {
+        // Config unreachable: the Google button stays hidden.
+      });
+    const GIS_SRC = 'https://accounts.google.com/gsi/client';
+    if (document.querySelector(`script[src="${GIS_SRC}"]`)) {
+      setGoogleReady(true);
+      return () => {
+        cancelled = true;
+      };
+    }
+    const script = document.createElement('script');
+    script.src = GIS_SRC;
+    script.async = true;
+    script.defer = true;
+    script.onload = () => {
+      if (!cancelled) setGoogleReady(true);
+    };
+    script.onerror = () => {
+      // GIS failed to load: the Google button stays hidden.
+    };
+    document.head.appendChild(script);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!googleClientId || !googleReady || googleRenderedRef.current) return;
+    const g = window.google;
+    const el = googleBtnRef.current;
+    if (!g || !el) return;
+    g.accounts.id.initialize({
+      client_id: googleClientId,
+      callback: (response: { credential: string }) => {
+        void handleGoogleLogin(response.credential);
+      },
+    });
+    g.accounts.id.renderButton(el, {
+      theme: 'outline',
+      size: 'large',
+      width: 320,
+      text: 'signin_with',
+    });
+    googleRenderedRef.current = true;
+  }, [googleClientId, googleReady]);
 
   const isValidEmailFormat = (value: string): boolean =>
     /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(value.trim().toLowerCase());
@@ -224,6 +313,47 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
     }
   };
 
+  const handleGoogleLogin = async (idToken: string) => {
+    try {
+      const res = await fetch('/api/google-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken }),
+      }).then(r => r.json());
+
+      if (!res.ok) {
+        const errText = res.msg || 'ورود با گوگل ناموفق بود. لطفاً دوباره تلاش کنید.';
+        setMsg({ text: errText, isOk: false });
+        return;
+      }
+
+      if (res.sessionToken) {
+        try {
+          localStorage.setItem('chat_session_token', res.sessionToken);
+        } catch {
+          // ignore
+        }
+      }
+
+      // New Google users get a one-time recovery code, shown exactly
+      // like the Bale/email registration flow (step 4).
+      if (res.isNew && res.recoveryCode) {
+        setIssuedRecoveryCode(res.recoveryCode);
+        setPendingAuthUsername(res.username);
+        setRecoverySavedChecked(false);
+        setRecoveryCopied(false);
+        setRecoveryHeading('کد بازیابی یک‌بارمصرف شما');
+        setMsg({ text: '', isOk: false });
+        setStep(4);
+      } else {
+        setMsg({ text: '✅ خوش آمدی!', isOk: true });
+        setTimeout(() => onAuthenticated(res.username), 400);
+      }
+    } catch {
+      setMsg({ text: 'ارتباط با سرور برقرار نشد. لطفاً دوباره تلاش کنید.', isOk: false });
+    }
+  };
+
   const handleRegister = async () => {
     const registerBody =
       authMethod === 'email' ? { email: verifiedEmail } : { baleId: verifiedBaleId };
@@ -357,6 +487,19 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                     : 'ورود با آیدی بله • مجهز به رمزنگاری E2EE'}
                 </p>
               </div>
+              {googleClientId && googleReady && (
+                <>
+                  <div
+                    ref={googleBtnRef}
+                    style={{ display: 'flex', justifyContent: 'center', marginBottom: '12px' }}
+                  />
+                  <div className="test-login-divider" role="separator" aria-label="یا">
+                    <span className="divider-line" aria-hidden="true" />
+                    <span className="divider-text">یا</span>
+                    <span className="divider-line" aria-hidden="true" />
+                  </div>
+                </>
+              )}
               <div
                 className="auth-method-toggle"
                 role="tablist"
@@ -864,6 +1007,12 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
           <nav aria-label="پیوندهای پاصفحه" className="auth-footer-nav">
             <a href="/terms" className="link-btn">
               قوانین پیام‌رسان
+            </a>
+            <span className="footer-sep" role="separator" aria-hidden="true">
+              |
+            </span>
+            <a href="/privacy" className="link-btn">
+              حریم خصوصی
             </a>
           </nav>
           <span className="footer-sep" role="separator" aria-hidden="true">
