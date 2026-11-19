@@ -37,7 +37,7 @@ import {
 } from './src/server/google';
 import { PRIVACY_HTML } from './src/server/privacy';
 
-const APP_VERSION = '6.3.0';
+const APP_VERSION = '6.4.0';
 const recoverRateLimiter = new RecoveryRateLimiter(5, 15 * 60 * 1000);
 
 // کلید سرور برای پروتکل احراز هویت کور Ristretto255-VOPRF (RFC 9497)

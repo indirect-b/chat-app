@@ -2,7 +2,15 @@
 
 ---
 
-## v6.3.0 (Latest) — Media end-to-end encryption: files encrypted with the room key, members-only media links
+## v6.4.0 (Latest) — Google-only login: Bale and email login removed, redirect-mode Google Sign-In, styled privacy page
+- Login is now Google-only: the Bale and email OTP flows and /api/register are removed. The recovery-code login stays as the fallback for anyone who loses Google access.
+- Google Sign-In now uses redirect mode instead of a popup: the whole page goes to Google and comes back, which fixes the blank page mobile users hit after picking an account. The redirect URIs are registered in the Cloud Console.
+- The /privacy page has a proper UI now: dark, RTL, Persian first, matching the app; still no scripts and no external resources (page-specific CSP).
+- Account deletion is now confirmed with the one-time recovery code instead of a Bale OTP — this also fixes deletion for Google users, for whom Bale OTP delivery was impossible.
+- 112/112 tests pass.
+- Known limits: Bale users who did not save a recovery code are locked out — there is no self-service recovery for them. The Bale bot no longer answers /start (login is gone); it still powers health checks and admin notifications.
+
+## v6.3.0 — Media end-to-end encryption: files encrypted with the room key, members-only media links
 - Files (photos, voice, video) are now encrypted with the room key before upload (PQF1 + AES-256-GCM); the server only ever stores ciphertext. The message ratchet is untouched — the file key comes from stable per-room material.
 - Media links open only for logged-in members of that chat: /api/media requires a session token and room membership; the public /uploads route is gone; deleted messages' media is denied; orphan media is denied. Avatars stay visible to logged-in users (public profile pictures by design, never anonymous).
 - Old media: access-controlled through its message's room, but NOT encrypted — the server never had the key, so it cannot retro-encrypt. Re-upload a file to encrypt it.
