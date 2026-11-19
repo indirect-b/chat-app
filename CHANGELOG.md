@@ -2,7 +2,14 @@
 
 ---
 
-## v6.4.0 (Latest) — Google-only login: Bale and email login removed, redirect-mode Google Sign-In, styled privacy page
+## v6.5.0 (Latest) — Google profile sync: display name + photo from the Google profile
+- The name and photo from the Google profile now become the user's chat profile at sign-in. Existing users get updated on their next Google login.
+- If the user edits their display name or photo in the profile settings, their own choice wins — Google sign-in will not overwrite it afterwards.
+- The Google photo loads from lh3.googleusercontent.com (the only new image host allowed); other external avatar URLs are not loaded.
+- 142/142 tests pass.
+- Known limits: Google sign-in itself was not verified live over HTTP (it needs a real Google token); profile refresh happens on the next login only, so a user who never logs in again keeps their old profile.
+
+## v6.4.0 — Google-only login: Bale and email login removed, redirect-mode Google Sign-In, styled privacy page
 - Login is now Google-only: the Bale and email OTP flows and /api/register are removed. The recovery-code login stays as the fallback for anyone who loses Google access.
 - Google Sign-In now uses redirect mode instead of a popup: the whole page goes to Google and comes back, which fixes the blank page mobile users hit after picking an account. The redirect URIs are registered in the Cloud Console.
 - The /privacy page has a proper UI now: dark, RTL, Persian first, matching the app; still no scripts and no external resources (page-specific CSP).
