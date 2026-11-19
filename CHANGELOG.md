@@ -2,7 +2,15 @@
 
 ---
 
-## v6.1.0 (Latest) — Hardening round 2
+## v6.2.0 (Latest) — Login without Bale: email + Google Sign-In, privacy page, database hardening
+- Email signup: one-time code by email (Gmail SMTP, env-gated), same one-time recovery code at registration. Bale stays as the other path.
+- Google Sign-In (primary): the server verifies the Google ID token; a new account is created atomically from the verified email. No client secret anywhere.
+- Security fix: /api/register now requires a verified one-time code first — before, anyone could register any Bale ID or email without proving ownership and receive its recovery code.
+- Privacy page: public /privacy (Persian + English), linked from the login screen.
+- Database hardening: production SSL now verifies the database certificate; RLS enabled on all 7 tables with app-only policies; a least-privilege chatapp role (supabase/hardening.sql); startup tolerates DDL permission errors and probes table readability before falling back to local storage. 76/76 tests pass.
+- Known limits: media files (images, voice, video) are stored unencrypted — only message text is end-to-end encrypted; email OTP stays dormant until its env vars are set; Google Sign-In is in Testing mode (owner only) until the OAuth app is published to Production.
+
+## v6.1.0 — Hardening round 2
 - Keys moved from localStorage to IndexedDB (v4 keystore); ECDH P-256 is non-extractable. ML-KEM/ML-DSA keys are stored AES-GCM-wrapped — WebCrypto has no native key objects for them yet.
 - Strict CSP: no `unsafe-inline`, no unpinned CDN. Admin/error pages self-hosted.
 - NIST KAT vectors (ML-KEM-768, ML-DSA-65), fuzz tests (490+ inputs, fail closed), benchmarks. 31/31 tests pass.

@@ -41,7 +41,7 @@ import {
 } from './src/server/google';
 import { PRIVACY_HTML } from './src/server/privacy';
 
-const APP_VERSION = '6.1.0';
+const APP_VERSION = '6.2.0';
 const recoverRateLimiter = new RecoveryRateLimiter(5, 15 * 60 * 1000);
 // Email OTP requests: 5 per hour, per email address and per IP (same sliding-window style as /api/recover).
 const emailOtpRateLimiter = new RecoveryRateLimiter(

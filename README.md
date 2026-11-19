@@ -9,7 +9,7 @@ Every message is protected by **PQ-MPRBA** — an original browser-native protoc
 and **ML-DSA-65 (FIPS 204)** identity signatures.
 The server never sees plaintext, and never learns who is talking to whom.
 
-[![Version](https://img.shields.io/badge/version-6.1.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-6.2.0-blue)](CHANGELOG.md)
 [![React](https://img.shields.io/badge/React-19-61dafb?logo=react&logoColor=white)](https://react.dev)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
 [![Node.js](https://img.shields.io/badge/Node.js-Express-339933?logo=nodedotjs&logoColor=white)](https://expressjs.com)
@@ -225,6 +225,8 @@ data/database.json        # Auto-generated fallback database snapshot
 ## 📋 Version history
 
 Full details in [CHANGELOG.md](CHANGELOG.md).
+
+- **v6.2.0** — Login without Bale: email signup (OTP), Google Sign-In (server-verified), public privacy page, database hardening (verified SSL, RLS on all tables, least-privilege role)
 
 - **v6.1.0** — IndexedDB keystore (keys out of localStorage), strict CSP (no inline scripts, no CDN), NIST KAT + fuzz tests, Bale fallback recovery codes, SECURITY.md + threat model
 
