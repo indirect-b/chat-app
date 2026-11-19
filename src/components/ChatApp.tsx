@@ -116,18 +116,32 @@ async function fetchAvatarBlobUrl(src: string): Promise<{ url: string; mime: str
   return entry;
 }
 
-/** An avatar image fetched with the session token (never a raw src). */
+/** An avatar image fetched with the session token (never a raw src) —
+ * except Google profile photos, which are public https URLs on
+ * lh3.googleusercontent.com (allowed by the CSP img-src pin) and are
+ * rendered directly: fetching them with a Bearer token would send the
+ * session token to Google for no reason and needs CORS the host does
+ * not promise. Any OTHER http(s) avatar URL renders nothing — the
+ * session token must never be sent to an arbitrary host, and no
+ * third-party host may be loaded as a tracking pixel. */
 function AuthImg(props: {
   src: string | null | undefined;
   alt?: string;
   className?: string;
   style?: React.CSSProperties;
 }) {
+  const isGooglePhoto =
+    typeof props.src === 'string' &&
+    props.src.startsWith('https://lh3.googleusercontent.com/');
+  const isOtherExternal =
+    typeof props.src === 'string' &&
+    (props.src.startsWith('https://') || props.src.startsWith('http://')) &&
+    !isGooglePhoto;
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
     setObjectUrl(null);
-    if (!props.src) return;
+    if (!props.src || isGooglePhoto || isOtherExternal) return;
     fetchAvatarBlobUrl(props.src)
       .then(entry => {
         if (!cancelled) setObjectUrl(entry.url);
@@ -140,6 +154,10 @@ function AuthImg(props: {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.src]);
+  if (isGooglePhoto) {
+    return <img src={props.src} alt={props.alt || ''} className={props.className} style={props.style} />;
+  }
+  if (isOtherExternal) return null;
   if (!objectUrl) return null;
   return <img src={objectUrl} alt={props.alt || ''} className={props.className} style={props.style} />;
 }
@@ -216,6 +234,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
 }) => {
   const [myProfile, setMyProfile] = useState<UserProfile>({
     username: myUsername,
+    display_name: null,
     avatar: null,
     bio: '',
     status: 'online',
@@ -288,6 +307,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
 
   const [profileModalOpen, setProfileModalOpen] = useState(false);
   const [bioInput, setBioInput] = useState('');
+  const [nameInput, setNameInput] = useState('');
   const [statusInput, setStatusInput] = useState('online');
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
 
@@ -706,7 +726,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
           setRooms(
             res.contacts.map((c: any) => ({
               id: c.username,
-              name: c.username,
+              name: c.display_name || c.username,
               isGroup: false,
               avatar: c.avatar,
               online: !!c.online,
@@ -777,6 +797,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       .then(res => {
         if (res.ok && res.user) {
           setMyProfile(res.user);
+          setNameInput(res.user.display_name || '');
           setBioInput(res.user.bio || '');
           setStatusInput(res.user.status || 'online');
           setAvatarPreview(res.user.avatar || null);
@@ -1505,6 +1526,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       },
       body: JSON.stringify({
         username: myUsername,
+        display_name: nameInput,
         bio: bioInput,
         status: statusInput,
         avatar: avatarPreview,
@@ -1512,6 +1534,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     });
     setMyProfile({
       username: myUsername,
+      display_name: nameInput.trim() || null,
       bio: bioInput,
       status: statusInput,
       avatar: avatarPreview,
@@ -1912,13 +1935,15 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 </div>
                 <div>
                   <div className="chat-header-name" id="chatName">
-                    {currentIsGroup ? currentPartnerName : `@${currentPartnerName}`}
+                    {currentPartnerName}
                   </div>
                   <div
                     className={`chat-header-status ${partnerOnline ? 'online' : ''}`}
                     id="chatStatus"
                   >
-                    {partnerStatusLabel}
+                    {!currentIsGroup && currentPartner && currentPartner !== currentPartnerName
+                      ? `@${currentPartner} · ${partnerStatusLabel}`
+                      : partnerStatusLabel}
                   </div>
                 </div>
               </div>
@@ -2414,7 +2439,9 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                         }}
                       >
                         {currentIsGroup && !isOut && (
-                          <div className="sender-name">{msg.sender}</div>
+                          <div className="sender-name">
+                            {groupMemberProfiles[msg.sender]?.display_name || msg.sender}
+                          </div>
                         )}
                         {msg.reply_to_text && (
                           <div className="reply-quote">
@@ -3007,6 +3034,15 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 📷 تغییر عکس پروفایل
               </div>
             </div>
+            <label style={{ fontSize: '13px', color: '#9ca3af' }}>نام نمایشی</label>
+            <input
+              type="text"
+              id="nameInput"
+              value={nameInput}
+              onChange={e => setNameInput(e.target.value)}
+              placeholder="نامی که بقیه می‌بینن (خالی = همون ایمیل)"
+              maxLength={100}
+            />
             <label style={{ fontSize: '13px', color: '#9ca3af' }}>بیوگرافی</label>
             <input
               type="text"
@@ -3079,10 +3115,12 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               )}
             </div>
             <div style={{ fontSize: '16px', fontWeight: 700, marginBottom: '4px' }}>
-              {currentIsGroup ? currentPartnerName : `@${currentPartnerName}`}
+              {currentPartnerName}
             </div>
             <div style={{ fontSize: '12px', color: '#9ca3af', marginBottom: '14px' }}>
-              {partnerStatusLabel}
+              {!currentIsGroup && currentPartner && currentPartner !== currentPartnerName
+                ? `@${currentPartner} · ${partnerStatusLabel}`
+                : partnerStatusLabel}
             </div>
             {!currentIsGroup && contactProfileModal.user?.bio && (
               <div
@@ -3332,6 +3370,8 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                     const rec = currentGroupVerificationSummary.memberRecords[member];
                     const state = rec?.state || 'UNVERIFIED';
                     const memberAvatar = groupMemberProfiles[member]?.avatar;
+                    const memberDisplay =
+                      groupMemberProfiles[member]?.display_name || member;
 
                     return (
                       <div
@@ -3382,7 +3422,13 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                           </div>
                           <div>
                             <div style={{ fontSize: '12.5px', fontWeight: 600, color: '#f3f4f6' }}>
-                              @{member} {isMe && <span style={{ color: '#9ca3af' }}>(شما)</span>}
+                              {memberDisplay}{' '}
+                              {memberDisplay !== member && (
+                                <span style={{ color: '#9ca3af', fontWeight: 400 }}>
+                                  @{member}
+                                </span>
+                              )}{' '}
+                              {isMe && <span style={{ color: '#9ca3af' }}>(شما)</span>}
                             </div>
                             {!isMe && (
                               <div
