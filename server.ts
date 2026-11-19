@@ -21,9 +21,33 @@ import {
   verifyRecoveryCode,
   RecoveryRateLimiter,
 } from './src/server/recovery';
+import {
+  validateEmail,
+  generateEmailOtp,
+  isEmailConfigured,
+  sendEmailOtp,
+  createEmailOtpRecord,
+  verifyEmailOtpAttempt,
+  EMAIL_OTP_MAX_REQUESTS_PER_HOUR,
+  EMAIL_OTP_REQUEST_WINDOW_MS,
+} from './src/server/email';
 
 const APP_VERSION = '6.1.0';
 const recoverRateLimiter = new RecoveryRateLimiter(5, 15 * 60 * 1000);
+// Email OTP requests: 5 per hour, per email address and per IP (same sliding-window style as /api/recover).
+const emailOtpRateLimiter = new RecoveryRateLimiter(
+  EMAIL_OTP_MAX_REQUESTS_PER_HOUR,
+  EMAIL_OTP_REQUEST_WINDOW_MS
+);
+const EMAIL_DISABLED_MSG = 'ورود با ایمیل فعلاً فعال نیست';
+
+function getClientIp(req: Request): string {
+  return (
+    (typeof req.ip === 'string' && req.ip) ||
+    req.socket?.remoteAddress ||
+    'unknown'
+  );
+}
 
 // کلید سرور برای پروتکل احراز هویت کور Ristretto255-VOPRF (RFC 9497)
 // (رفع F12، بازیابی‌شده از دور اول) بذر اختصاصی VOPRF_SEED (۳۲ بایت Base64) در اولویت است؛ در غیاب
@@ -362,9 +386,97 @@ app.post('/api/verify-otp', async (req: Request, res: Response) => {
   res.json({ ok: true, isNew: rows.length === 0, username: key, sessionToken });
 });
 
+// ===== EMAIL AUTH (alternative to Bale; env-gated) =====
+app.post('/api/request-email-otp', async (req: Request, res: Response) => {
+  if (!isEmailConfigured()) return res.json({ ok: false, msg: EMAIL_DISABLED_MSG });
+  const email = validateEmail((req.body || {}).email);
+  if (!email) return res.json({ ok: false, msg: 'ایمیل معتبر وارد کنید.' });
+
+  const limit = emailOtpRateLimiter.checkAndConsume(getClientIp(req), `email:${email}`);
+  if (!limit.allowed) {
+    res.setHeader('Retry-After', String(limit.retryAfterSec));
+    return res.status(429).json({
+      ok: false,
+      msg: 'تعداد درخواست کد بیش از حد مجاز است. لطفاً یک ساعت دیگر دوباره تلاش کنید.',
+    });
+  }
+
+  const code = generateEmailOtp();
+  otps[`email:${email}`] = createEmailOtpRecord(code);
+  try {
+    await sendEmailOtp(email, code);
+  } catch {
+    delete otps[`email:${email}`];
+    return res.status(503).json({
+      ok: false,
+      msg: 'ارسال ایمیل با خطا مواجه شد. لطفاً بعداً دوباره تلاش کنید.',
+    });
+  }
+  // Never reveal whether the email is registered: the request path does not check registration.
+  return res.json({ ok: true, msg: '✅ کد تأیید به ایمیل شما فرستاده شد' });
+});
+
+app.post('/api/verify-email-otp', async (req: Request, res: Response) => {
+  if (!isEmailConfigured()) return res.json({ ok: false, msg: EMAIL_DISABLED_MSG });
+  const email = validateEmail((req.body || {}).email);
+  const code = String((req.body || {}).code || '').trim();
+  if (!email || !/^\d{6}$/.test(code)) {
+    return res.json({ ok: false, msg: 'ایمیل یا کد تأیید نامعتبر است.' });
+  }
+  const key = `email:${email}`;
+  const outcome = verifyEmailOtpAttempt(otps[key], code);
+  if (outcome === 'missing') return res.json({ ok: false, msg: 'ابتدا کد درخواست کن' });
+  if (outcome === 'expired') {
+    delete otps[key];
+    return res.json({ ok: false, msg: 'کد منقضی شده' });
+  }
+  if (outcome === 'locked') {
+    delete otps[key];
+    return res.json({
+      ok: false,
+      msg: 'تعداد تلاش‌های ناموفق بیش از حد مجاز است. لطفاً کد جدید درخواست کن.',
+    });
+  }
+  if (outcome === 'wrong') return res.json({ ok: false, msg: 'کد اشتباه است' });
+  delete otps[key];
+
+  if (await isUserBlocked(email)) {
+    return res.status(403).json({ ok: false, msg: 'این حساب مسدود شده است.' });
+  }
+
+  const sessionToken = uuidv4();
+  userSessions[sessionToken] = {
+    username: email,
+    expire: Date.now() + 7 * 24 * 60 * 60 * 1000,
+  };
+
+  const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [email]);
+  res.json({ ok: true, isNew: rows.length === 0, username: email, sessionToken });
+});
+
 app.post('/api/register', async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
-  const { baleId } = req.body;
+  const { baleId, email: rawEmail } = req.body || {};
+
+  // --- Email registration (alternative to Bale) ---
+  if (rawEmail !== undefined && rawEmail !== null && String(rawEmail).trim() !== '') {
+    const email = validateEmail(rawEmail);
+    if (!email) return res.status(400).json({ ok: false, msg: 'ایمیل معتبر وارد کنید.' });
+    if (!isEmailConfigured()) return res.json({ ok: false, msg: EMAIL_DISABLED_MSG });
+    const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [email]);
+    if (rows.length) return res.json({ ok: false, msg: 'این حساب قبلاً ثبت‌نام کرده' });
+
+    // Same one-time recovery code as the Bale path (scrypt hash stored, code shown once).
+    const recoveryCode = generateRecoveryCode();
+    const recoveryCodeHash = await hashRecoveryCode(recoveryCode);
+    await pool.query(
+      'INSERT INTO users (username, bale_chat_id, joined_at, recovery_code_hash, email) VALUES ($1, $2, $3, $4, $5)',
+      [email, null, new Date().toISOString(), recoveryCodeHash, email]
+    );
+    return res.json({ ok: true, username: email, recoveryCode });
+  }
+
+  // --- Bale registration (unchanged) ---
   const key = String(baleId || '').toLowerCase().replace('@', '').trim();
   if (!key) return res.status(400).json({ ok: false, msg: 'آیدی بله نامعتبر است' });
   const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [key]);
