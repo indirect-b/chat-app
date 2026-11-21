@@ -637,6 +637,13 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     assert.match(badgeWithKey.badge, /Epoch #1/);
   });
 
+  it('L10: throws E2EEError instead of swallowing errors in ensureUserHybridKeyPair', async () => {
+    await assert.rejects(
+      () => ensureUserHybridKeyPair(''),
+      (err: unknown) => err instanceof E2EEError && err.code === 'MISSING_KEYS'
+    );
+  });
+
   it('enforces strict Helmet CSP without unsafe-inline, unsafe-eval, or unpinned CDN assets', () => {
     const serverSrc = fs.readFileSync(path.resolve(process.cwd(), 'server.ts'), 'utf8');
     const adminHtml = fs.readFileSync(path.resolve(process.cwd(), 'public/admin.html'), 'utf8');

@@ -299,9 +299,11 @@ async function withUnwrappedMLKEMSecretKey<T>(
  * - کلیدهای خصوصی ML-KEM-768 و ML-DSA-65 با CSPRNG تولید، با کلید غیرقابل‌استخراج پوشانده و در IndexedDB ذخیره می‌شوند.
  * - در صورت وجود کلیدهای قدیمی (v: 2 یا v: 3) در localStorage، به‌طور کامل حذف و کلید تازه تولید می‌شود.
  */
-export async function ensureUserHybridKeyPair(username: string): Promise<string | null> {
+export async function ensureUserHybridKeyPair(username: string): Promise<string> {
   const normUser = normalizeKeystoreUsername(username);
-  if (!normUser) return null;
+  if (!normUser) {
+    throw new E2EEError('MISSING_KEYS', 'Username cannot be empty');
+  }
 
   try {
     const webCrypto = getWebCrypto();
@@ -390,12 +392,16 @@ export async function ensureUserHybridKeyPair(username: string): Promise<string 
     };
 
     return JSON.stringify(bundle);
-  } catch {
-    return null;
+  } catch (err: unknown) {
+    if (err instanceof E2EEError) throw err;
+    throw new E2EEError(
+      'MISSING_KEYS',
+      `Failed to generate or load hybrid key pair: ${err instanceof Error ? err.message : String(err)}`
+    );
   }
 }
 
-export async function ensureUserECDHKeyPair(username: string): Promise<string | null> {
+export async function ensureUserECDHKeyPair(username: string): Promise<string> {
   return ensureUserHybridKeyPair(username);
 }
 
