@@ -29,6 +29,7 @@ import {
   base64ToBuf,
   bufToBase64,
   clearRatchetSession,
+  E2EEError,
   getMyMLDSAPublicKey,
   parsePeerKeyBundle,
   parsePeerKeyBundleStrict,
@@ -234,20 +235,28 @@ export function hexDigestTo60Digits(sha256Hex: string): {
   groups12: string[];
   formattedDisplay: string;
 } {
-  const cleanHex = sha256Hex.trim().toLowerCase();
-  const hashInt = BigInt('0x' + cleanHex);
-  const mod10Pow60 = 10n ** 60n;
-  const safetyInt = hashInt % mod10Pow60;
-  const digits60 = safetyInt.toString(10).padStart(60, '0');
-  const groups12: string[] = [];
-  for (let i = 0; i < 60; i += 5) {
-    groups12.push(digits60.slice(i, i + 5));
+  try {
+    if (typeof sha256Hex !== 'string') {
+      throw new TypeError('sha256Hex must be a string');
+    }
+    const cleanHex = sha256Hex.trim().toLowerCase();
+    const hashInt = BigInt('0x' + cleanHex);
+    const mod10Pow60 = 10n ** 60n;
+    const safetyInt = hashInt % mod10Pow60;
+    const digits60 = safetyInt.toString(10).padStart(60, '0');
+    const groups12: string[] = [];
+    for (let i = 0; i < 60; i += 5) {
+      groups12.push(digits60.slice(i, i + 5));
+    }
+    return {
+      digits60,
+      groups12,
+      formattedDisplay: groups12.join(' '),
+    };
+  } catch (err: any) {
+    if (err instanceof E2EEError) throw err;
+    throw new E2EEError('MALFORMED_PAYLOAD', `Failed to convert hex digest to 60 digits: ${err?.message || err}`);
   }
-  return {
-    digits60,
-    groups12,
-    formattedDisplay: groups12.join(' '),
-  };
 }
 
 /**
@@ -259,50 +268,58 @@ export function computeSafetyNumberFromRawKeys(
   myRawKey: Uint8Array,
   peerRawKey: Uint8Array
 ): Omit<SafetyNumberData, 'myMldsaPubB64' | 'peerMldsaPubB64'> {
-  const domainBytes = new TextEncoder().encode(SAFETY_PROTOCOL_ID);
-  const cmp = compareRawBytesLexicographically(myRawKey, peerRawKey);
-  const firstKey = cmp <= 0 ? myRawKey : peerRawKey;
-  const secondKey = cmp <= 0 ? peerRawKey : myRawKey;
+  try {
+    if (!(myRawKey instanceof Uint8Array) || !(peerRawKey instanceof Uint8Array)) {
+      throw new TypeError('Raw keys must be Uint8Array instances');
+    }
+    const domainBytes = new TextEncoder().encode(SAFETY_PROTOCOL_ID);
+    const cmp = compareRawBytesLexicographically(myRawKey, peerRawKey);
+    const firstKey = cmp <= 0 ? myRawKey : peerRawKey;
+    const secondKey = cmp <= 0 ? peerRawKey : myRawKey;
 
-  const firstLenBE = encodeUint32BE(firstKey.byteLength);
-  const secondLenBE = encodeUint32BE(secondKey.byteLength);
+    const firstLenBE = encodeUint32BE(firstKey.byteLength);
+    const secondLenBE = encodeUint32BE(secondKey.byteLength);
 
-  // "PQ-MPRBA-SAFETY-v1" + 0x00 + len(firstKey) + firstKey + len(secondKey) + secondKey
-  const totalLen =
-    domainBytes.byteLength +
-    1 +
-    4 +
-    firstKey.byteLength +
-    4 +
-    secondKey.byteLength;
+    // "PQ-MPRBA-SAFETY-v1" + 0x00 + len(firstKey) + firstKey + len(secondKey) + secondKey
+    const totalLen =
+      domainBytes.byteLength +
+      1 +
+      4 +
+      firstKey.byteLength +
+      4 +
+      secondKey.byteLength;
 
-  const preimage = new Uint8Array(totalLen);
-  let offset = 0;
-  preimage.set(domainBytes, offset);
-  offset += domainBytes.byteLength;
-  preimage[offset] = 0x00;
-  offset += 1;
-  preimage.set(firstLenBE, offset);
-  offset += 4;
-  preimage.set(firstKey, offset);
-  offset += firstKey.byteLength;
-  preimage.set(secondLenBE, offset);
-  offset += 4;
-  preimage.set(secondKey, offset);
+    const preimage = new Uint8Array(totalLen);
+    let offset = 0;
+    preimage.set(domainBytes, offset);
+    offset += domainBytes.byteLength;
+    preimage[offset] = 0x00;
+    offset += 1;
+    preimage.set(firstLenBE, offset);
+    offset += 4;
+    preimage.set(firstKey, offset);
+    offset += firstKey.byteLength;
+    preimage.set(secondLenBE, offset);
+    offset += 4;
+    preimage.set(secondKey, offset);
 
-  const digest = sha256(preimage);
-  const sha256Hex = bytesToLowerHex(digest);
-  const { digits60, groups12, formattedDisplay } = hexDigestTo60Digits(sha256Hex);
+    const digest = sha256(preimage);
+    const sha256Hex = bytesToLowerHex(digest);
+    const { digits60, groups12, formattedDisplay } = hexDigestTo60Digits(sha256Hex);
 
-  return {
-    digits60,
-    groups12,
-    formattedDisplay,
-    sha256Hex,
-    qrPayload: `${SAFETY_QR_PREFIX}${sha256Hex}`,
-    myKeyFingerprint: computeKeyFingerprintHex(myRawKey),
-    peerKeyFingerprint: computeKeyFingerprintHex(peerRawKey),
-  };
+    return {
+      digits60,
+      groups12,
+      formattedDisplay,
+      sha256Hex,
+      qrPayload: `${SAFETY_QR_PREFIX}${sha256Hex}`,
+      myKeyFingerprint: computeKeyFingerprintHex(myRawKey),
+      peerKeyFingerprint: computeKeyFingerprintHex(peerRawKey),
+    };
+  } catch (err: any) {
+    if (err instanceof E2EEError) throw err;
+    throw new E2EEError('MALFORMED_PAYLOAD', `Failed to compute safety number from raw keys: ${err?.message || err}`);
+  }
 }
 
 /**
@@ -392,49 +409,57 @@ export function parseAndCompareQrPayload(
   scannedRaw: string,
   expectedSha256Hex: string
 ): QrComparisonResult {
-  const trimmed = (scannedRaw || '').trim();
-  if (!trimmed) {
-    return {
-      status: 'PARSE_ERROR',
-      errorReason: 'کد QR خالی یا غیرقابل خواندن است.',
-    };
-  }
+  try {
+    if (typeof scannedRaw !== 'string') {
+      throw new TypeError('scannedRaw must be a string');
+    }
+    const trimmed = (scannedRaw || '').trim();
+    if (!trimmed) {
+      return {
+        status: 'PARSE_ERROR',
+        errorReason: 'کد QR خالی یا غیرقابل خواندن است.',
+      };
+    }
 
-  if (!trimmed.startsWith(SAFETY_QR_PREFIX)) {
-    return {
-      status: 'PARSE_ERROR',
-      errorReason: 'پیشوند کد اسکن‌شده با استاندارد PQ-MPRBA-SAFETY-v1 مطابقت ندارد.',
-    };
-  }
+    if (!trimmed.startsWith(SAFETY_QR_PREFIX)) {
+      return {
+        status: 'PARSE_ERROR',
+        errorReason: 'پیشوند کد اسکن‌شده با استاندارد PQ-MPRBA-SAFETY-v1 مطابقت ندارد.',
+      };
+    }
 
-  const hexPart = trimmed.slice(SAFETY_QR_PREFIX.length);
-  if (!/^[0-9a-f]{64}$/.test(hexPart)) {
-    return {
-      status: 'PARSE_ERROR',
-      errorReason: 'ساختار هش ۶۴ کاراکتری (SHA-256 lowercase hex) در کد QR نامعتبر است.',
-    };
-  }
+    const hexPart = trimmed.slice(SAFETY_QR_PREFIX.length);
+    if (!/^[0-9a-f]{64}$/.test(hexPart)) {
+      return {
+        status: 'PARSE_ERROR',
+        errorReason: 'ساختار هش ۶۴ کاراکتری (SHA-256 lowercase hex) در کد QR نامعتبر است.',
+      };
+    }
 
-  const { digits60, groups12, formattedDisplay } = hexDigestTo60Digits(hexPart);
-  const expectedClean = expectedSha256Hex.trim().toLowerCase();
+    const { digits60, groups12, formattedDisplay } = hexDigestTo60Digits(hexPart);
+    const expectedClean = expectedSha256Hex ? expectedSha256Hex.trim().toLowerCase() : '';
 
-  if (hexPart === expectedClean) {
+    if (hexPart === expectedClean) {
+      return {
+        status: 'MATCH',
+        scannedHex: hexPart,
+        scannedDigits60: digits60,
+        scannedGroups12: groups12,
+        scannedFormatted: formattedDisplay,
+      };
+    }
+
     return {
-      status: 'MATCH',
+      status: 'MISMATCH',
       scannedHex: hexPart,
       scannedDigits60: digits60,
       scannedGroups12: groups12,
       scannedFormatted: formattedDisplay,
     };
+  } catch (err: any) {
+    if (err instanceof E2EEError) throw err;
+    throw new E2EEError('MALFORMED_PAYLOAD', `Failed to parse QR payload: ${err?.message || err}`);
   }
-
-  return {
-    status: 'MISMATCH',
-    scannedHex: hexPart,
-    scannedDigits60: digits60,
-    scannedGroups12: groups12,
-    scannedFormatted: formattedDisplay,
-  };
 }
 
 // ============================================================================

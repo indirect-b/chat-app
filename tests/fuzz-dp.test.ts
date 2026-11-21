@@ -569,15 +569,15 @@ describe('DP deepening-1 — coverage-guided fuzzing (setup)', () => {
     );
   });
 
-  // -- DP-3 REGRESSION: safety-number helpers throw raw JS errors on malformed input --
-  it('DP-3 REGRESSION: hexDigestTo60Digits / computeSafetyNumberFromRawKeys throw raw SyntaxError/TypeError (not E2EEError) on malformed input', () => {
-    assert.throws(() => SN.hexDigestTo60Digits('zz'.repeat(32)), SyntaxError);
-    assert.throws(() => SN.hexDigestTo60Digits(''), SyntaxError);
-    assert.throws(() => SN.hexDigestTo60Digits(12345 as unknown as string), TypeError);
-    assert.throws(() => SN.hexDigestTo60Digits(null as unknown as string), TypeError);
-    assert.throws(() => SN.computeSafetyNumberFromRawKeys(null as unknown as Uint8Array, new Uint8Array(32)), TypeError);
-    // Non-string QR input also throws a raw TypeError (guarded in the app by string-typed callers).
-    assert.throws(() => SN.parseAndCompareQrPayload(12345 as unknown as string, 'ab'.repeat(32)), TypeError);
+  // -- DP-3 REGRESSION (fixed by DP-14): safety-number helpers wrap malformed input in E2EEError --
+  it('DP-3 REGRESSION: hexDigestTo60Digits / computeSafetyNumberFromRawKeys throw E2EEError on malformed input', () => {
+    assert.throws(() => SN.hexDigestTo60Digits('zz'.repeat(32)), (err: any) => err instanceof C.E2EEError && err.code === 'MALFORMED_PAYLOAD');
+    assert.throws(() => SN.hexDigestTo60Digits(''), (err: any) => err instanceof C.E2EEError && err.code === 'MALFORMED_PAYLOAD');
+    assert.throws(() => SN.hexDigestTo60Digits(12345 as unknown as string), (err: any) => err instanceof C.E2EEError && err.code === 'MALFORMED_PAYLOAD');
+    assert.throws(() => SN.hexDigestTo60Digits(null as unknown as string), (err: any) => err instanceof C.E2EEError && err.code === 'MALFORMED_PAYLOAD');
+    assert.throws(() => SN.computeSafetyNumberFromRawKeys(null as unknown as Uint8Array, new Uint8Array(32)), (err: any) => err instanceof C.E2EEError && err.code === 'MALFORMED_PAYLOAD');
+    // Non-string QR input also throws E2EEError
+    assert.throws(() => SN.parseAndCompareQrPayload(12345 as unknown as string, 'ab'.repeat(32)), (err: any) => err instanceof C.E2EEError && err.code === 'MALFORMED_PAYLOAD');
     // Sanity: well-formed inputs still behave.
     const good = SN.hexDigestTo60Digits('ab'.repeat(32));
     assert.equal(good.digits60.length, 60);
