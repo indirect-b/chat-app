@@ -16,7 +16,6 @@ import {
   FileEncryptionOptions,
   E2EEError,
   isE2EEEnabled,
-  setE2EEEnabled,
   getRoomSecret,
   setRoomSecret,
   isE2EEPayload,
@@ -260,8 +259,8 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   const [typingUser, setTypingUser] = useState<string | null>(null);
   const [disappearAfter, setDisappearAfter] = useState<number>(0);
 
-  // E2EE + Post-Quantum + VOPRF State
-  const [e2eeActive, setE2eeActive] = useState<boolean>(isE2EEEnabled());
+  // E2EE + Post-Quantum + VOPRF State (Mandatory E2EE - L11)
+  const e2eeActive = true;
   const [e2eeModalOpen, setE2eeModalOpen] = useState(false);
   const [customSecretInput, setCustomSecretInput] = useState('');
   const [voprfToken, setVoprfToken] = useState<VoprfBlindTokenRecord | null>(null);
@@ -1220,20 +1219,23 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     if (!trimmed || !currentRoom || !currentPartner) return;
 
     let payloadText = trimmed;
-    if (e2eeActive) {
-      try {
-        payloadText = await encryptMessageText(trimmed, currentRoom, {
-          myUsername,
-          peerPublicKey: getPeerKeyForRoom(currentRoom),
-          peerUsername: !currentIsGroup && currentPartner ? currentPartner : undefined,
-          groupMembers: currentIsGroup && currentPartner ? groupMembersRef.current[currentPartner] || [] : undefined,
-        });
-      } catch (err) {
-        // F5 Fail-Closed: abort send completely if encryption fails
-        const reason = err instanceof E2EEError ? err.code : 'ENCRYPTION_FAILED';
-        showToast(`⛔ خطا در رمزنگاری سرتاسری (${reason}) — ارسال پیام لغو شد`);
+    try {
+      const peerKey = getPeerKeyForRoom(currentRoom);
+      if (!currentIsGroup && !peerKey) {
+        showToast('⛔ کلید عمومی مخاطب هنوز دریافت نشده است — ارسال پیام لغو شد');
         return;
       }
+      payloadText = await encryptMessageText(trimmed, currentRoom, {
+        myUsername,
+        peerPublicKey: peerKey,
+        peerUsername: !currentIsGroup && currentPartner ? currentPartner : undefined,
+        groupMembers: currentIsGroup && currentPartner ? groupMembersRef.current[currentPartner] || [] : undefined,
+      });
+    } catch (err) {
+      // F5 Fail-Closed: abort send completely if encryption fails
+      const reason = err instanceof E2EEError ? err.code : 'ENCRYPTION_FAILED';
+      showToast(`⛔ خطا در رمزنگاری سرتاسری (${reason}) — ارسال پیام لغو شد`);
+      return;
     }
 
     socket.emit('send-message', {
@@ -1307,15 +1309,11 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     try {
       // Media E2EE: بایت‌های فایل پیش از آپلود با کلید پایدار اتاق رمز می‌شوند؛
       // در نبود کلید اتاق، فرآیند متوقف شده و هیچ فایلی آپلود نخواهد شد (Fail-Closed).
-      // اگر E2EE خاموش است، مثل پیام متنی، فایل خام فرستاده می‌شود.
-      let uploadFile: File = file;
-      if (e2eeActive) {
-        const rawBytes = new Uint8Array(await file.arrayBuffer());
-        const cipherBytes = await encryptFileBytes(rawBytes, currentRoom, getFileCryptoOptions());
-        uploadFile = new File([cipherBytes as unknown as BlobPart], file.name, {
-          type: file.type,
-        });
-      }
+      const rawBytes = new Uint8Array(await file.arrayBuffer());
+      const cipherBytes = await encryptFileBytes(rawBytes, currentRoom, getFileCryptoOptions());
+      const uploadFile = new File([cipherBytes as unknown as BlobPart], file.name, {
+        type: file.type,
+      });
       const sessionToken = getSessionToken();
       const fd = new FormData();
       fd.append('file', uploadFile);
@@ -1360,18 +1358,16 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
         try {
           // ویس هم مثل بقیه فایل‌ها پیش از آپلود با کلید اتاق رمز می‌شود.
-          let uploadBlob: Blob = blob;
-          if (e2eeActive && currentRoom) {
-            const rawBytes = new Uint8Array(await blob.arrayBuffer());
-            const cipherBytes = await encryptFileBytes(
-              rawBytes,
-              currentRoom,
-              getFileCryptoOptions()
-            );
-            uploadBlob = new Blob([cipherBytes as unknown as BlobPart], {
-              type: 'audio/webm',
-            });
-          }
+          if (!currentRoom) return;
+          const rawBytes = new Uint8Array(await blob.arrayBuffer());
+          const cipherBytes = await encryptFileBytes(
+            rawBytes,
+            currentRoom,
+            getFileCryptoOptions()
+          );
+          const uploadBlob = new Blob([cipherBytes as unknown as BlobPart], {
+            type: 'audio/webm',
+          });
           const sessionToken = getSessionToken();
           const fd = new FormData();
           fd.append('file', uploadBlob, 'voice.webm');
@@ -1579,17 +1575,6 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     setContactProfileModal({ open: true, user: res.ok ? res.user : null });
   };
 
-  const handleToggleE2EE = () => {
-    const next = !e2eeActive;
-    setE2eeActive(next);
-    setE2EEEnabled(next);
-    showToast(
-      next
-        ? '🔒 رمزنگاری سرتاسری (E2EE - AES-256) فعال شد'
-        : '🔓 رمزنگاری سرتاسری غیرفعال شد'
-    );
-  };
-
   const handleSaveRoomSecret = async () => {
     if (!currentRoom) return;
     setRoomSecret(currentRoom, customSecretInput);
@@ -1617,18 +1602,21 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     const trimmed = editModal.text.trim();
     if (!trimmed || !currentRoom) return;
     let payload = trimmed;
-    if (e2eeActive) {
-      try {
-        payload = await encryptMessageText(trimmed, currentRoom, {
-          myUsername,
-          peerPublicKey: getPeerKeyForRoom(currentRoom),
-          peerUsername: !currentIsGroup && currentPartner ? currentPartner : undefined,
-        });
-      } catch (err) {
-        const reason = err instanceof E2EEError ? err.code : 'ENCRYPTION_FAILED';
-        showToast(`⛔ خطا در رمزنگاری ویرایش (${reason}) — ویرایش لغو شد`);
+    try {
+      const peerKey = getPeerKeyForRoom(currentRoom);
+      if (!currentIsGroup && !peerKey) {
+        showToast('⛔ کلید عمومی مخاطب هنوز دریافت نشده است — ویرایش لغو شد');
         return;
       }
+      payload = await encryptMessageText(trimmed, currentRoom, {
+        myUsername,
+        peerPublicKey: peerKey,
+        peerUsername: !currentIsGroup && currentPartner ? currentPartner : undefined,
+      });
+    } catch (err) {
+      const reason = err instanceof E2EEError ? err.code : 'ENCRYPTION_FAILED';
+      showToast(`⛔ خطا در رمزنگاری ویرایش (${reason}) — ویرایش لغو شد`);
+      return;
     }
     socket.emit('edit-message', {
       msgId: ctxMenu.msgId,
@@ -2012,37 +2000,31 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 </button>
               )}
 
-              {/* E2EE Transport Controls (distinct from verification) */}
+              {/* E2EE Transport Status Badge (mandatory E2EE - opens encryption info) */}
               <button
                 type="button"
                 className="icon-btn"
-                onClick={handleToggleE2EE}
+                onClick={() => setE2eeModalOpen(true)}
                 title={
                   currentPQStatus
                     ? currentPQStatus.tooltip
-                    : e2eeActive
-                    ? 'رمزنگاری پساکوانتومی فعال است'
-                    : 'رمزنگاری سرتاسری غیرفعال است'
+                    : 'رمزنگاری پساکوانتومی اجباری (همیشه فعال)'
                 }
                 style={{
                   fontSize: '12px',
                   padding: '5px 10px',
                   borderRadius: '14px',
-                  background: !e2eeActive
-                    ? 'rgba(255,255,255,0.06)'
-                    : currentPQStatus?.isPQ
+                  background: currentPQStatus?.isPQ
                     ? 'rgba(124,58,237,0.18)'
                     : currentPQStatus?.reason === 'INVALID_MLDSA_SIGNATURE'
                     ? 'rgba(239,68,68,0.2)'
                     : 'rgba(234,179,8,0.18)',
-                  color: !e2eeActive
-                    ? '#9ca3af'
-                    : currentPQStatus?.isPQ
+                  color: currentPQStatus?.isPQ
                     ? '#c4b5fd'
                     : currentPQStatus?.reason === 'INVALID_MLDSA_SIGNATURE'
                     ? '#ef4444'
                     : '#facc15',
-                  border: currentPQStatus && !currentPQStatus.isPQ && e2eeActive
+                  border: currentPQStatus && !currentPQStatus.isPQ
                     ? currentPQStatus.reason === 'INVALID_MLDSA_SIGNATURE'
                       ? '1px solid rgba(239,68,68,0.45)'
                       : '1px solid rgba(234,179,8,0.4)'
@@ -2050,13 +2032,11 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                   gap: '4px',
                 }}
               >
-                {e2eeActive
-                  ? currentIsGroup
-                    ? getGroupSecurityBadge(currentRoom, currentGroupEpoch).badge
-                    : currentPQStatus?.isPQ
-                    ? '🔒 PQ-KEM'
-                    : currentPQStatus?.badge || '⚠️ غیر کوانتومی'
-                  : '🔓 ساده'}
+                {currentIsGroup
+                  ? getGroupSecurityBadge(currentRoom, currentGroupEpoch).badge
+                  : currentPQStatus?.isPQ
+                  ? '🔒 PQ-KEM'
+                  : currentPQStatus?.badge || '⚠️ غیر کوانتومی'}
               </button>
 
               <button
@@ -2299,7 +2279,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               )}
 
             {/* ANTI-DOWNGRADE WARNING BANNER */}
-            {currentPQStatus && !currentPQStatus.isPQ && e2eeActive && (
+            {currentPQStatus && !currentPQStatus.isPQ && (
               <div
                 className="pq-downgrade-warning-banner"
                 style={{
@@ -2426,9 +2406,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
             >
               {messages.length === 0 ? (
                 <div className="sys-msg">
-                  {e2eeActive
-                    ? '🔒 این گفتگو با رمزنگاری سرتاسری (AES-256-GCM) محافظت می‌شود'
-                    : 'شروع مکالمه'}
+                  🔒 این گفتگو با رمزنگاری سرتاسری (AES-256-GCM) محافظت می‌شود
                 </div>
               ) : (
                 messages.map(msg => {
@@ -2615,9 +2593,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               <input
                 type="text"
                 id="messageInput"
-                placeholder={
-                  e2eeActive ? 'پیام رمزنگاری‌شده (E2EE)...' : 'پیام...'
-                }
+                placeholder="پیام رمزنگاری‌شده (E2EE)..."
                 value={messageText}
                 onChange={e => handleTypingInput(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && handleSendMessage()}

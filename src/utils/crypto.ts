@@ -634,13 +634,13 @@ export function getGroupSecurityBadge(roomId: string, currentEpoch: number): { i
 export function getRoomPQStatus(options: {
   roomId: string;
   isGroup: boolean;
-  e2eeActive: boolean;
+  e2eeActive?: boolean;
   myUsername: string;
   peerPublicKey?: string | null;
   peerUsername?: string;
   customSecret?: string;
 }): RoomPQSecurityStatus {
-  if (!options.e2eeActive) {
+  if (options.e2eeActive === false) {
     return {
       isPQ: false,
       type: 'DISABLED',
@@ -2273,24 +2273,12 @@ export function setRoomSecret(roomId: string, secret: string): void {
 }
 
 export function isE2EEEnabled(): boolean {
-  const ls = getSafeLocalStorage();
-  if (!ls) return true;
-  try {
-    const val = ls.getItem(E2EE_ENABLED_STORAGE_KEY);
-    return val === null ? true : val === 'true';
-  } catch {
-    return true;
-  }
+  // L11: E2EE is permanently enabled and mandatory across the application
+  return true;
 }
 
-export function setE2EEEnabled(enabled: boolean): void {
-  const ls = getSafeLocalStorage();
-  if (!ls) return;
-  try {
-    ls.setItem(E2EE_ENABLED_STORAGE_KEY, String(enabled));
-  } catch {
-    // ignore
-  }
+export function setE2EEEnabled(_enabled: boolean): void {
+  // L11: Plaintext downgrade toggle is removed; E2EE cannot be disabled
 }
 
 // M15: آزمون سلامت خودکار پساکوانتومی هنگام لود ماژول (KAT Round-Trip Self-Test)
