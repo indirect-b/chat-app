@@ -4,6 +4,11 @@ import { config } from './config';
 const BASE = `${config.BALE_API}${config.BALE_BOT_TOKEN}`;
 const BALE_TIMEOUT_MS = 8000;
 
+// Security (M12): Disable redirects to prevent credential/token leaks cross-origin
+const baleClient = axios.create({
+  maxRedirects: 0,
+});
+
 export interface BaleUpdate {
   update_id: number;
   message?: {
@@ -73,7 +78,7 @@ export async function checkBaleHealth(): Promise<BaleHealthStatus> {
     return getBaleHealthStatus();
   }
   try {
-    const res = await axios.get(`${BASE}/getMe`, { timeout: 5000 });
+    const res = await baleClient.get(`${BASE}/getMe`, { timeout: 5000 });
     if (res.data && res.data.ok) {
       recordBaleSuccess();
     } else {
@@ -88,7 +93,7 @@ export async function checkBaleHealth(): Promise<BaleHealthStatus> {
 export async function sendMessage(chatId: string | number, text: string): Promise<boolean> {
   if (!config.BALE_BOT_TOKEN) return false;
   try {
-    await axios.post(`${BASE}/sendMessage`, { chat_id: chatId, text }, { timeout: BALE_TIMEOUT_MS });
+    await baleClient.post(`${BASE}/sendMessage`, { chat_id: chatId, text }, { timeout: BALE_TIMEOUT_MS });
     recordBaleSuccess();
     return true;
   } catch (e: unknown) {
@@ -104,7 +109,7 @@ export async function sendPhoto(
 ): Promise<boolean> {
   if (!config.BALE_BOT_TOKEN) return false;
   try {
-    await axios.post(
+    await baleClient.post(
       `${BASE}/sendPhoto`,
       { chat_id: chatId, photo: photoUrl, caption: caption || '' },
       { timeout: BALE_TIMEOUT_MS }
@@ -120,7 +125,7 @@ export async function sendPhoto(
 export async function getUpdates(offset: number): Promise<BaleUpdate[]> {
   if (!config.BALE_BOT_TOKEN) return [];
   try {
-    const res = await axios.get(`${BASE}/getUpdates`, {
+    const res = await baleClient.get(`${BASE}/getUpdates`, {
       params: { offset, timeout: 30 },
       timeout: 35000,
     });
