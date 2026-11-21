@@ -13,6 +13,7 @@ import {
   createGroupEpochPacket,
   decapsulateGroupEpochKey,
   decryptMessageText,
+  E2EE_GROUP_EPOCH_V3_PREFIX,
   encryptMessageText,
   ensureUserHybridKeyPair,
   getGroupSecurityBadge,
@@ -861,5 +862,67 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     const tamperedKeys = { ...packet.keys, bob: 'AAAA' };
     const tamperedKeysTarget = serializeEpochPacketForSigning(epoch, members, tamperedKeys);
     assert.equal(ml_dsa65.verify(sigBytes, tamperedKeysTarget, mldsaPub), false);
+  });
+
+  it('authenticates group message senders via e2ee:gep:v3 ML-DSA signatures and verifies sender identity (M3)', async () => {
+    const aliceBundleStr = (await ensureUserHybridKeyPair('alice'))!;
+    const bobBundleStr = (await ensureUserHybridKeyPair('bob'))!;
+
+    const aliceParsed = parsePeerKeyBundle(aliceBundleStr, 'alice');
+    const bobParsed = parsePeerKeyBundle(bobBundleStr, 'bob');
+
+    const members = ['alice', 'bob'];
+    const bundles = { alice: aliceParsed, bob: bobParsed };
+    const roomId = 'group__m3-team';
+
+    const packet = await createGroupEpochPacket(bundles, 'alice', 1);
+    await rotateGroupEpoch('m3-team', 1, members, packet.epochKeyB64);
+
+    // Sender alice sends group message with myUsername: 'alice' -> generates e2ee:gep:v3:
+    const v3Payload = await encryptMessageText('secret group broadcast', roomId, {
+      myUsername: 'alice',
+      groupMembers: members,
+    });
+
+    assert.ok(v3Payload.startsWith(E2EE_GROUP_EPOCH_V3_PREFIX));
+    assert.equal(v3Payload.slice(E2EE_GROUP_EPOCH_V3_PREFIX.length).split(':').length, 5);
+
+    // Recipient bob decrypts and verifies sender alice's ML-DSA signature
+    const dec = await decryptMessageText(v3Payload, roomId, {
+      myUsername: 'bob',
+      sender: 'alice',
+      peerPublicKey: aliceBundleStr,
+      groupMembers: members,
+    });
+
+    assert.equal(dec.text, 'secret group broadcast');
+    assert.equal(dec.mldsaVerified, true);
+
+    // Tampered signature causes decrypt to throw SIGNATURE_INVALID
+    const v3Parts = v3Payload.slice(E2EE_GROUP_EPOCH_V3_PREFIX.length).split(':');
+    const forgedSig = bufToBase64(new Uint8Array(3309).fill(0x55));
+    const forgedPayload = `${E2EE_GROUP_EPOCH_V3_PREFIX}${v3Parts[0]}:${v3Parts[1]}:${v3Parts[2]}:${v3Parts[3]}:${forgedSig}`;
+
+    await assert.rejects(
+      () =>
+        decryptMessageText(forgedPayload, roomId, {
+          myUsername: 'bob',
+          sender: 'alice',
+          peerPublicKey: aliceBundleStr,
+          groupMembers: members,
+        }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'INVALID_SIGNATURE'
+    );
+
+    // Legacy e2ee:gep:v2: fallback decrypts with mldsaVerified: false
+    const v2Payload = `e2ee:gep:v2:${v3Parts[0]}:${v3Parts[1]}:${v3Parts[2]}:${v3Parts[3]}`;
+    const decV2 = await decryptMessageText(v2Payload, roomId, {
+      myUsername: 'bob',
+      sender: 'alice',
+      peerPublicKey: aliceBundleStr,
+      groupMembers: members,
+    });
+    assert.equal(decV2.text, 'secret group broadcast');
+    assert.equal(decV2.mldsaVerified, false);
   });
 });

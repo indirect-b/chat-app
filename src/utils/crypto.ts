@@ -31,6 +31,7 @@ const E2EE_V1_PREFIX = 'e2ee:v1:';
 const E2EE_ECDH_PREFIX = 'e2ee:ecdh:';
 const E2EE_PQ_RATCHET_PREFIX = 'e2ee:pq:v2:';
 const E2EE_GROUP_EPOCH_PREFIX = 'e2ee:gep:v2:';
+export const E2EE_GROUP_EPOCH_V3_PREFIX = 'e2ee:gep:v3:';
 
 const ROOM_KEY_STORAGE_PREFIX = 'chat_e2ee_pass_';
 const E2EE_ENABLED_STORAGE_KEY = 'chat_e2ee_enabled';
@@ -259,6 +260,20 @@ export function serializeMessageForSigning(params: {
   cipherB64: string;
 }): Uint8Array {
   const data = `MLDSA-MSG-v2:${params.roomId}:${params.step}:${params.kemCipherB64}:${params.ivB64}:${params.cipherB64}`;
+  return new TextEncoder().encode(data);
+}
+
+/**
+ * سریال‌سازی پیام گروهی جهت امضای دیجیتال فرستنده با ML-DSA-65 (M3)
+ */
+export function serializeGroupMessageForSigning(params: {
+  roomId: string;
+  epoch: number;
+  membersHash: string;
+  ivB64: string;
+  cipherB64: string;
+}): Uint8Array {
+  const data = `MLDSA-GEP-MSG-v3:${params.roomId}:${params.epoch}:${params.membersHash}:${params.ivB64}:${params.cipherB64}`;
   return new TextEncoder().encode(data);
 }
 
@@ -1519,7 +1534,8 @@ export function isE2EEPayload(text: string | null | undefined): boolean {
     (text.startsWith(E2EE_V1_PREFIX) ||
       text.startsWith(E2EE_ECDH_PREFIX) ||
       text.startsWith(E2EE_PQ_RATCHET_PREFIX) ||
-      text.startsWith(E2EE_GROUP_EPOCH_PREFIX))
+      text.startsWith(E2EE_GROUP_EPOCH_PREFIX) ||
+      text.startsWith(E2EE_GROUP_EPOCH_V3_PREFIX))
   );
 }
 
@@ -1583,7 +1599,28 @@ export async function encryptMessageText(
           aesKey,
           encoded
         );
-        const payload = `${E2EE_GROUP_EPOCH_PREFIX}${fsm.currentEpoch}:${epochRec.membersHash}:${bufToBase64(iv)}:${bufToBase64(cipherBuffer)}`;
+        let payload: string;
+        if (options?.myUsername) {
+          try {
+            const ivB64 = bufToBase64(iv);
+            const cipherB64 = bufToBase64(cipherBuffer);
+            const signTarget = serializeGroupMessageForSigning({
+              roomId,
+              epoch: fsm.currentEpoch,
+              membersHash: epochRec.membersHash,
+              ivB64,
+              cipherB64,
+            });
+            const sigB64 = await withUnwrappedMLDSASecretKey(options.myUsername, sec =>
+              bufToBase64(ml_dsa65.sign(signTarget, sec))
+            );
+            payload = `${E2EE_GROUP_EPOCH_V3_PREFIX}${fsm.currentEpoch}:${epochRec.membersHash}:${ivB64}:${cipherB64}:${sigB64}`;
+          } catch {
+            payload = `${E2EE_GROUP_EPOCH_PREFIX}${fsm.currentEpoch}:${epochRec.membersHash}:${bufToBase64(iv)}:${bufToBase64(cipherBuffer)}`;
+          }
+        } else {
+          payload = `${E2EE_GROUP_EPOCH_PREFIX}${fsm.currentEpoch}:${epochRec.membersHash}:${bufToBase64(iv)}:${bufToBase64(cipherBuffer)}`;
+        }
         const payloadHashKey = bufToBase64(sha256(new TextEncoder().encode(payload))).slice(0, 24);
         if (options?.myUsername) {
           saveSentPlaintextInMemory(options.myUsername, roomId, payloadHashKey, plainText);
@@ -1896,13 +1933,18 @@ export async function decryptMessageText(
   }
 
   // ۲. رمزگشایی پیام‌های گروهی مبتنی بر ماشین وضعیت اپوک (Group Epoch FSM + Grace Buffer)
-  if (payload.startsWith(E2EE_GROUP_EPOCH_PREFIX)) {
-    const raw = payload.slice(E2EE_GROUP_EPOCH_PREFIX.length);
+  const isGepV3 = payload.startsWith(E2EE_GROUP_EPOCH_V3_PREFIX);
+  const isGepV2 = payload.startsWith(E2EE_GROUP_EPOCH_PREFIX);
+  if (isGepV3 || isGepV2) {
+    const raw = payload.slice(isGepV3 ? E2EE_GROUP_EPOCH_V3_PREFIX.length : E2EE_GROUP_EPOCH_PREFIX.length);
     const parts = raw.split(':');
-    if (parts.length !== 4) {
+    if (isGepV3 && parts.length !== 5) {
+      throw new E2EEError('MALFORMED_PAYLOAD', 'Group epoch v3 packet must have exactly 5 parts');
+    }
+    if (isGepV2 && parts.length !== 4) {
       throw new E2EEError('MALFORMED_PAYLOAD', 'Group epoch packet must have exactly 4 parts');
     }
-    const [epochStr, membersHash, ivB64, cipherB64] = parts;
+    const [epochStr, membersHash, ivB64, cipherB64, senderSigB64] = parts;
     if (!/^\d+$/.test(epochStr)) {
       throw new E2EEError('MALFORMED_PAYLOAD', 'Invalid group epoch number');
     }
@@ -1921,6 +1963,29 @@ export async function decryptMessageText(
     const cipherBytes = base64ToBuf(cipherB64);
     if (cipherBytes.byteLength < 16) {
       throw new E2EEError('MALFORMED_PAYLOAD', 'Group ciphertext too short');
+    }
+
+    let isMldsaVerified = false;
+    if (isGepV3) {
+      const senderKeyStr = options?.peerPublicKey || (options?.sender ? getStoredPeerPublicKey(options.sender) : null);
+      if (senderKeyStr && options?.sender) {
+        const parsed = parsePeerKeyBundle(senderKeyStr, options.sender, { skipCache: true });
+        if (parsed.hasMLDSA && parsed.mldsaPub) {
+          const signTarget = serializeGroupMessageForSigning({
+            roomId,
+            epoch: msgEpoch,
+            membersHash,
+            ivB64,
+            cipherB64,
+          });
+          const sigBytes = base64ToBuf(senderSigB64);
+          const valid = ml_dsa65.verify(sigBytes, signTarget, parsed.mldsaPub);
+          if (!valid) {
+            throw new E2EEError('INVALID_SIGNATURE', 'Group sender ML-DSA-65 signature verification failed');
+          }
+          isMldsaVerified = true;
+        }
+      }
     }
 
     const groupId = roomId.replace('group__', '');
@@ -1992,6 +2057,7 @@ export async function decryptMessageText(
         isEncrypted: true,
         mode: 'GROUP-EPOCH-FSM',
         epoch: msgEpoch,
+        mldsaVerified: isMldsaVerified,
         failed: false,
       };
     } catch {
