@@ -145,9 +145,12 @@ describe('DP item 15 (M2) — in-order rotation test masks H4: late pre-rotation
     // CORRECTION TO H4: the late pre-rotation message decrypts — the old
     // session is re-established from the old capsule. It is NOT lost.
     assert.equal((await decryptMessageText(payloads[49], ROOM, decOpts(aliceBundle))).text, 'msg-49');
-    // ...but re-establishing it destroyed the post-rotation session's
-    // consumed-step set, so msg-50 now decrypts a SECOND time (H1).
-    assert.equal((await decryptMessageText(payloads[50], ROOM, decOpts(aliceBundle))).text, 'msg-50');
+    // With H1 fixed, the post-rotation session's consumed steps are preserved
+    // across the late pre-rotation message, so replayed msg-50 is rejected.
+    await assert.rejects(
+      () => decryptMessageText(payloads[50], ROOM, decOpts(aliceBundle)),
+      (err: unknown) => err instanceof E2EEError && err.code === 'REPLAY_DETECTED',
+    );
     console.log('[dp-masking M2] H4 CORRECTED: late msg-49 decrypts; the cost is that msg-50 then replays. In-order test masks the session destruction, not a lost message.');
   });
 });
