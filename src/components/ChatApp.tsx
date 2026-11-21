@@ -536,7 +536,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         }
         bundles[m] = bundleStr ? parsePeerKeyBundle(bundleStr, m) : null;
       }
-      const packet = await createGroupEpochPacket(bundles);
+      const packet = await createGroupEpochPacket(bundles, myUsername, epoch);
       if (packet.missing.length > 0) {
         showToast(
           `⚠️ کلید اپوک گروه برای این اعضا ساخته نشد (بدون باندل تأییدشده): ${packet.missing.join('، ')}`
@@ -546,7 +546,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         await fetch(`/api/group/${encodeURIComponent(groupId)}/epoch-packet`, {
           method: 'POST',
           headers: authHeaders,
-          body: JSON.stringify({ epoch, keys: packet.keys }),
+          body: JSON.stringify({ epoch, keys: packet.keys, sig: packet.distributorSigB64 }),
         });
       } catch {
         // ignore

@@ -1272,15 +1272,34 @@ export interface GroupEpochPacket {
   epochKeyB64: string; // کلید خام اپوک — فقط نزد توزیع‌کننده می‌ماند
   keys: Record<string, string>; // username -> کپسول ML-KEM-768 (Base64)
   missing: string[]; // اعضایی که باندل تأییدشده ندارند و نمی‌توانند بخوانند
+  distributorSigB64?: string;
+  epoch?: number;
+}
+
+export function serializeEpochPacketForSigning(
+  epoch: number,
+  members: string[],
+  keys: Record<string, string>
+): Uint8Array {
+  const sortedMembers = [...members].sort().join(',');
+  const sortedKeys = Object.keys(keys)
+    .sort()
+    .map(k => `${k}=${keys[k]}`)
+    .join('&');
+  const str = `MLDSA-EPOCH-PACKET-v1:${epoch}:${sortedMembers}:${sortedKeys}`;
+  return new TextEncoder().encode(str);
 }
 
 export async function createGroupEpochPacket(
-  memberBundles: Record<string, ParsedPeerKeyBundle | null | undefined>
+  memberBundles: Record<string, ParsedPeerKeyBundle | null | undefined>,
+  distributorUsername?: string,
+  epoch: number = 1
 ): Promise<GroupEpochPacket> {
   const webCrypto = getWebCrypto();
   const epochKey = webCrypto.getRandomValues(new Uint8Array(32));
   const keys: Record<string, string> = {};
   const missing: string[] = [];
+  const members = Object.keys(memberBundles).sort();
   for (const [username, bundle] of Object.entries(memberBundles)) {
     if (bundle && bundle.isFullyPostQuantum && bundle.mlkemPub) {
       try {
@@ -1320,9 +1339,23 @@ export async function createGroupEpochPacket(
       missing.push(username);
     }
   }
+
+  let distributorSigB64: string | undefined = undefined;
+  if (distributorUsername) {
+    try {
+      const signTarget = serializeEpochPacketForSigning(epoch, members, keys);
+      distributorSigB64 = await withUnwrappedMLDSASecretKey(distributorUsername, mldsaSec => {
+        const sig = ml_dsa65.sign(signTarget, mldsaSec);
+        return bufToBase64(sig);
+      });
+    } catch {
+      // ignore
+    }
+  }
+
   const epochKeyB64 = bufToBase64(epochKey);
   zeroizeBuffer(epochKey);
-  return { epochKeyB64, keys, missing };
+  return { epochKeyB64, keys, missing, distributorSigB64, epoch };
 }
 
 /** باز کردن کپسول کلید اپوک گروه با کلید خصوصی ML-KEM-768 خود کاربر (IndexedDB v4). */

@@ -23,6 +23,7 @@ import {
   parsePeerKeyBundleStrict,
   resetAllCryptoStateForTests,
   rotateGroupEpoch,
+  serializeEpochPacketForSigning,
   serializeMessageForSigning,
   setRoomSecret,
   withUnwrappedMLDSASecretKey,
@@ -828,5 +829,37 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     const v1Qr = `PQ-MPRBA-SAFETY-v1:${snAlice.sha256Hex}`;
     const qrV1Match = parseAndCompareQrPayload(v1Qr, snAlice.sha256Hex);
     assert.equal(qrV1Match.status, 'MATCH');
+  });
+
+  it('signs group epoch packets with distributor ML-DSA signature and validates signature integrity (H2)', async () => {
+    const aliceBundleStr = (await ensureUserHybridKeyPair('alice'))!;
+    const bobBundleStr = (await ensureUserHybridKeyPair('bob'))!;
+
+    const aliceParsed = parsePeerKeyBundle(aliceBundleStr, 'alice');
+    const bobParsed = parsePeerKeyBundle(bobBundleStr, 'bob');
+
+    const bundles = { alice: aliceParsed, bob: bobParsed };
+    const epoch = 3;
+    const packet = await createGroupEpochPacket(bundles, 'alice', epoch);
+
+    assert.ok(packet.distributorSigB64, 'Distributor ML-DSA signature must be present');
+    assert.equal(packet.epoch, epoch);
+
+    const members = Object.keys(bundles).sort();
+    const signTarget = serializeEpochPacketForSigning(epoch, members, packet.keys);
+    const sigBytes = base64ToBuf(packet.distributorSigB64);
+    const mldsaPub = aliceParsed.mldsaPub!;
+
+    // Valid signature must verify
+    assert.equal(ml_dsa65.verify(sigBytes, signTarget, mldsaPub), true);
+
+    // Tampered epoch fails verification
+    const tamperedEpochTarget = serializeEpochPacketForSigning(epoch + 1, members, packet.keys);
+    assert.equal(ml_dsa65.verify(sigBytes, tamperedEpochTarget, mldsaPub), false);
+
+    // Tampered keys fail verification
+    const tamperedKeys = { ...packet.keys, bob: 'AAAA' };
+    const tamperedKeysTarget = serializeEpochPacketForSigning(epoch, members, tamperedKeys);
+    assert.equal(ml_dsa65.verify(sigBytes, tamperedKeysTarget, mldsaPub), false);
   });
 });

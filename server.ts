@@ -8,6 +8,7 @@ import path from 'path';
 import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import multer from 'multer';
+import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js';
 import { ristretto255_oprf } from '@noble/curves/ed25519.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { hkdf } from '@noble/hashes/hkdf.js';
@@ -741,7 +742,7 @@ app.post(['/api/auth/reissue-recovery-code', '/api/reissue-recovery-code'], asyn
 app.post('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
   const sessionUser = getSessionUsername(req);
   if (!sessionUser) return res.status(401).json({ ok: false });
-  const { epoch, keys } = req.body as { epoch?: unknown; keys?: unknown };
+  const { epoch, keys, sig } = req.body as { epoch?: unknown; keys?: unknown; sig?: unknown };
   if (typeof epoch !== 'number' || !Number.isSafeInteger(epoch) || epoch < 1 || epoch > Number.MAX_SAFE_INTEGER) {
     return res.json({ ok: false, msg: 'invalid epoch' });
   }
@@ -765,6 +766,34 @@ app.post('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
   if (members[0] !== sessionUser) {
     return res.status(403).json({ ok: false, msg: 'only group distributor can post epoch packets' });
   }
+
+  // H2: تأیید امضای دیجیتال ML-DSA-65 توزیع‌کننده بر روی بسته اپوک
+  const userRes = await pool.query('SELECT public_key FROM users WHERE username = $1', [sessionUser]);
+  if (userRes.rows.length && userRes.rows[0].public_key) {
+    try {
+      const parsedBundle = JSON.parse(userRes.rows[0].public_key);
+      if (parsedBundle.mldsaPubB64) {
+        if (typeof sig !== 'string' || !sig) {
+          return res.status(403).json({ ok: false, msg: 'distributor ML-DSA signature required' });
+        }
+        const mldsaPub = Buffer.from(parsedBundle.mldsaPubB64, 'base64');
+        const sigBytes = Buffer.from(sig, 'base64');
+        const sortedMembers = [...members].sort().join(',');
+        const sortedKeys = Object.keys(keys as Record<string, string>)
+          .sort()
+          .map(k => `${k}=${(keys as Record<string, string>)[k]}`)
+          .join('&');
+        const signTarget = new TextEncoder().encode(`MLDSA-EPOCH-PACKET-v1:${epoch}:${sortedMembers}:${sortedKeys}`);
+        const valid = ml_dsa65.verify(sigBytes, signTarget, mldsaPub);
+        if (!valid) {
+          return res.status(403).json({ ok: false, msg: 'invalid distributor ML-DSA signature on epoch packet' });
+        }
+      }
+    } catch {
+      return res.status(403).json({ ok: false, msg: 'failed to verify distributor signature' });
+    }
+  }
+
   // DP-10: جلوگیری از rollback اپوک
   const rawPrev = await getSetting(`group_epoch_packet_${req.params.id}`);
   if (rawPrev) {
@@ -775,7 +804,7 @@ app.post('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
       }
     } catch {}
   }
-  const packet = { epoch, keys, postedBy: sessionUser, postedAt: new Date().toISOString() };
+  const packet = { epoch, keys, sig: typeof sig === 'string' ? sig : undefined, postedBy: sessionUser, postedAt: new Date().toISOString() };
   await setSetting(`group_epoch_packet_${req.params.id}`, JSON.stringify(packet));
   // پخش فوری به اعضای آنلاین
   members.forEach(m => {
