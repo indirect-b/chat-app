@@ -157,20 +157,88 @@ async function fileStartsWithMagic(filePath: string, magic: string): Promise<boo
 
 // متغیرهای درون‌حافظه‌ای توکن‌های موقت
 const adminTokens: Record<string, { username: string; expire: number; adminAt: number }> = {};
-const userSessions: Record<string, { username: string; expire: number }> = {};
+export const userSessions: Record<string, { username: string; expire: number }> = {};
+
+export function parseCookies(header: string | undefined): Record<string, string> {
+  const list: Record<string, string> = {};
+  if (!header) return list;
+  header.split(';').forEach(cookie => {
+    const parts = cookie.split('=');
+    if (parts.length >= 2) {
+      list[parts[0].trim()] = decodeURIComponent(parts.slice(1).join('=').trim());
+    }
+  });
+  return list;
+}
+
+export async function saveUserSession(token: string, username: string, expireMs: number): Promise<void> {
+  userSessions[token] = { username, expire: expireMs };
+  try {
+    const expiresAt = new Date(expireMs).toISOString();
+    await pool.query(
+      'INSERT INTO sessions (token, username, expires_at) VALUES ($1, $2, $3)',
+      [token, username, expiresAt]
+    );
+  } catch (e: any) {
+    console.warn('⚠️ اخطار در ذخیره سشن در دیتابیس:', e?.message || e);
+  }
+}
+
+export async function removeUserSession(token: string): Promise<void> {
+  delete userSessions[token];
+  try {
+    await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
+  } catch (e: any) {
+    console.warn('⚠️ اخطار در حذف سشن از دیتابیس:', e?.message || e);
+  }
+}
+
+export async function removeAllUserSessions(username: string): Promise<void> {
+  for (const [tok, sess] of Object.entries(userSessions)) {
+    if (sess.username === username) {
+      delete userSessions[tok];
+    }
+  }
+  try {
+    await pool.query('DELETE FROM sessions WHERE username = $1', [username]);
+  } catch (e: any) {
+    console.warn('⚠️ اخطار در حذف سشن‌های کاربر از دیتابیس:', e?.message || e);
+  }
+}
+
+export async function restoreSessionsFromDb(): Promise<void> {
+  try {
+    const { rows } = await pool.query('SELECT * FROM sessions');
+    const now = Date.now();
+    for (const r of rows) {
+      const expire = r.expires_at ? new Date(r.expires_at).getTime() : now + 7 * 24 * 3600 * 1000;
+      if (expire > now) {
+        userSessions[r.token] = { username: r.username, expire };
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
 
 function getSessionUsername(req: Request): string | null {
+  let token: string | null = null;
   const authHeader = req.headers.authorization;
   const raw = Array.isArray(authHeader) ? authHeader[0] : authHeader;
-  if (!raw || typeof raw !== 'string') return null;
-  const match = raw.match(/^Bearer\s+(.+)$/i);
-  if (!match) return null;
-  const token = match[1].trim();
+  if (raw && typeof raw === 'string') {
+    const match = raw.match(/^Bearer\s+(.+)$/i);
+    if (match) token = match[1].trim();
+  }
+  if (!token && req.headers.cookie) {
+    const cookies = parseCookies(req.headers.cookie);
+    if (cookies.session_token) token = cookies.session_token;
+  }
   if (!token) return null;
   const session = userSessions[token];
   if (!session) return null;
   if (Date.now() > session.expire) {
     delete userSessions[token];
+    void removeUserSession(token);
     return null;
   }
   return session.username;
@@ -459,10 +527,8 @@ async function completeGoogleSignIn(
   }
 
   const sessionToken = uuidv4();
-  userSessions[sessionToken] = {
-    username: email,
-    expire: Date.now() + 7 * 24 * 60 * 60 * 1000,
-  };
+  const sessionExpire = Date.now() + 7 * 24 * 60 * 60 * 1000;
+  await saveUserSession(sessionToken, email, sessionExpire);
 
   return { sessionToken, username: email, isNew, recoveryCode };
 }
@@ -500,6 +566,13 @@ app.post('/api/google-login', async (req: Request, res: Response) => {
     email,
     verified.profile
   );
+
+  res.cookie('session_token', sessionToken, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
 
   res.json({
     ok: true,
@@ -563,6 +636,13 @@ app.post('/api/google-redirect', async (req: Request, res: Response) => {
   if (isNew && recoveryCode) {
     pendingRecoveryCodes.store(sessionToken, recoveryCode, Date.now());
   }
+
+  res.cookie('session_token', sessionToken, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
 
   // The session token rides in the URL only for this one hop; the
   // client stores it and strips it from the address bar immediately
@@ -637,10 +717,15 @@ app.post('/api/recover', async (req: Request, res: Response) => {
   await pool.query('UPDATE users SET recovery_code_hash=$1 WHERE username=$2', [nextHash, key]);
 
   const sessionToken = uuidv4();
-  userSessions[sessionToken] = {
-    username: key,
-    expire: Date.now() + 7 * 24 * 60 * 60 * 1000,
-  };
+  const sessionExpire = Date.now() + 7 * 24 * 60 * 60 * 1000;
+  await saveUserSession(sessionToken, key, sessionExpire);
+
+  res.cookie('session_token', sessionToken, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
 
   return res.json({
     ok: true,
@@ -1025,11 +1110,7 @@ app.post('/api/account/delete', async (req: Request, res: Response) => {
   await pool.query('DELETE FROM contacts WHERE username = $1 OR contact = $1', [username]);
   await pool.query('DELETE FROM users WHERE username = $1', [username]);
 
-  for (const [tok, sess] of Object.entries(userSessions)) {
-    if (sess.username === username) {
-      delete userSessions[tok];
-    }
-  }
+  await removeAllUserSessions(username);
 
   return res.json({ ok: true });
 });
@@ -1973,6 +2054,8 @@ async function start(): Promise<void> {
     if (res.headersSent) return next(err);
     res.status(500).json({ ok: false, msg: 'Internal server error' });
   });
+
+  await restoreSessionsFromDb();
 
   server.listen(config.PORT, '0.0.0.0', () => {
     console.log(`✅ سرور TypeScript + React نسخه ${APP_VERSION} روی پورت ${config.PORT}`);

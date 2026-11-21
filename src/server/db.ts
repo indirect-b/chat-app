@@ -78,6 +78,13 @@ export interface DbMediaBlob {
   created_at: string;
 }
 
+export interface DbSession {
+  token: string;
+  username: string;
+  created_at: string;
+  expires_at?: string;
+}
+
 interface SnapshotData {
   users: [string, DbUser][];
   contacts: DbContact[];
@@ -86,6 +93,7 @@ interface SnapshotData {
   reports: DbReport[];
   settings: [string, string][];
   mediaBlobs?: [string, DbMediaBlob][];
+  sessions?: [string, DbSession][];
 }
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
@@ -101,6 +109,7 @@ export class PersistentFallbackDatabase {
   private groups = new Map<string, DbGroup>();
   private reports: DbReport[] = [];
   private mediaBlobs = new Map<string, DbMediaBlob>();
+  private sessions = new Map<string, DbSession>();
   private settings = new Map<string, string>([
     ['server_mode', 'normal'],
     ['maintenance_msg', 'سرور در حال به‌روزرسانی است. لطفاً بعداً مراجعه کنید.'],
@@ -130,6 +139,7 @@ export class PersistentFallbackDatabase {
         if (Array.isArray(parsed.groups)) this.groups = new Map(parsed.groups);
         if (Array.isArray(parsed.reports)) this.reports = parsed.reports;
         if (Array.isArray(parsed.mediaBlobs)) this.mediaBlobs = new Map(parsed.mediaBlobs);
+        if (Array.isArray(parsed.sessions)) this.sessions = new Map(parsed.sessions);
         if (Array.isArray(parsed.settings)) {
           for (const [k, v] of parsed.settings) {
             this.settings.set(k, v);
@@ -180,6 +190,7 @@ export class PersistentFallbackDatabase {
         reports: this.reports,
         settings: Array.from(this.settings.entries()),
         mediaBlobs: Array.from(this.mediaBlobs.entries()),
+        sessions: Array.from(this.sessions.entries()),
       };
 
       const payload = JSON.stringify(snapshot);
@@ -217,6 +228,49 @@ export class PersistentFallbackDatabase {
     if (lower.startsWith('select * from media_blobs where id = $1')) {
       const item = this.mediaBlobs.get(params[0]);
       return { rows: item ? [item] : [] };
+    }
+
+    // 0.5 SESSIONS (DP-11)
+    if (lower.startsWith('insert into sessions')) {
+      const [token, username, expires_at] = params;
+      const created_at = new Date().toISOString();
+      this.sessions.set(token, {
+        token,
+        username,
+        created_at,
+        expires_at: expires_at ? new Date(expires_at).toISOString() : undefined,
+      });
+      this.scheduleSave();
+      return { rows: [] };
+    }
+    if (lower.startsWith('select * from sessions where token = $1') || lower.startsWith('select username from sessions where token = $1')) {
+      const item = this.sessions.get(params[0]);
+      if (!item) return { rows: [] };
+      if (item.expires_at && new Date(item.expires_at).getTime() < Date.now()) {
+        this.sessions.delete(params[0]);
+        this.scheduleSave();
+        return { rows: [] };
+      }
+      return { rows: [item] };
+    }
+    if (lower.startsWith('select * from sessions')) {
+      const now = Date.now();
+      const valid = Array.from(this.sessions.values()).filter(
+        s => !s.expires_at || new Date(s.expires_at).getTime() > now
+      );
+      return { rows: valid };
+    }
+    if (lower.startsWith('delete from sessions where token = $1')) {
+      this.sessions.delete(params[0]);
+      this.scheduleSave();
+      return { rows: [] };
+    }
+    if (lower.startsWith('delete from sessions where username = $1')) {
+      for (const [t, s] of Array.from(this.sessions.entries())) {
+        if (s.username === params[0]) this.sessions.delete(t);
+      }
+      this.scheduleSave();
+      return { rows: [] };
     }
 
     // 1. SETTINGS
@@ -820,6 +874,13 @@ export async function init(poolOverride?: Pool): Promise<void> {
           ALTER TABLE media_blobs ADD COLUMN IF NOT EXISTS room_id TEXT;
           ALTER TABLE media_blobs ADD COLUMN IF NOT EXISTS is_encrypted INTEGER DEFAULT 0;
           ALTER TABLE media_blobs ADD COLUMN IF NOT EXISTS uploaded_by TEXT;
+
+          CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP
+          );
           `);
         } catch (e: any) {
           console.warn(

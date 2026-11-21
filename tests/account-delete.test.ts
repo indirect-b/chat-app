@@ -11,6 +11,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { pool } from '../src/server/db';
 import {
   canDeleteWithCode,
   generateRecoveryCode,
@@ -38,5 +39,28 @@ describe('canDeleteWithCode', () => {
   it('allows deletion on the session alone for legacy accounts with no hash (NULL/undefined)', async () => {
     assert.equal(await canDeleteWithCode(null, ''), true);
     assert.equal(await canDeleteWithCode(undefined, 'anything'), true);
+  });
+});
+
+describe('sessions table persistence (DP-11)', () => {
+  it('persists and deletes sessions in database', async () => {
+    const token = 'test-token-' + Date.now();
+    const username = 'test-user-' + Date.now();
+    const expire = new Date(Date.now() + 3600 * 1000).toISOString();
+
+    await pool.query('INSERT INTO sessions (token, username, expires_at) VALUES ($1, $2, $3)', [
+      token,
+      username,
+      expire,
+    ]);
+
+    const { rows } = await pool.query('SELECT * FROM sessions WHERE token = $1', [token]);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].token, token);
+    assert.equal(rows[0].username, username);
+
+    await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
+    const afterDelete = await pool.query('SELECT * FROM sessions WHERE token = $1', [token]);
+    assert.equal(afterDelete.rows.length, 0);
   });
 });
