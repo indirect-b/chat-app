@@ -210,6 +210,25 @@ export async function restoreSessionsFromDb(): Promise<void> {
   }
 }
 
+/**
+ * پاک‌سازی سشن‌های منقضی (DP-11، راند ۳): سطرهای منقضی از دیتابیس و
+ * ورودی‌های منقضی از حافظه حذف می‌شوند تا جدول sessions بی‌نهایت رشد نکند.
+ * در استارتاپ و هر ساعت یک بار اجرا می‌شود.
+ */
+export async function purgeExpiredSessions(): Promise<void> {
+  const now = Date.now();
+  for (const [tok, sess] of Object.entries(userSessions)) {
+    if (sess.expire <= now) {
+      delete userSessions[tok];
+    }
+  }
+  try {
+    await pool.query('DELETE FROM sessions WHERE expires_at IS NOT NULL AND expires_at < NOW()');
+  } catch (e: any) {
+    console.warn('⚠️ اخطار در پاک‌سازی سشن‌های منقضی:', e?.message || e);
+  }
+}
+
 function getSessionUsername(req: Request): string | null {
   let token: string | null = null;
   const authHeader = req.headers.authorization;
@@ -841,31 +860,38 @@ app.post('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
     return res.status(403).json({ ok: false, msg: 'only group distributor can post epoch packets' });
   }
 
-  // H2: تأیید امضای دیجیتال ML-DSA-65 توزیع‌کننده بر روی بسته اپوک
+  // H2: تأیید امضای دیجیتال ML-DSA-65 توزیع‌کننده بر روی بسته اپوک.
+  // راند ۳: امضا همیشه لازم است — اگر باندل توزیع‌کننده کلید ML-DSA نداشت
+  // یا اصلاً باندلی ذخیره نشده بود، بسته رد می‌شود (پیش‌تر در این حالت‌ها
+  // بررسی کاملاً رد می‌شد و بستهٔ بدون امضا پذیرفته می‌شد). همهٔ هویت‌های
+  // فعال v4 کلید ML-DSA دارند و باندل در هر ورود منتشر می‌شود، پس این
+  // سخت‌گیری حساب‌های قدیمیِ فعال را نمی‌شکند.
   const userRes = await pool.query('SELECT public_key FROM users WHERE username = $1', [sessionUser]);
-  if (userRes.rows.length && userRes.rows[0].public_key) {
-    try {
-      const parsedBundle = JSON.parse(userRes.rows[0].public_key);
-      if (parsedBundle.mldsaPubB64) {
-        if (typeof sig !== 'string' || !sig) {
-          return res.status(403).json({ ok: false, msg: 'distributor ML-DSA signature required' });
-        }
-        const mldsaPub = Buffer.from(parsedBundle.mldsaPubB64, 'base64');
-        const sigBytes = Buffer.from(sig, 'base64');
-        const sortedMembers = [...members].sort().join(',');
-        const sortedKeys = Object.keys(keys as Record<string, string>)
-          .sort()
-          .map(k => `${k}=${(keys as Record<string, string>)[k]}`)
-          .join('&');
-        const signTarget = new TextEncoder().encode(`MLDSA-EPOCH-PACKET-v1:${epoch}:${sortedMembers}:${sortedKeys}`);
-        const valid = ml_dsa65.verify(sigBytes, signTarget, mldsaPub);
-        if (!valid) {
-          return res.status(403).json({ ok: false, msg: 'invalid distributor ML-DSA signature on epoch packet' });
-        }
-      }
-    } catch {
-      return res.status(403).json({ ok: false, msg: 'failed to verify distributor signature' });
+  if (!userRes.rows.length || !userRes.rows[0].public_key) {
+    return res.status(403).json({ ok: false, msg: 'distributor ML-DSA key unavailable' });
+  }
+  try {
+    const parsedBundle = JSON.parse(userRes.rows[0].public_key);
+    if (!parsedBundle.mldsaPubB64) {
+      return res.status(403).json({ ok: false, msg: 'distributor ML-DSA key unavailable' });
     }
+    if (typeof sig !== 'string' || !sig) {
+      return res.status(403).json({ ok: false, msg: 'distributor ML-DSA signature required' });
+    }
+    const mldsaPub = Buffer.from(parsedBundle.mldsaPubB64, 'base64');
+    const sigBytes = Buffer.from(sig, 'base64');
+    const sortedMembers = [...members].sort().join(',');
+    const sortedKeys = Object.keys(keys as Record<string, string>)
+      .sort()
+      .map(k => `${k}=${(keys as Record<string, string>)[k]}`)
+      .join('&');
+    const signTarget = new TextEncoder().encode(`MLDSA-EPOCH-PACKET-v1:${epoch}:${sortedMembers}:${sortedKeys}`);
+    const valid = ml_dsa65.verify(sigBytes, signTarget, mldsaPub);
+    if (!valid) {
+      return res.status(403).json({ ok: false, msg: 'invalid distributor ML-DSA signature on epoch packet' });
+    }
+  } catch {
+    return res.status(403).json({ ok: false, msg: 'failed to verify distributor signature' });
   }
 
   // DP-10: جلوگیری از rollback اپوک
@@ -2045,6 +2071,7 @@ async function start(): Promise<void> {
   });
 
   await restoreSessionsFromDb();
+  await purgeExpiredSessions();
 
   server.listen(config.PORT, '0.0.0.0', () => {
     console.log(`✅ سرور TypeScript + React نسخه ${APP_VERSION} روی پورت ${config.PORT}`);
@@ -2055,6 +2082,11 @@ async function start(): Promise<void> {
       void bale.checkBaleHealth();
     }, 5 * 60 * 1000);
     healthTimer.unref();
+    // پاک‌سازی ساعتی سشن‌های منقضی (DP-11)
+    const sessionPurgeTimer = setInterval(() => {
+      void purgeExpiredSessions();
+    }, 60 * 60 * 1000);
+    sessionPurgeTimer.unref();
   });
 }
 

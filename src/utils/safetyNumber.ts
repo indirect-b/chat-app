@@ -39,6 +39,8 @@ import {
   getPinnedPeerIdentityKeyTOFUSync,
   pinPeerIdentityKeyTOFU,
   pinPeerIdentityKeyTOFUSync,
+  repinPeerIdentityKeyTOFU,
+  repinPeerIdentityKeyTOFUSync,
 } from './keystore';
 
 export const SAFETY_PROTOCOL_ID = 'PQ-MPRBA-SAFETY-v1';
@@ -820,6 +822,14 @@ export function markContactVerified(
   const all = loadAllVerificationRecords(myUsername);
   all[normContact] = updated;
   saveAllVerificationRecords(myUsername, all);
+
+  // M4 (round 3): explicit user verification RE-PINS the TOFU key. Without
+  // this, a legitimate key rotation stayed CHANGED forever: verify set
+  // VERIFIED, but the next observe() still saw the pin diverge and re-flagged
+  // CHANGED. The re-pin moves the pin to the verified key.
+  repinPeerIdentityKeyTOFUSync(myUsername, normContact, extracted.base64);
+  repinPeerIdentityKeyTOFU(myUsername, normContact, extracted.base64).catch(() => {});
+
   return updated;
 }
 

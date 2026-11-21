@@ -35,7 +35,15 @@ import {
   rotateSessionRatchetOnly,
 } from '../utils/safetyNumber';
 import { SafetyNumberModal } from './SafetyNumberModal';
-import { deleteIdentityRecordV4 } from '../utils/keystore';
+import {
+  deleteIdentityRecordV4,
+  disablePasswordProtection,
+  enablePasswordProtection,
+  isPasswordProtectionEnabled,
+  lockIdentity,
+  pruneDurableReplaySeen,
+  unlockIdentityWithPassphrase,
+} from '../utils/keystore';
 
 interface ChatAppProps {
   myUsername: string;
@@ -47,7 +55,7 @@ interface ChatAppProps {
 interface DecryptedChatMessage extends ChatMessage {
   decryptedText?: string;
   isE2EE?: boolean;
-  e2eeMode?: 'PQ-MLKEM-RATCHET' | 'GROUP-EPOCH-FSM' | 'ECDH' | 'PBKDF2';
+  e2eeMode?: 'PQ-MLKEM-RATCHET' | 'GROUP-EPOCH-FSM' | 'PBKDF2';
   ratchetStep?: number;
   epoch?: number;
   mldsaVerified?: boolean;
@@ -263,6 +271,104 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   const e2eeActive = true;
   const [e2eeModalOpen, setE2eeModalOpen] = useState(false);
   const [customSecretInput, setCustomSecretInput] = useState('');
+
+  // L8: محافظت از کلید هویت با رمز عبور
+  const [identityLocked, setIdentityLocked] = useState(false);
+  const [unlockPassphrase, setUnlockPassphrase] = useState('');
+  const [unlockMsg, setUnlockMsg] = useState<{ text: string; ok: boolean }>({ text: '', ok: false });
+  const [pwProtectionEnabled, setPwProtectionEnabled] = useState<boolean | null>(null);
+  const [pwNewPass, setPwNewPass] = useState('');
+  const [pwConfirmPass, setPwConfirmPass] = useState('');
+  const [pwCurrentPass, setPwCurrentPass] = useState('');
+  const [pwMsg, setPwMsg] = useState<{ text: string; ok: boolean }>({ text: '', ok: false });
+
+  const refreshPwProtectionStatus = useCallback(async () => {
+    try {
+      setPwProtectionEnabled(await isPasswordProtectionEnabled(myUsername));
+    } catch {
+      setPwProtectionEnabled(null);
+    }
+  }, [myUsername]);
+
+  useEffect(() => {
+    if (e2eeModalOpen) {
+      setPwMsg({ text: '', ok: false });
+      setPwNewPass('');
+      setPwConfirmPass('');
+      setPwCurrentPass('');
+      void refreshPwProtectionStatus();
+    }
+  }, [e2eeModalOpen, refreshPwProtectionStatus]);
+
+  const handleEnablePwProtection = async () => {
+    if (pwNewPass.length < 8) {
+      setPwMsg({ text: 'رمز عبور باید حداقل ۸ کاراکتر باشد.', ok: false });
+      return;
+    }
+    if (pwNewPass !== pwConfirmPass) {
+      setPwMsg({ text: 'تکرار رمز عبور مطابقت ندارد.', ok: false });
+      return;
+    }
+    try {
+      await enablePasswordProtection(myUsername, pwNewPass);
+      setPwProtectionEnabled(true);
+      setPwNewPass('');
+      setPwConfirmPass('');
+      setPwMsg({
+        text: 'محافظت با رمز عبور فعال شد. کلید هویت شما اکنون فقط با این رمز باز می‌شود — آن را در جایی امن نگه دارید؛ در صورت فراموشی، بازیابی ممکن نیست.',
+        ok: true,
+      });
+    } catch (err: any) {
+      setPwMsg({ text: `فعال‌سازی ناموفق بود: ${err?.message || 'خطای ناشناخته'}`, ok: false });
+    }
+  };
+
+  const handleDisablePwProtection = async () => {
+    try {
+      await disablePasswordProtection(myUsername, pwCurrentPass);
+      setPwProtectionEnabled(false);
+      setPwCurrentPass('');
+      setPwMsg({ text: 'محافظت با رمز عبور غیرفعال شد.', ok: true });
+    } catch (err: any) {
+      setPwMsg({
+        text:
+          err?.code === 'IDENTITY_LOCKED'
+            ? 'رمز عبور فعلی نادرست است.'
+            : `غیرفعال‌سازی ناموفق بود: ${err?.message || 'خطای ناشناخته'}`,
+        ok: false,
+      });
+    }
+  };
+
+  const handleUnlockIdentity = async () => {
+    try {
+      await unlockIdentityWithPassphrase(myUsername, unlockPassphrase);
+      setIdentityLocked(false);
+      setUnlockPassphrase('');
+      setUnlockMsg({ text: '', ok: false });
+      // کلید هویت باز شد — باندل عمومی را دوباره منتشر کن.
+      const pubKey = await ensureUserHybridKeyPair(myUsername);
+      if (pubKey) {
+        const sessionToken = localStorage.getItem('chat_session_token') || '';
+        fetch('/api/user/public-key', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: JSON.stringify({ username: myUsername, publicKey: pubKey }),
+        }).catch(() => {});
+      }
+    } catch (err: any) {
+      setUnlockMsg({
+        text:
+          err?.code === 'IDENTITY_LOCKED'
+            ? 'رمز عبور نادرست است.'
+            : `باز کردن ناموفق بود: ${err?.message || 'خطای ناشناخته'}`,
+        ok: false,
+      });
+    }
+  };
   const [voprfToken, setVoprfToken] = useState<VoprfBlindTokenRecord | null>(null);
   const [currentGroupEpoch, setCurrentGroupEpoch] = useState<number>(1);
   const groupMembersRef = useRef<Record<string, string[]>>({});
@@ -785,6 +891,8 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     // نام کاربری تنها قابل جعل است.
     socket.emit('auth', { username: myUsername, token: sessionToken });
     loadRoomList('chats');
+    // هرس انبار دائم Replay در استارتاپ (راند ۳) — best-effort.
+    void pruneDurableReplaySeen();
 
     acquireBlindedIdentityToken(myUsername)
       .then(voprfRec => {
@@ -801,6 +909,13 @@ export const ChatApp: React.FC<ChatAppProps> = ({
             },
             body: JSON.stringify({ username: myUsername, publicKey: pubKey }),
           }).catch(() => {});
+        }
+      })
+      .catch(err => {
+        // L8: هویت با رمز عبور محافظت شده و در این نشست باز نشده است —
+        // به‌جای شکست خاموش، پنجرهٔ باز کردن رمز عبور را نشان بده.
+        if (err instanceof E2EEError && err.code === 'IDENTITY_LOCKED') {
+          setIdentityLocked(true);
         }
       });
 
@@ -2492,8 +2607,6 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                                   }`
                                 : msg.e2eeMode === 'GROUP-EPOCH-FSM'
                                 ? `ماشین وضعیت اپوک گروه (Epoch #${msg.epoch ?? 1})`
-                                : msg.e2eeMode === 'ECDH'
-                                ? 'رمزنگاری کلاسیک ECDH P-256 (فاقد امنیت پساکوانتومی)'
                                 : 'رمزنگاری سرتاسری دستی (PBKDF2)'
                             }
                             style={{
@@ -2502,8 +2615,6 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                               color:
                                 msg.e2eeMode === 'PQ-MLKEM-RATCHET'
                                   ? '#a78bfa'
-                                  : msg.e2eeMode === 'ECDH'
-                                  ? '#facc15'
                                   : '#38bdf8',
                             }}
                           >
@@ -2511,8 +2622,6 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                               ? `🛡️PQ#${msg.ratchetStep ?? 0}${msg.mldsaVerified ? ' ✓DSA' : ''}`
                               : msg.e2eeMode === 'GROUP-EPOCH-FSM'
                               ? `🔄Ep#${msg.epoch ?? 1}`
-                              : msg.e2eeMode === 'ECDH'
-                              ? '⚠️ECDH'
                               : '🔒'}
                           </span>
                         )}
@@ -2911,6 +3020,131 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               </div>
             )}
 
+            {/* L8: محافظت از کلید هویت با رمز عبور */}
+            <div
+              style={{
+                background: 'rgba(245, 158, 11, 0.1)',
+                border: '1px solid rgba(245, 158, 11, 0.35)',
+                borderRadius: '10px',
+                padding: '10px 12px',
+                marginBottom: '12px',
+                textAlign: 'right',
+                fontSize: '11.5px',
+                lineHeight: '1.7',
+              }}
+            >
+              <div style={{ fontWeight: 700, marginBottom: '4px' }}>
+                🔐 محافظت از کلید هویت با رمز عبور
+              </div>
+              <div style={{ marginBottom: '8px' }}>
+                وقتی فعال باشد، کلید هویت شما فقط با رمز عبور باز می‌شود — حتی اگر کسی به
+                دستگاه شما دسترسی پیدا کند، بدون رمز نمی‌تواند پیام بخواند یا ارسال کند.
+                رمز عبور را فراموش نکنید؛ بازیابی آن ممکن نیست.
+              </div>
+              <div style={{ marginBottom: '8px' }}>
+                وضعیت:{' '}
+                {pwProtectionEnabled === null
+                  ? 'در حال بررسی...'
+                  : pwProtectionEnabled
+                    ? 'فعال ✅'
+                    : 'غیرفعال'}
+                {pwProtectionEnabled && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      lockIdentity(myUsername);
+                      setIdentityLocked(true);
+                      setE2eeModalOpen(false);
+                    }}
+                    style={{
+                      marginRight: '8px',
+                      background: 'rgba(245, 158, 11, 0.22)',
+                      border: '1px solid rgba(245, 158, 11, 0.45)',
+                      borderRadius: '8px',
+                      color: '#fde68a',
+                      padding: '4px 10px',
+                      fontSize: '11.5px',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                      fontFamily: 'inherit',
+                    }}
+                  >
+                    🔒 قفل کردن اکنون
+                  </button>
+                )}
+              </div>
+              {pwProtectionEnabled === false && (
+                <>
+                  <input
+                    type="password"
+                    placeholder="رمز عبور جدید (حداقل ۸ کاراکتر)"
+                    value={pwNewPass}
+                    onChange={e => setPwNewPass(e.target.value)}
+                    style={{ marginBottom: '6px' }}
+                  />
+                  <input
+                    type="password"
+                    placeholder="تکرار رمز عبور"
+                    value={pwConfirmPass}
+                    onChange={e => setPwConfirmPass(e.target.value)}
+                    style={{ marginBottom: '6px' }}
+                  />
+                  <button
+                    type="button"
+                    onClick={handleEnablePwProtection}
+                    style={{
+                      width: '100%',
+                      background: 'rgba(245, 158, 11, 0.22)',
+                      border: '1px solid rgba(245, 158, 11, 0.45)',
+                      borderRadius: '8px',
+                      color: '#fef3c7',
+                      padding: '7px 10px',
+                      fontSize: '12px',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                      fontFamily: 'inherit',
+                    }}
+                  >
+                    فعال‌کردن محافظت با رمز عبور
+                  </button>
+                </>
+              )}
+              {pwProtectionEnabled === true && (
+                <>
+                  <input
+                    type="password"
+                    placeholder="رمز عبور فعلی"
+                    value={pwCurrentPass}
+                    onChange={e => setPwCurrentPass(e.target.value)}
+                    style={{ marginBottom: '6px' }}
+                  />
+                  <button
+                    type="button"
+                    onClick={handleDisablePwProtection}
+                    style={{
+                      width: '100%',
+                      background: 'rgba(239, 68, 68, 0.18)',
+                      border: '1px solid rgba(239, 68, 68, 0.45)',
+                      borderRadius: '8px',
+                      color: '#fecaca',
+                      padding: '7px 10px',
+                      fontSize: '12px',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                      fontFamily: 'inherit',
+                    }}
+                  >
+                    غیرفعال‌کردن محافظت
+                  </button>
+                </>
+              )}
+              {pwMsg.text && (
+                <div style={{ marginTop: '8px', color: pwMsg.ok ? '#4ade80' : '#f87171' }}>
+                  {pwMsg.text}
+                </div>
+              )}
+            </div>
+
             <p style={{ fontSize: '12px', lineHeight: '1.6' }}>
               در صورت تمایل به بازنویسی کلید خودکار با یک رمز مشترک دستی (PBKDF2 Override)، آن را
               در کادر زیر وارد کنید:
@@ -2931,6 +3165,38 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 onClick={() => setE2eeModalOpen(false)}
               >
                 {SAFETY_STRINGS_FA.cancel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* L8: IDENTITY UNLOCK MODAL — کلید هویت با رمز عبور قفل است */}
+      {identityLocked && (
+        <div className="modal">
+          <div className="modal-box" style={{ width: '92%', maxWidth: '420px' }}>
+            <h3>🔐 کلید هویت قفل است</h3>
+            <p style={{ fontSize: '12px', lineHeight: '1.7' }}>
+              کلید هویت شما با رمز عبور محافظت می‌شود. برای استفاده از چت رمزنگاری‌شده، رمز
+              عبور را وارد کنید. کلید فقط در حافظهٔ این نشست باز می‌ماند و با بستن تب پاک
+              می‌شود.
+            </p>
+            <input
+              type="password"
+              placeholder="رمز عبور کلید هویت"
+              value={unlockPassphrase}
+              onChange={e => setUnlockPassphrase(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && handleUnlockIdentity()}
+              autoFocus
+            />
+            {unlockMsg.text && (
+              <div style={{ marginTop: '8px', fontSize: '12px', color: '#f87171' }}>
+                {unlockMsg.text}
+              </div>
+            )}
+            <div className="modal-btns" style={{ marginTop: '10px' }}>
+              <button type="button" onClick={handleUnlockIdentity}>
+                باز کردن
               </button>
             </div>
           </div>
@@ -3204,10 +3470,10 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                       return (
                         <div>
                           <div style={{ color: '#facc15', fontWeight: 700, marginBottom: '2px' }}>
-                            ⚠️ رمزنگاری کلاسیک (ECDH P-256)
+                            ⚠️ مخاطب فاقد کلیدهای پساکوانتومی است
                           </div>
                           <div style={{ color: '#9ca3af', fontSize: '11px' }}>
-                            مخاطب فاقد کلیدهای پساکوانتومی است؛ ارتباطات در برابر الگوریتم شور ایمن نیستند.
+                            پیام رمزنگاری‌شده به این مخاطب ارسال نمی‌شود؛ مسیر قدیمی ECDH حذف شده است.
                           </div>
                         </div>
                       );

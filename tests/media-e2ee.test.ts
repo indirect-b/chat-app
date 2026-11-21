@@ -349,6 +349,58 @@ describe('file encryption round-trips (real crypto, same key setup as the pq-mpr
     assert.deepEqual(Array.from(back), Array.from(plain));
   });
 
+  it('(g) DM: sender can re-read their own file and every file gets a fresh ML-KEM key (M10)', async () => {
+    const aliceBundle = (await ensureUserHybridKeyPair('alice'))!;
+    const bobBundle = (await ensureUserHybridKeyPair('bob'))!;
+    const plain = new TextEncoder().encode('a fake JPEG body — 📷 bytes go here');
+    const opts = {
+      myUsername: 'alice',
+      peerPublicKey: bobBundle,
+      peerUsername: 'bob',
+    };
+    const cipher = await encryptFileBytes(plain, 'alice__bob', opts);
+    // Kind byte 4 = DM-MLKEM: per-file key encapsulated to both parties.
+    assert.equal(cipher[4], 4);
+    // The sender re-reads their own file (their own capsule in the header).
+    const backSelf = await decryptFileBytes(cipher, 'alice__bob', {
+      myUsername: 'alice',
+      peerPublicKey: bobBundle,
+      peerUsername: 'bob',
+    });
+    assert.deepEqual(Array.from(backSelf), Array.from(plain));
+    // The receiver reads it too.
+    const backPeer = await decryptFileBytes(cipher, 'alice__bob', {
+      myUsername: 'bob',
+      peerPublicKey: aliceBundle,
+      peerUsername: 'alice',
+    });
+    assert.deepEqual(Array.from(backPeer), Array.from(plain));
+    // A second encryption of the same plaintext uses a fresh file key and
+    // fresh KEM capsules — the whole payload differs, not just the IV.
+    const cipher2 = await encryptFileBytes(plain, 'alice__bob', opts);
+    assert.notDeepEqual(Array.from(cipher2), Array.from(cipher));
+    const back2 = await decryptFileBytes(cipher2, 'alice__bob', {
+      myUsername: 'bob',
+      peerPublicKey: aliceBundle,
+      peerUsername: 'alice',
+    });
+    assert.deepEqual(Array.from(back2), Array.from(plain));
+    // Tampering with BOTH KEM capsules fails closed (tampering with only one
+    // would still decrypt via the other capsule — by design, either party's
+    // capsule opens the file).
+    const tamperedCt = new Uint8Array(cipher);
+    tamperedCt[100] ^= 0xff; // inside the peer capsule
+    tamperedCt[1200] ^= 0xff; // inside the sender capsule
+    await assert.rejects(
+      decryptFileBytes(tamperedCt, 'alice__bob', {
+        myUsername: 'bob',
+        peerPublicKey: aliceBundle,
+        peerUsername: 'alice',
+      }),
+      (err: unknown) => err instanceof E2EEError
+    );
+  });
+
   it('(g) DM: tampering with the ciphertext fails closed', async () => {
     const aliceBundle = (await ensureUserHybridKeyPair('alice'))!;
     const bobBundle = (await ensureUserHybridKeyPair('bob'))!;

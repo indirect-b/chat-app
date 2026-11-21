@@ -500,8 +500,8 @@ describe('W3 extended fuzz — PQF1 file payloads and safety QR edge cases', () 
     const valid = await encryptFileBytes(plain, 'alice__bob', {
       myUsername: 'alice', peerPublicKey: bobBundle, peerUsername: 'bob',
     });
-    assert.equal(valid[4], 1, 'DM file kind byte is 1');
-    const headerLen = 21; // 4 magic + 1 kind + 4 epoch + 12 IV
+    assert.equal(valid[4], 4, 'DM file kind byte is 4 (per-file ML-KEM key, M10)');
+    const headerLen = 2261; // 4 magic + 1 kind + 4 epoch + 12 IV + 2x(1088 KEM ct + 32 wrapped key)
     assert.equal(valid.length, headerLen + plain.length + 16);
 
     const mutate = (fn: (b: Uint8Array) => void) => {
@@ -513,17 +513,17 @@ describe('W3 extended fuzz — PQF1 file payloads and safety QR edge cases', () 
       ['bad magic (first byte)', mutate(b => { b[0] = 0x58; })],
       ['bad magic (all four)', mutate(b => { b.set([0, 0, 0, 0], 0); })],
       ['kind 0', mutate(b => { b[4] = 0; })],
-      ['kind 4 (unknown)', mutate(b => { b[4] = 4; })],
+      ['kind 5 (unknown)', mutate(b => { b[4] = 5; })],
       ['kind 255', mutate(b => { b[4] = 255; })],
-      // NOTE: for DM files (kind 1) the epoch header bytes are ignored by
+      // NOTE: for DM files (kind 4) the epoch header bytes are ignored by
       // design — the DM key does not depend on any epoch. Epoch tampering is
       // only meaningful for group files and is tested in the group case below.
       ['IV byte flipped', mutate(b => { b[9] ^= 0xff; })],
       ['last ciphertext byte flipped (tag)', mutate(b => { b[b.length - 1] ^= 0xff; })],
       ['truncated to 20 bytes (short header)', valid.slice(0, 20)],
-      ['header only (21 bytes, no ciphertext)', valid.slice(0, 21)],
-      ['header + 15 bytes (no full tag)', valid.slice(0, 21 + 15)],
-      ['header + 16 bytes (tag only, empty plaintext)', valid.slice(0, 21 + 16)],
+      ['header only (2261 bytes, no ciphertext)', valid.slice(0, 2261)],
+      ['header + 15 bytes (no full tag)', valid.slice(0, 2261 + 15)],
+      ['header + 16 bytes (tag only, empty plaintext)', valid.slice(0, 2261 + 16)],
       ['empty', new Uint8Array(0)],
       ['3 bytes', new Uint8Array([0x50, 0x51, 0x46])],
     ];
@@ -580,7 +580,18 @@ describe('W3 extended fuzz — PQF1 file payloads and safety QR edge cases', () 
 
   it('safety QR parser rejects null/undefined/uppercase-hex/odd-length payloads without MATCH', () => {
     const expectedHex = '0123456789abcdef'.repeat(4);
-    for (const bad of [null, undefined, '', '   ', 'PQ-MPRBA-SAFETY-v1:', 'PQ-MPRBA-SAFETY-v1:0123456789ABCDEF'.repeat(4), 'PQ-MPRBA-SAFETY-v1:' + 'ab'.repeat(31), 'PQ-MPRBA-SAFETY-v1:' + 'ab'.repeat(33), 'pq-mprba-safety-v1:' + expectedHex] as unknown[]) {
+    // DP-14 contract: non-string input is a TYPE error and throws E2EEError
+    // (MALFORMED_PAYLOAD) — the same contract as the other safety-number
+    // helpers (fuzz-dp DP-3). Malformed STRING input returns a PARSE_ERROR /
+    // MISMATCH status object and never MATCHes.
+    for (const bad of [null, undefined] as unknown[]) {
+      assert.throws(
+        () => parseAndCompareQrPayload(bad as string, expectedHex),
+        (err: any) => err instanceof E2EEError && err.code === 'MALFORMED_PAYLOAD',
+        `QR parser must throw E2EEError for non-string input: ${JSON.stringify(bad)}`
+      );
+    }
+    for (const bad of ['', '   ', 'PQ-MPRBA-SAFETY-v1:', 'PQ-MPRBA-SAFETY-v1:0123456789ABCDEF'.repeat(4), 'PQ-MPRBA-SAFETY-v1:' + 'ab'.repeat(31), 'PQ-MPRBA-SAFETY-v1:' + 'ab'.repeat(33), 'pq-mprba-safety-v1:' + expectedHex] as unknown[]) {
       const res = parseAndCompareQrPayload(bad as string, expectedHex);
       assert.notEqual(res.status, 'MATCH', `QR payload must never MATCH: ${JSON.stringify(bad)?.slice(0, 60)}`);
       assert.ok(res.status === 'PARSE_ERROR' || res.status === 'MISMATCH');

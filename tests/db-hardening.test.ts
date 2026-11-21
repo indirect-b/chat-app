@@ -16,6 +16,7 @@ import {
   buildAppPolicySql,
   APP_TABLES,
   init,
+  PersistentFallbackDatabase,
 } from '../src/server/db';
 
 const EXPECTED_TABLES = [
@@ -169,5 +170,48 @@ describe('init() DDL tolerance', () => {
       !log.some((s) => s.includes('INSERT INTO settings')),
       log.join('\n')
     );
+  });
+});
+
+describe('session purge (DP-11, round 3)', () => {
+  it('deletes only expired sessions, keeps valid and never-expiring ones', async () => {
+    const db = new PersistentFallbackDatabase();
+    const expiredToken = 'purge-test-expired-' + Date.now();
+    const validToken = 'purge-test-valid-' + Date.now();
+    const noExpiryToken = 'purge-test-noexpiry-' + Date.now();
+    try {
+      await db.query('INSERT INTO sessions (token, username, expires_at) VALUES ($1, $2, $3)', [
+        expiredToken,
+        'alice',
+        new Date(Date.now() - 60_000).toISOString(),
+      ]);
+      await db.query('INSERT INTO sessions (token, username, expires_at) VALUES ($1, $2, $3)', [
+        validToken,
+        'alice',
+        new Date(Date.now() + 3_600_000).toISOString(),
+      ]);
+      // سشن بدون انقضا: expires_at خالی — باید بماند.
+      await db.query('INSERT INTO sessions (token, username, expires_at) VALUES ($1, $2, $3)', [
+        noExpiryToken,
+        'alice',
+        null,
+      ]);
+
+      await db.query('DELETE FROM sessions WHERE expires_at IS NOT NULL AND expires_at < NOW()');
+
+      const expired = await db.query('SELECT * FROM sessions WHERE token = $1', [expiredToken]);
+      assert.equal(expired.rows.length, 0, 'expired session must be purged');
+      const valid = await db.query('SELECT * FROM sessions WHERE token = $1', [validToken]);
+      assert.equal(valid.rows.length, 1, 'valid session must be kept');
+      const noExpiry = await db.query('SELECT * FROM sessions WHERE token = $1', [noExpiryToken]);
+      assert.equal(noExpiry.rows.length, 1, 'session without expiry must be kept');
+    } finally {
+      // پاک‌سازی ردیف‌های تست تا اسنپ‌شات دیسک آلوده نشود.
+      await db.query('DELETE FROM sessions WHERE token = $1', [expiredToken]);
+      await db.query('DELETE FROM sessions WHERE token = $1', [validToken]);
+      await db.query('DELETE FROM sessions WHERE token = $1', [noExpiryToken]);
+      // فرصت به debounce-write تا وضعیت پاک‌شده روی دیسک بنشیند.
+      await new Promise(resolve => setTimeout(resolve, 400));
+    }
   });
 });

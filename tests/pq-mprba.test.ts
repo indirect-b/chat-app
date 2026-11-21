@@ -31,16 +31,26 @@ import {
   zeroizeBuffer,
 } from '../src/utils/crypto';
 import {
+  disablePasswordProtection,
+  DURABLE_REPLAY_MAX_ENTRIES,
+  enablePasswordProtection,
+  IdentityLockedError,
   isDurableReplaySeen,
+  isIdentityUnlocked,
+  isPasswordProtectionEnabled,
   KEY_STORAGE_VERSION_MARKER,
   loadIdentityRecordV4,
+  lockIdentity,
   pinPeerIdentityKeyTOFU,
   getPinnedPeerIdentityKeyTOFU,
+  recordDurableReplaySeen,
+  unlockIdentityWithPassphrase,
   wrapRootKeyWithPassphrase,
   unwrapRootKeyWithPassphrase,
 } from '../src/utils/keystore';
 import {
   computeSafetyNumberForContact,
+  computeSafetyNumberForContactV2,
   computeSafetyNumberFromRawKeysV2,
   generateQrCodeMatrix,
   markContactVerified,
@@ -82,6 +92,18 @@ class MemoryStorage implements Storage {
 
 const mockLocalStorage = new MemoryStorage();
 const mockSessionStorage = new MemoryStorage();
+
+/** Stable public-key parts of a bundle (the ML-DSA signature is re-randomized on every call). */
+function publicPartsOfBundle(bundleStr: string): unknown {
+  const parsed = JSON.parse(bundleStr);
+  return {
+    v: parsed.v,
+    username: parsed.username,
+    ecdhJwk: parsed.ecdhJwk,
+    mlkemPubB64: parsed.mlkemPubB64,
+    mldsaPubB64: parsed.mldsaPubB64,
+  };
+}
 Object.defineProperty(globalThis, 'localStorage', {
   value: mockLocalStorage,
   configurable: true,
@@ -111,6 +133,9 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     assert.ok(record, 'IndexedDB v4 identity record must exist');
     assert.equal(record.v, 4);
     assert.equal(record.ecdhPrivateKey.extractable, false, 'ECDH private CryptoKey must be non-extractable');
+    // Unprotected record: wrapping key is present and non-extractable
+    // (protected records store null here — see the L8 test below).
+    assert.ok(record.wrappingKey, 'Unprotected record must store a wrapping key');
     assert.equal(record.wrappingKey.extractable, false, 'AES-GCM wrapping CryptoKey must be non-extractable');
 
     await assert.rejects(
@@ -837,6 +862,24 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     assert.equal(qrV1Match.status, 'MATCH');
   });
 
+  it('L2 (round 3): modal shows v2 by default and still accepts a v1 QR via fallback', async () => {
+    const bobBundleStr = (await ensureUserHybridKeyPair('bob'))!;
+    const aliceBundleStr = (await ensureUserHybridKeyPair('alice'))!;
+    const snV2 = computeSafetyNumberForContactV2('alice', bobBundleStr, 'bob');
+    const snV1 = computeSafetyNumberForContact('alice', bobBundleStr, 'bob');
+    assert.ok(snV2 && snV1);
+    assert.equal(snV2.version, 'v2');
+    assert.equal(snV1.version, 'v1');
+    assert.notEqual(snV2.sha256Hex, snV1.sha256Hex, 'v2 binds ML-KEM so the hash differs from v1');
+    // A v1 QR (old client) still MATCHes when the v1 hash is passed as fallback.
+    const v1Qr = `PQ-MPRBA-SAFETY-v1:${snV1.sha256Hex}`;
+    assert.equal(parseAndCompareQrPayload(v1Qr, snV2.sha256Hex, snV1.sha256Hex).status, 'MATCH');
+    // Without the fallback it would MISMATCH (the hashes differ).
+    assert.equal(parseAndCompareQrPayload(v1Qr, snV2.sha256Hex).status, 'MISMATCH');
+    // The v2 QR matches against the v2 hash directly.
+    assert.equal(parseAndCompareQrPayload(snV2.qrPayload, snV2.sha256Hex).status, 'MATCH');
+  });
+
   it('signs group epoch packets with distributor ML-DSA signature and validates signature integrity (H2)', async () => {
     const aliceBundleStr = (await ensureUserHybridKeyPair('alice'))!;
     const bobBundleStr = (await ensureUserHybridKeyPair('bob'))!;
@@ -931,6 +974,47 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     assert.equal(decV2.mldsaVerified, false);
   });
 
+  it('M3 (round 3): group send fails closed instead of silently falling back to unsigned v2', async () => {
+    const aliceBundleStr = (await ensureUserHybridKeyPair('alice'))!;
+    const bobBundleStr = (await ensureUserHybridKeyPair('bob'))!;
+    const aliceParsed = parsePeerKeyBundle(aliceBundleStr, 'alice');
+    const bobParsed = parsePeerKeyBundle(bobBundleStr, 'bob');
+    const members = ['alice', 'bob'];
+    const bundles = { alice: aliceParsed, bob: bobParsed };
+    const roomId = 'group__m3-failclosed';
+    const packet = await createGroupEpochPacket(bundles, 'alice', 1);
+    await rotateGroupEpoch('m3-failclosed', 1, members, packet.epochKeyB64);
+
+    // With a working identity the sender produces a signed v3 payload.
+    const v3Payload = await encryptMessageText('signed group broadcast', roomId, {
+      myUsername: 'alice',
+      groupMembers: members,
+    });
+    assert.ok(v3Payload.startsWith(E2EE_GROUP_EPOCH_V3_PREFIX));
+
+    // Lock alice's identity (L8 password protection): the same send must
+    // now throw IDENTITY_LOCKED — never silently emit an unsigned v2 payload.
+    await enablePasswordProtection('alice', 'SuperSecureUserPassphrase!2026');
+    lockIdentity('alice');
+    await assert.rejects(
+      () =>
+        encryptMessageText('must not send unsigned', roomId, {
+          myUsername: 'alice',
+          groupMembers: members,
+        }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'IDENTITY_LOCKED'
+    );
+
+    // Unlock again: signed sends work as before, same identity.
+    await unlockIdentityWithPassphrase('alice', 'SuperSecureUserPassphrase!2026');
+    const v3Again = await encryptMessageText('signed again after unlock', roomId, {
+      myUsername: 'alice',
+      groupMembers: members,
+    });
+    assert.ok(v3Again.startsWith(E2EE_GROUP_EPOCH_V3_PREFIX));
+    await disablePasswordProtection('alice', 'SuperSecureUserPassphrase!2026');
+  });
+
   it('persists ratchet and group replay protection tokens in durable store to prevent replay after memory reload (H3, M1)', async () => {
     const aliceBundleStr = (await ensureUserHybridKeyPair('alice'))!;
     const bobBundleStr = (await ensureUserHybridKeyPair('bob'))!;
@@ -1003,6 +1087,19 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     );
   });
 
+  it('bounds the durable replay store: oldest tokens are evicted past the cap (round 3)', async () => {
+    const roomId = 'alice__bob';
+    // 10,050 tokens — 50 past the 10,000 cap.
+    for (let i = 0; i < DURABLE_REPLAY_MAX_ENTRIES + 50; i++) {
+      await recordDurableReplaySeen(roomId, `cap_test_${i}`);
+    }
+    // The oldest 50 were evicted; the newest are kept.
+    assert.equal(await isDurableReplaySeen(roomId, 'cap_test_0'), false);
+    assert.equal(await isDurableReplaySeen(roomId, 'cap_test_49'), false);
+    assert.equal(await isDurableReplaySeen(roomId, 'cap_test_50'), true);
+    assert.equal(await isDurableReplaySeen(roomId, `cap_test_${DURABLE_REPLAY_MAX_ENTRIES + 49}`), true);
+  });
+
   it('implements TOFU peer identity key pinning in IndexedDB (M4)', async () => {
     resetAllCryptoStateForTests();
     const bobBundle1Str = (await ensureUserHybridKeyPair('bob-tofu'))!;
@@ -1032,26 +1129,101 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     assert.equal(changedObs.auditHistory[0].previousKeyB64, bobMldsa1B64);
   });
 
-  it('protects root wrapping key with opt-in user passphrase and PBKDF2 (L8)', async () => {
-    const rawKey = new Uint8Array(32);
-    globalThis.crypto.getRandomValues(rawKey);
+  it('M4 (round 3): explicit verification re-pins the TOFU key — no stuck CHANGED after a legitimate rotation', async () => {
+    resetAllCryptoStateForTests();
+    const bobBundle1Str = (await ensureUserHybridKeyPair('bob-tofu2'))!;
+    const parsed1 = parsePeerKeyBundle(bobBundle1Str, 'bob-tofu2');
+    const bobMldsa1B64 = bufToBase64(parsed1.mldsaPub);
 
+    // Pin the first-seen key.
+    const initialObs = observeContactPublicKey('alice-tofu2', 'bob-tofu2', bobBundle1Str);
+    assert.equal(initialObs.state, 'UNVERIFIED');
+
+    // Legitimate key rotation: fresh keys for the same username.
+    resetAllCryptoStateForTests();
+    const bobBundle2Str = (await ensureUserHybridKeyPair('bob-tofu2'))!;
+    const parsed2 = parsePeerKeyBundle(bobBundle2Str, 'bob-tofu2');
+    const bobMldsa2B64 = bufToBase64(parsed2.mldsaPub);
+    assert.notEqual(bobMldsa1B64, bobMldsa2B64, 'Keys must differ');
+
+    // Rotation is detected as CHANGED …
+    const changedObs = observeContactPublicKey('alice-tofu2', 'bob-tofu2', bobBundle2Str);
+    assert.equal(changedObs.state, 'CHANGED');
+
+    // … the user explicitly verifies the new key …
+    const verified = markContactVerified('alice-tofu2', 'bob-tofu2', bobBundle2Str);
+    assert.ok(verified);
+    assert.equal(verified.state, 'VERIFIED');
+    assert.equal(verified.verifiedMldsaPubB64, bobMldsa2B64);
+    const pinnedAfterVerify = await getPinnedPeerIdentityKeyTOFU('alice-tofu2', 'bob-tofu2');
+    assert.ok(pinnedAfterVerify, 'Pin must exist after verification');
+    assert.equal(pinnedAfterVerify.mldsaPubB64, bobMldsa2B64, 'Pin must move to the verified key');
+
+    // … and the next observation of the same (now verified) key must NOT
+    // re-flag CHANGED — the pre-round-3 defect was a stuck CHANGED forever.
+    const afterVerify = observeContactPublicKey('alice-tofu2', 'bob-tofu2', bobBundle2Str);
+    assert.equal(afterVerify.state, 'VERIFIED');
+  });
+
+  it('L8 (round 3): password protection lifecycle — enable → locked → unlock → disable', async () => {
     const passphrase = 'SuperSecureUserPassphrase!2026';
-    const blob = await wrapRootKeyWithPassphrase(rawKey, passphrase, 5000);
+    const bundleBefore = await ensureUserHybridKeyPair('alice');
+    assert.ok(bundleBefore);
 
-    assert.equal(blob.salt.length, 16);
-    assert.equal(blob.iv.length, 12);
-    assert.equal(blob.iterations, 5000);
-    assert.notDeepEqual(blob.wrappedKeyBytes, rawKey);
+    // Enable: record becomes protected, wrapping key is no longer stored.
+    await enablePasswordProtection('alice', passphrase);
+    assert.equal(await isPasswordProtectionEnabled('alice'), true);
+    const protectedRecord = await loadIdentityRecordV4('alice');
+    assert.ok(protectedRecord);
+    assert.equal(protectedRecord.passwordProtected, true);
+    assert.equal(protectedRecord.wrappingKey, null);
 
-    // Unwrapping with correct passphrase recovers original raw key bytes
-    const recovered = await unwrapRootKeyWithPassphrase(blob, passphrase);
-    assert.deepEqual(recovered, rawKey);
-
-    // Unwrapping with wrong passphrase fails closed (OperationError / tag mismatch)
+    // Enabling again is rejected.
     await assert.rejects(
-      () => unwrapRootKeyWithPassphrase(blob, 'WrongPassphrase!'),
-      (err: any) => err instanceof Error
+      () => enablePasswordProtection('alice', passphrase),
+      (err: unknown) => err instanceof Error && /already enabled/.test(err.message)
+    );
+
+    // Lock the session: crypto ops that need the private key now fail with IDENTITY_LOCKED.
+    lockIdentity('alice');
+    assert.equal(await isIdentityUnlocked('alice'), false);
+    await assert.rejects(
+      () => ensureUserHybridKeyPair('alice'),
+      (err: unknown) => err instanceof E2EEError && err.code === 'IDENTITY_LOCKED'
+    );
+
+    // Wrong passphrase stays locked.
+    await assert.rejects(
+      () => unlockIdentityWithPassphrase('alice', 'WrongPassphrase!'),
+      (err: unknown) => err instanceof IdentityLockedError
+    );
+    assert.equal(await isIdentityUnlocked('alice'), false);
+
+    // Correct passphrase unlocks: the same identity (same public keys) works again.
+    await unlockIdentityWithPassphrase('alice', passphrase);
+    assert.equal(await isIdentityUnlocked('alice'), true);
+    const bundleAfterUnlock = await ensureUserHybridKeyPair('alice');
+    // The bundle signature is re-randomized on every call, so compare the
+    // stable public-key components instead of the whole string.
+    assert.deepEqual(
+      publicPartsOfBundle(bundleAfterUnlock),
+      publicPartsOfBundle(bundleBefore),
+      'unlock must restore the same identity, not rotate it'
+    );
+
+    // Disable with the current passphrase: back to a plain stored wrapping key.
+    await disablePasswordProtection('alice', passphrase);
+    assert.equal(await isPasswordProtectionEnabled('alice'), false);
+    const plainRecord = await loadIdentityRecordV4('alice');
+    assert.ok(plainRecord);
+    assert.equal(plainRecord.passwordProtected, false);
+    assert.ok(plainRecord.wrappingKey);
+    assert.equal(plainRecord.wrappingKey!.extractable, false);
+    const bundleAfterDisable = await ensureUserHybridKeyPair('alice');
+    assert.deepEqual(
+      publicPartsOfBundle(bundleAfterDisable),
+      publicPartsOfBundle(bundleBefore),
+      'disable must keep the same identity'
     );
   });
 });

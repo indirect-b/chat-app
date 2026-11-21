@@ -4,6 +4,7 @@ import {
   SafetyNumberData,
   ContactVerificationRecord,
   computeSafetyNumberForContact,
+  computeSafetyNumberForContactV2,
   generateQrCodeMatrix,
   parseAndCompareQrPayload,
   compareSafetyNumberDigits,
@@ -57,7 +58,15 @@ export const SafetyNumberModal: React.FC<SafetyNumberModalProps> = ({
   const scanTimerRef = useRef<number | null>(null);
   const qrFileInputRef = useRef<HTMLInputElement | null>(null);
 
+  // L2 (round 3): the displayed safety number is v2 (binds ML-DSA-65 AND
+  // ML-KEM-768). v1 is kept only as a fallback when comparing a scanned QR
+  // code, so QR codes shown by older clients still verify.
   const safetyData: SafetyNumberData | null = useMemo(() => {
+    if (!open || !myUsername || !contactUsername) return null;
+    return computeSafetyNumberForContactV2(myUsername, peerPublicKey, contactUsername);
+  }, [open, myUsername, contactUsername, peerPublicKey]);
+
+  const safetyDataV1: SafetyNumberData | null = useMemo(() => {
     if (!open || !myUsername || !contactUsername) return null;
     return computeSafetyNumberForContact(myUsername, peerPublicKey, contactUsername);
   }, [open, myUsername, contactUsername, peerPublicKey]);
@@ -148,7 +157,17 @@ export const SafetyNumberModal: React.FC<SafetyNumberModalProps> = ({
       return;
     }
 
-    const res = parseAndCompareQrPayload(rawScanned, safetyData.sha256Hex);
+    // DP-14: parseAndCompareQrPayload throws E2EEError on non-string input
+    // (scanner yielding null/undefined) — map the throw to the tech-error
+    // state instead of crashing the modal.
+    let res;
+    try {
+      res = parseAndCompareQrPayload(rawScanned, safetyData.sha256Hex, safetyDataV1?.sha256Hex);
+    } catch {
+      setTechErrorDetail('کد QR خوانده نشد. دوباره تلاش کنید.');
+      setMode('SCAN_TECH_ERROR');
+      return;
+    }
     if (res.status === 'PARSE_ERROR') {
       setTechErrorDetail(res.errorReason || 'ساختار کد QR نامعتبر است.');
       setMode('SCAN_TECH_ERROR');

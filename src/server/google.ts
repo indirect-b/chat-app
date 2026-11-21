@@ -211,7 +211,14 @@ export function parseCookies(header: string | undefined): Record<string, string>
   header.split(';').forEach(cookie => {
     const parts = cookie.split('=');
     if (parts.length >= 2) {
-      list[parts[0].trim()] = decodeURIComponent(parts.slice(1).join('=').trim());
+      const rawValue = parts.slice(1).join('=').trim();
+      try {
+        list[parts[0].trim()] = decodeURIComponent(rawValue);
+      } catch {
+        // توالی % خراب در کوکی (مثلاً %ZZ) — مقدار خام را نگه دار تا یک
+        // کوکی بد، کل درخواست را خراب نکند.
+        list[parts[0].trim()] = rawValue;
+      }
     }
   });
   return list;

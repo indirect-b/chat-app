@@ -16,6 +16,7 @@ import {
   generateNonExtractableEcdhKeyPair,
   generateNonExtractableWrappingKey,
   getCachedPublicKeyMetadataV4,
+  getSessionWrappingKey,
   getWebCrypto,
   hasBrowserIndexedDB,
   isDurableReplaySeen,
@@ -48,6 +49,9 @@ const PBKDF2_ITERATIONS_NEW = 600000; // تعداد تکرار بر اساس ا�
 const PBKDF2_ITERATIONS_LEGACY = 50000; // مقدار پیشین؛ فقط برای رمزگشایی تاریخچه قدیمی
 const MAX_VERIFIED_BUNDLE_CACHE = 256;
 const MAX_SENT_PLAINTEXT_CACHE = 500;
+// کران‌های حافظهٔ Replay (راند ۳) — انبار دائم در keystore.ts کران خودش را دارد.
+const MAX_SEEN_RECV_STEPS = 10_000;
+const MAX_GROUP_SEEN_MESSAGE_KEYS = 10_000;
 const BASE64_REGEX = /^[A-Za-z0-9+/]*={0,2}$/;
 
 export type E2EEErrorCode =
@@ -60,7 +64,8 @@ export type E2EEErrorCode =
   | 'MALFORMED_PAYLOAD'
   | 'MISSING_KEYS'
   | 'MAX_SKIP_EXCEEDED'
-  | 'UNVERIFIED_PEER_KEY';
+  | 'UNVERIFIED_PEER_KEY'
+  | 'IDENTITY_LOCKED'; // L8: هویت با رمز عبور محافظت شده و در این نشست باز نشده است
 
 export class E2EEError extends Error {
   public readonly code: E2EEErrorCode;
@@ -293,6 +298,26 @@ export function getMyMLKEMPublicKey(myUsername: string): string | null {
   return meta?.mlkemPublicKeyB64 || null;
 }
 
+/**
+ * کلید پوششیِ لازم برای باز کردن رازهای ML-KEM/ML-DSA (L8): برای رکورد
+ * معمولی، کلید ذخیره‌شده؛ برای رکورد محافظت‌شده، فقط کلید بازشدهٔ نشست —
+ * وگرنه IDENTITY_LOCKED تا رابط کاربری از کاربر رمز عبور بخواهد.
+ */
+async function resolveWrappingKey(record: StoredIdentityRecordV4): Promise<CryptoKey> {
+  if (!record.passwordProtected) {
+    if (!record.wrappingKey) {
+      throw new E2EEError('MISSING_KEYS', 'Identity wrapping key is missing');
+    }
+    return record.wrappingKey;
+  }
+  const sessionKey = getSessionWrappingKey(record.username);
+  if (sessionKey) return sessionKey;
+  throw new E2EEError(
+    'IDENTITY_LOCKED',
+    'Identity key is protected by a password — unlock it to continue'
+  );
+}
+
 export async function withUnwrappedMLDSASecretKey<T>(
   myUsername: string,
   fn: (secretKey: Uint8Array) => Promise<T> | T
@@ -302,7 +327,7 @@ export async function withUnwrappedMLDSASecretKey<T>(
     throw new E2EEError('MISSING_KEYS', 'ML-DSA-65 identity key is not initialized in IndexedDB');
   }
   const secretKey = await unwrapSecretBytes(
-    record.wrappingKey,
+    await resolveWrappingKey(record),
     record.username,
     'ML-DSA-65',
     record.mldsaSecretWrapped
@@ -323,7 +348,7 @@ async function withUnwrappedMLKEMSecretKey<T>(
     throw new E2EEError('MISSING_KEYS', 'ML-KEM-768 decapsulation key is not initialized in IndexedDB');
   }
   const secretKey = await unwrapSecretBytes(
-    record.wrappingKey,
+    await resolveWrappingKey(record),
     record.username,
     'ML-KEM-768',
     record.mlkemSecretWrapped
@@ -407,6 +432,15 @@ export async function ensureUserHybridKeyPair(username: string): Promise<string>
 
       await saveIdentityRecordV4(newRecord);
       record = newRecord;
+    }
+
+    // L8: رکورد محافظت‌شده و نشست قفل است — پیش از هر کاری که به کلید
+    // خصوصی نیاز دارد، خطای مشخص بده تا رابط کاربری رمز عبور بخواهد.
+    if (record.passwordProtected && !getSessionWrappingKey(normUser)) {
+      throw new E2EEError(
+        'IDENTITY_LOCKED',
+        'Identity key is protected by a password — unlock it to continue'
+      );
     }
 
     // امضای محتوای باندل کلید توسط کلید خصوصی ML-DSA-65 هویت کاربر (از داخل IndexedDB)
@@ -781,41 +815,11 @@ async function deriveECDHSharedBits(
   }
 }
 
-async function deriveECDHSharedAesKey(
-  myUsername: string,
-  peerPublicKeyStr: string,
-  roomId: string,
-  peerUsername?: string
-): Promise<CryptoKey> {
-  const webCrypto = getWebCrypto();
-  const { ecdhJwk } = parsePeerKeyBundle(peerPublicKeyStr, undefined, { skipCache: true });
-  if (!ecdhJwk) {
-    throw new E2EEError('INVALID_BUNDLE', 'Peer ECDH public key is missing or invalid');
-  }
-  const bits = await deriveECDHSharedBits(myUsername, ecdhJwk);
-  try {
-    // خروجی خام ECDH مستقیم به‌عنوان کلید AES استفاده نمی‌شود؛ مشتق‌سازی با HKDF انجام می‌شود؛
-    // نخست از HKDF با salt شناسه اتاق و info وابسته به هویت مخاطب می‌گذرد،
-    // تا کلید هر اتاق جدا باشد.
-    const keyBytes = hkdf(
-      sha256,
-      bits,
-      new TextEncoder().encode(roomId),
-      new TextEncoder().encode(`ECDH-Legacy-AES-v2:${peerUsername || ''}`),
-      32
-    );
-    return await webCrypto.subtle.importKey(
-      'raw',
-      keyBytes as unknown as BufferSource,
-      { name: 'AES-GCM', length: 256 },
-      false,
-      ['encrypt', 'decrypt']
-    );
-  } finally {
-    zeroizeBuffer(bits);
-  }
-}
-
+// DP-15 (round 3) + L6: deriveECDHSharedAesKey was removed with the legacy
+// ECDH message path. L6's un-checked bundle parse
+// (parsePeerKeyBundle(peerPublicKeyStr, undefined, ...)) lived here; the
+// ECDH shared-bits helper below is kept — it is still used by the hybrid PQ
+// ratchet (ECDH component) and by legacy kind-1 file decryption.
 function getRatchetMapKey(myUsername: string, roomId: string): string {
   return `${normalizeKeystoreUsername(myUsername)}::${roomId}`;
 }
@@ -1187,6 +1191,18 @@ async function ratchetDecryptWithSkippedKeys(
     }
 
     state.seenRecvSteps.add(msgStep);
+    // کران حافظه (راند ۳): قدم‌های دیده‌شدهٔ یک نشست بدون کران رشد
+    // می‌کردند. قدیمی‌ترین‌ها حذف می‌شوند — راتچت چرخیده و پیام‌های قدیمی
+    // دیگر رمزگشایی نمی‌شوند؛ انبار دائم (TTL ۳۰ روز) پشتیبان است.
+    if (state.seenRecvSteps.size > MAX_SEEN_RECV_STEPS) {
+      const excess = state.seenRecvSteps.size - MAX_SEEN_RECV_STEPS;
+      let removed = 0;
+      for (const oldStep of state.seenRecvSteps) {
+        if (removed >= excess) break;
+        state.seenRecvSteps.delete(oldStep);
+        removed++;
+      }
+    }
     if (roomId) {
       await recordDurableReplaySeen(roomId, replayToken);
     }
@@ -1450,6 +1466,18 @@ export function getGroupEpochState(groupId: string, members: string[] = []): Gro
  * چرخش اتمیک اپوک گروه (Atomic Group Epoch Rotation) هنگام تغییر اعضا
  * نگه‌داشتن کلیدهای ۳ اپوک قبلی در Grace Buffer در RAM و Zeroization اپوک‌های خارج‌شده
  */
+/**
+ * چرخش اپوک گروهی.
+ *
+ * L1 — عمداً اصلاح نشده (STOPPED، راند ۳): این تابع بازگشت اپوک به عدد
+ * کوچک‌تر را رد نمی‌کند (بدون بررسی یکنواختی). تست C5 در
+ * tests/adversarial.test.ts:336 این رفتار را پین کرده است (چرخش ۵→۲ پذیرفته
+ * می‌شود)، چون در عملِ فعلی، یک عضو که مدتی آفلاین بوده ممکن است بستهٔ
+ * اپوک قدیمی را دیر دریافت کند و رد کردن آن، همگام‌سازی گروه را می‌شکند.
+ * اصلاح واقعی نیازمند تصمیم طراحی (مثلاً پنجرهٔ عقب‌گرد مجاز + امضای
+ * توزیع‌کنندهٔ اپوک) است، نه یک بررسی ساده؛ تا آن تصمیم گرفته نشود، L1
+ * هفتمین مورد متوقف‌شده محسوب می‌شود.
+ */
 export async function rotateGroupEpoch(
   groupId: string,
   newEpoch: number,
@@ -1630,8 +1658,14 @@ export async function encryptMessageText(
               bufToBase64(ml_dsa65.sign(signTarget, sec))
             );
             payload = `${E2EE_GROUP_EPOCH_V3_PREFIX}${fsm.currentEpoch}:${epochRec.membersHash}:${ivB64}:${cipherB64}:${sigB64}`;
-          } catch {
-            payload = `${E2EE_GROUP_EPOCH_PREFIX}${fsm.currentEpoch}:${epochRec.membersHash}:${bufToBase64(iv)}:${bufToBase64(cipherBuffer)}`;
+          } catch (err) {
+            // M3 (راند ۳): دیگر به‌صورت خاموش به قالب بدون امضای v2
+            // برنمی‌گردیم — پیامی که باید امضا شود و امضا نمی‌شود، ارسال
+            // نمی‌شود. خطای E2EEError (مثلاً IDENTITY_LOCKED وقتی هویت با
+            // رمز عبور قفل است) دست‌نخورده بالا می‌رود تا رابط کاربری
+            // واکنش مناسب نشان دهد (پنجرهٔ باز کردن رمز عبور).
+            if (err instanceof E2EEError) throw err;
+            throw new E2EEError('ENCRYPTION_FAILED', 'Group message signing failed');
           }
         } else {
           payload = `${E2EE_GROUP_EPOCH_PREFIX}${fsm.currentEpoch}:${epochRec.membersHash}:${bufToBase64(iv)}:${bufToBase64(cipherBuffer)}`;
@@ -1737,20 +1771,11 @@ export async function encryptMessageText(
         return payload;
       }
 
-      // تنزل صریح (نه خاموش) به ECDH کلاسیک فقط در صورت وجود کلید معتبر ECDH بدون کلید پساکوانتومی
-      if (peerBundle.ecdhJwk && !peerBundle.hasMLKEM && !peerBundle.hasMLDSA) {
-        const ecdhKey = await deriveECDHSharedAesKey(options.myUsername, options.peerPublicKey, roomId, options.peerUsername);
-        const cipherBuffer = await webCrypto.subtle.encrypt(
-          { name: 'AES-GCM', iv },
-          ecdhKey,
-          encoded
-        );
-        const payload = `${E2EE_ECDH_PREFIX}${bufToBase64(iv)}:${bufToBase64(cipherBuffer)}`;
-        const payloadHashKey = bufToBase64(sha256(new TextEncoder().encode(payload))).slice(0, 24);
-        saveSentPlaintextInMemory(options.myUsername, roomId, payloadHashKey, plainText);
-        return payload;
-      }
-
+      // DP-15 (round 3): the legacy ECDH message path was REMOVED — with the
+      // app's parameterization it could never be decrypted by the receiver
+      // (HKDF info bound the role-dependent name), so producing e2ee:ecdh:
+      // payloads only created undecryptable messages. A peer with only a
+      // classical ECDH key and no PQ material is now rejected fail-closed.
       throw new E2EEError('INVALID_BUNDLE', 'Peer public key bundle is invalid or incomplete');
     }
 
@@ -1803,7 +1828,7 @@ export async function decryptMessageText(
 ): Promise<{
   text: string;
   isEncrypted: boolean;
-  mode?: 'PQ-MLKEM-RATCHET' | 'GROUP-EPOCH-FSM' | 'ECDH' | 'PBKDF2';
+  mode?: 'PQ-MLKEM-RATCHET' | 'GROUP-EPOCH-FSM' | 'PBKDF2';
   epoch?: number;
   ratchetStep?: number;
   mldsaVerified?: boolean;
@@ -2070,6 +2095,14 @@ export async function decryptMessageText(
       seenSet.add(payloadHashKey);
       if (!epochRec.seenMessageKeys) epochRec.seenMessageKeys = [];
       epochRec.seenMessageKeys.push(payloadHashKey);
+      // کران حافظه (راند ۳): در یک اپوکِ بسیار پرپیام، فقط ۱۰٬۰۰۰ پیام اخیر
+      // در RAM نگه داشته می‌شوند؛ قدیمی‌ترها همچنان در انبار دائم (TTL ۳۰
+      // روز) بررسی می‌شوند.
+      if (epochRec.seenMessageKeys.length > MAX_GROUP_SEEN_MESSAGE_KEYS) {
+        const excess = epochRec.seenMessageKeys.length - MAX_GROUP_SEEN_MESSAGE_KEYS;
+        const removedKeys = epochRec.seenMessageKeys.splice(0, excess);
+        for (const oldKey of removedKeys) seenSet.delete(oldKey);
+      }
       await recordDurableReplaySeen(roomId, `group_msg_${msgEpoch}_${payloadHashKey}`);
       return {
         text: plainText,
@@ -2086,9 +2119,16 @@ export async function decryptMessageText(
     }
   }
 
-  // ۳. پیام‌های ECDH و PBKDF2
-  const isEcdh = payload.startsWith(E2EE_ECDH_PREFIX);
-  const raw = payload.slice(isEcdh ? E2EE_ECDH_PREFIX.length : E2EE_V1_PREFIX.length);
+  // ۳. پیام‌های PBKDF2 (رمز دستی). مسیر پیام ECDH قدیمی (e2ee:ecdh:) در
+  // راند ۳ حذف شد (DP-15) — چنین باری صریحاً رد می‌شود و هرگز به مسیر
+  // PBKDF2 نمی‌افتد یا به‌عنوان متن ساده نمایش داده نمی‌شود.
+  if (payload.startsWith(E2EE_ECDH_PREFIX)) {
+    throw new E2EEError(
+      'MALFORMED_PAYLOAD',
+      'Legacy ECDH message path was removed (DP-15): this message cannot be decrypted'
+    );
+  }
+  const raw = payload.slice(E2EE_V1_PREFIX.length);
   const parts = raw.split(':');
   if (parts.length !== 2 || !parts[0] || !parts[1]) {
     throw new E2EEError('MALFORMED_PAYLOAD', 'Malformed legacy E2EE packet');
@@ -2101,30 +2141,6 @@ export async function decryptMessageText(
   const cipherBytes = base64ToBuf(parts[1]);
   if (cipherBytes.byteLength < 16) {
     throw new E2EEError('MALFORMED_PAYLOAD', 'Ciphertext too short in legacy packet');
-  }
-
-  if (isEcdh) {
-    if (!options?.myUsername || !effectivePeerKey) {
-      throw new E2EEError('MISSING_KEYS', 'Missing keys for ECDH decryption');
-    }
-    try {
-      const ecdhKey = await deriveECDHSharedAesKey(options.myUsername, effectivePeerKey, roomId, options.peerUsername);
-      const decryptedBuffer = await webCrypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: iv as unknown as BufferSource },
-        ecdhKey,
-        cipherBytes as unknown as BufferSource
-      );
-      const text = new TextDecoder('utf-8', { fatal: true }).decode(decryptedBuffer);
-      return {
-        text,
-        isEncrypted: true,
-        mode: 'ECDH',
-        failed: false,
-      };
-    } catch (err) {
-      if (err instanceof E2EEError) throw err;
-      throw new E2EEError('DECRYPTION_FAILED', 'ECDH AES-GCM decryption failed');
-    }
   }
 
   const manualSecret = options?.customSecret ?? getRoomSecret(roomId);
@@ -2166,21 +2182,29 @@ export async function decryptMessageText(
 //   - اتاق گروهی: کلید ریشهٔ اپوک جاری (همان کلیدی که پیام‌های گروهی با آن
 //     رمز می‌شوند). شمارهٔ اپوک در سربرگ فایل ذخیره می‌شود تا گیرنده کلید
 //     همان اپوک را از Grace Buffer بردارد (مثل پیام‌های گروهی).
-//   - چت خصوصی: بیت‌های مشترک ECDH P-256 (قطعی و پایدار تا وقتی کلید هویت
-//     عوض نشده) با HKDF و info جدا. توجه صادقانه: این کلید از ECDH کلاسیک
-//     مشتق می‌شود، نه از ML-KEM — چون کلید ریشهٔ راتچت PQ پس از هر چرخش
-//     (۵۰ پیام) صفر می‌شود و نگه داشته نمی‌شود، پس نمی‌تواند کلید پایدار فایل
-//     باشد. سرور هرگز این کلید را نمی‌بیند.
+//   - چت خصوصی: هر فایل یک کلید تازهٔ تصادفی ۳۲ بایتی دارد که با ML-KEM-768
+//     به کلید عمومی گیرنده و به کلید عمومی خود فرستنده کپسوله می‌شود (M10،
+//     راند ۳) و هر دو کپسول + کلید پیچیده‌شده در سربرگ PQF1 ذخیره می‌شوند؛
+//     پس هم گیرنده و هم فرستنده می‌توانند فایل را باز کنند، بدون اینکه کلید
+//     پایدار کلاسیک ECDH در کار باشد. فایل‌های قدیمی kind=1 هنوز با مسیر
+//     ECDH باز می‌شوند (سازگاری با عقب).
 //   - رمز دستی: PBKDF2 با salt جداگانه (purpose='file-v1')، جدا از کلید پیام.
-// قالب باینری فایل رمز شده: 'PQF1' (۴ بایت) + kind (۱ بایت: 1=DM-ECDH،
-// 2=group-epoch، 3=manual) + epoch (۴ بایت BE، فقط گروهی) + iv (۱۲ بایت) +
-// ciphertext با AES-256-GCM (شامل ۱۶ بایت auth tag).
+// قالب باینری فایل رمز شده: 'PQF1' (۴ بایت) + kind (۱ بایت: 1=DM-ECDH قدیمی،
+// 2=group-epoch، 3=manual، 4=DM-MLKEM) + epoch (۴ بایت BE، فقط گروهی) +
+// iv (۱۲ بایت) + [فقط kind=4: ctPeer (۱۰۸۸ بایت) + wrapPeer (۳۲ بایت) +
+// ctSelf (۱۰۸۸ بایت) + wrapSelf (۳۲ بایت)] + ciphertext با AES-256-GCM
+// (شامل ۱۶ بایت auth tag).
 
 export const FILE_ENCRYPTION_MAGIC = 'PQF1';
 export const FILE_ENCRYPTION_KIND_DM = 1;
 export const FILE_ENCRYPTION_KIND_GROUP = 2;
 export const FILE_ENCRYPTION_KIND_MANUAL = 3;
+export const FILE_ENCRYPTION_KIND_DM_MLKEM = 4;
 const FILE_ENCRYPTION_HEADER_LEN = 21;
+// سربرگ kind=4: ۲۱ بایت پایه + ۲×(۱۰۸۸ بایت کپسول ML-KEM-768 + ۳۲ بایت
+// کلید پیچیده‌شده با XOR).
+const FILE_ENCRYPTION_HEADER_LEN_DM_MLKEM =
+  FILE_ENCRYPTION_HEADER_LEN + 2 * (ml_kem768.lengths.cipherText + 32);
 
 export interface FileEncryptionOptions {
   myUsername?: string;
@@ -2240,7 +2264,10 @@ async function getRoomFileKey(
     }
   }
 
-  // ۳. چت خصوصی: بیت‌های مشترک ECDH (پایدار، بدون دست‌زدن به راتچت).
+  // ۳. چت خصوصی (فقط رمزگشایی فایل‌های قدیمی kind=1): بیت‌های مشترک ECDH.
+  // رمزنگاری فایل‌های جدید DM دیگر از این مسیر استفاده نمی‌کند — کلید
+  // تازهٔ هر فایل با ML-KEM-768 کپسوله می‌شود (M10، kind=4). این شاخه فقط
+  // برای باز کردن فایل‌های ساخته‌شده پیش از M10 نگه داشته شده است.
   if (!options?.myUsername || !options?.peerPublicKey) {
     throw new E2EEError(
       'MISSING_KEYS',
@@ -2271,6 +2298,184 @@ async function getRoomFileKey(
   }
 }
 
+/**
+ * پیچیدن کلید فایل با راز مشترک ML-KEM (KEM-DEM با XOR و HKDF) — M10.
+ * کلید فایل تصادفی است و برچسب اصالت ciphertext نهایی AES-GCM، درستی کلید
+ * بازیابی‌شده را تضمین می‌کند؛ پس پیچیدن با XOR برای محرمانگی کلید کافی است.
+ */
+function wrapFileKeyWithKemSecret(
+  fileKey: Uint8Array,
+  kemSharedSecret: Uint8Array,
+  roomId: string
+): Uint8Array {
+  const stream = hkdf(
+    sha256,
+    kemSharedSecret,
+    new TextEncoder().encode(roomId),
+    new TextEncoder().encode('PQ-MPRBA-file-wrap-v1'),
+    32
+  );
+  const wrapped = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) {
+    wrapped[i] = (fileKey[i] ?? 0) ^ (stream[i] ?? 0);
+  }
+  zeroizeBuffer(stream);
+  return wrapped;
+}
+
+/** رمزنگاری فایل DM با کلید تازهٔ هر فایل کپسوله‌شده با ML-KEM-768 (M10). */
+async function encryptDmFileBytesMlkem(
+  data: Uint8Array,
+  roomId: string,
+  options?: FileEncryptionOptions
+): Promise<Uint8Array> {
+  const webCrypto = getWebCrypto();
+  if (!options?.myUsername || !options?.peerPublicKey) {
+    throw new E2EEError(
+      'MISSING_KEYS',
+      'No room key available for file encryption: peer public key is missing'
+    );
+  }
+  const peerBundle = parsePeerKeyBundle(options.peerPublicKey, options.peerUsername, { skipCache: true });
+  if (!peerBundle.mlkemPub) {
+    throw new E2EEError('INVALID_BUNDLE', 'Peer ML-KEM-768 public key is missing or invalid');
+  }
+  const myMlkemPubB64 = getMyMLKEMPublicKey(options.myUsername);
+  if (!myMlkemPubB64) {
+    throw new E2EEError('MISSING_KEYS', 'Own ML-KEM-768 public key is unavailable');
+  }
+  let myMlkemPub: Uint8Array;
+  try {
+    myMlkemPub = base64ToBuf(myMlkemPubB64);
+  } catch {
+    throw new E2EEError('MISSING_KEYS', 'Own ML-KEM-768 public key is unavailable');
+  }
+  if (myMlkemPub.byteLength !== ml_kem768.lengths.publicKey) {
+    throw new E2EEError('MISSING_KEYS', 'Own ML-KEM-768 public key is unavailable');
+  }
+
+  const fileKey = webCrypto.getRandomValues(new Uint8Array(32));
+  const iv = webCrypto.getRandomValues(new Uint8Array(12));
+  let aesKey: CryptoKey;
+  let ctPeer: Uint8Array;
+  let wrapPeer: Uint8Array;
+  let ctSelf: Uint8Array;
+  let wrapSelf: Uint8Array;
+  try {
+    // کلید فایل به کلید عمومی گیرنده و به کلید عمومی خود فرستنده کپسوله
+    // می‌شود تا هر دو طرف بتوانند فایل را باز کنند.
+    const encPeer = ml_kem768.encapsulate(peerBundle.mlkemPub);
+    const encSelf = ml_kem768.encapsulate(myMlkemPub);
+    ctPeer = encPeer.cipherText;
+    ctSelf = encSelf.cipherText;
+    wrapPeer = wrapFileKeyWithKemSecret(fileKey, encPeer.sharedSecret, roomId);
+    wrapSelf = wrapFileKeyWithKemSecret(fileKey, encSelf.sharedSecret, roomId);
+    zeroizeBuffer(encPeer.sharedSecret);
+    zeroizeBuffer(encSelf.sharedSecret);
+    aesKey = await webCrypto.subtle.importKey(
+      'raw',
+      fileKey as unknown as BufferSource,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt']
+    );
+  } finally {
+    zeroizeBuffer(fileKey);
+  }
+  const cipherBuffer = await webCrypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    aesKey,
+    data as unknown as BufferSource
+  );
+  const out = new Uint8Array(FILE_ENCRYPTION_HEADER_LEN_DM_MLKEM + cipherBuffer.byteLength);
+  out.set(new TextEncoder().encode(FILE_ENCRYPTION_MAGIC), 0);
+  out[4] = FILE_ENCRYPTION_KIND_DM_MLKEM;
+  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  view.setUint32(5, 0, false);
+  out.set(iv, 9);
+  let off = FILE_ENCRYPTION_HEADER_LEN;
+  out.set(ctPeer, off);
+  off += ctPeer.byteLength;
+  out.set(wrapPeer, off);
+  off += wrapPeer.byteLength;
+  out.set(ctSelf, off);
+  off += ctSelf.byteLength;
+  out.set(wrapSelf, off);
+  off += wrapSelf.byteLength;
+  out.set(new Uint8Array(cipherBuffer), off);
+  return out;
+}
+
+/**
+ * باز کردن فایل DM kind=4: هر دو کپسول را با کلید خصوصی ML-KEM خود امتحان
+ * می‌کند (یکی برای گیرنده، یکی برای فرستنده)؛ برچسب اصالت AES-GCM مشخص
+ * می‌کند کدام کلید درست است. کپسول اشتباه راز مشترکِ تصادفی‌نما می‌دهد و
+ * رمزگشایی AES-GCM آن رد می‌شود.
+ */
+async function decryptDmFileBytesMlkem(
+  data: Uint8Array,
+  roomId: string,
+  options?: FileEncryptionOptions
+): Promise<Uint8Array> {
+  const webCrypto = getWebCrypto();
+  if (data.length < FILE_ENCRYPTION_HEADER_LEN_DM_MLKEM) {
+    throw new E2EEError('MALFORMED_PAYLOAD', 'Truncated ML-KEM file header');
+  }
+  if (!options?.myUsername) {
+    throw new E2EEError('MISSING_KEYS', 'Username is required to open an ML-KEM-encrypted file');
+  }
+  const iv = data.slice(9, FILE_ENCRYPTION_HEADER_LEN);
+  const ctLen = ml_kem768.lengths.cipherText;
+  let off = FILE_ENCRYPTION_HEADER_LEN;
+  const ctPeer = data.slice(off, off + ctLen);
+  off += ctLen;
+  const wrapPeer = data.slice(off, off + 32);
+  off += 32;
+  const ctSelf = data.slice(off, off + ctLen);
+  off += ctLen;
+  const wrapSelf = data.slice(off, off + 32);
+  off += 32;
+  const cipherBytes = data.slice(off);
+
+  const attempts: Array<[Uint8Array, Uint8Array]> = [
+    [ctPeer, wrapPeer],
+    [ctSelf, wrapSelf],
+  ];
+  for (const [ct, wrap] of attempts) {
+    try {
+      const fileKey = await withUnwrappedMLKEMSecretKey(options.myUsername, mySecretKey => {
+        const shared = ml_kem768.decapsulate(ct, mySecretKey);
+        try {
+          return wrapFileKeyWithKemSecret(wrap, shared, roomId);
+        } finally {
+          zeroizeBuffer(shared);
+        }
+      });
+      try {
+        const aesKey = await webCrypto.subtle.importKey(
+          'raw',
+          fileKey as unknown as BufferSource,
+          { name: 'AES-GCM', length: 256 },
+          false,
+          ['decrypt']
+        );
+        const plainBuffer = await webCrypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: iv as unknown as BufferSource },
+          aesKey,
+          cipherBytes as unknown as BufferSource
+        );
+        return new Uint8Array(plainBuffer);
+      } finally {
+        zeroizeBuffer(fileKey);
+      }
+    } catch (err) {
+      if (err instanceof E2EEError && err.code === 'MISSING_KEYS') throw err;
+      // کپسول اشتباه یا کلید نادرست — کپسول دیگر را امتحان کن.
+    }
+  }
+  throw new E2EEError('DECRYPTION_FAILED', 'File AES-GCM authentication or decryption failed');
+}
+
 /** رمزنگاری بایت‌های خام فایل با کلید پایدار اتاق. بدون کلید اتاق، Fail-Closed (پرتاب E2EEError، هرگز بایت ساده برنمی‌گردد). */
 export async function encryptFileBytes(
   data: Uint8Array,
@@ -2278,6 +2483,11 @@ export async function encryptFileBytes(
   options?: FileEncryptionOptions
 ): Promise<Uint8Array> {
   const webCrypto = getWebCrypto();
+  // چت خصوصی بدون رمز دستی: کلید تازهٔ هر فایل با ML-KEM-768 (M10، kind=4).
+  const manualSecret = options?.customSecret ?? getRoomSecret(roomId);
+  if (!manualSecret && !roomId.startsWith('group__')) {
+    return encryptDmFileBytesMlkem(data, roomId, options);
+  }
   const { key, kind, epoch } = await getRoomFileKey(roomId, options);
   const iv = webCrypto.getRandomValues(new Uint8Array(12));
   const cipherBuffer = await webCrypto.subtle.encrypt(
@@ -2309,6 +2519,12 @@ export async function decryptFileBytes(
   const epoch = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(5, false);
   const iv = data.slice(9, FILE_ENCRYPTION_HEADER_LEN);
   const cipherBytes = data.slice(FILE_ENCRYPTION_HEADER_LEN);
+
+  // kind=4: کلید تازهٔ هر فایل با ML-KEM-768 (M10) — هر دو کپسول امتحان
+  // می‌شوند و مستقیم برمی‌گردد.
+  if (kind === FILE_ENCRYPTION_KIND_DM_MLKEM) {
+    return decryptDmFileBytesMlkem(data, roomId, options);
+  }
 
   let key: CryptoKey;
   if (kind === FILE_ENCRYPTION_KIND_GROUP) {

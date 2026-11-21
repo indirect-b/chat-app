@@ -265,6 +265,18 @@ export class PersistentFallbackDatabase {
       this.scheduleSave();
       return { rows: [] };
     }
+    if (lower.startsWith('delete from sessions where expires_at')) {
+      // پاک‌سازی سشن‌های منقضی (DP-11، راند ۳): سطرهایی که expires_at آن‌ها
+      // گذشته است حذف می‌شوند؛ سشن‌های بدون انقضا دست نمی‌خورند.
+      const now = Date.now();
+      for (const [t, s] of Array.from(this.sessions.entries())) {
+        if (s.expires_at && new Date(s.expires_at).getTime() < now) {
+          this.sessions.delete(t);
+        }
+      }
+      this.scheduleSave();
+      return { rows: [] };
+    }
     if (lower.startsWith('delete from sessions where username = $1')) {
       for (const [t, s] of Array.from(this.sessions.entries())) {
         if (s.username === params[0]) this.sessions.delete(t);

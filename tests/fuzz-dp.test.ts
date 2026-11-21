@@ -8,7 +8,7 @@
  *   - ML-KEM-768 decapsulation / ML-DSA-65 verification (raw noble primitives)
  *   - key-bundle parsing (lenient parsePeerKeyBundle + strict parsePeerKeyBundleStrict)
  *   - decryptMessageText: PQ ratchet (e2ee:pq:v2:), group epoch (e2ee:gep:v2:),
- *     ECDH (e2ee:ecdh:) and PBKDF2 (e2ee:v1:) paths
+ *     removed ECDH prefix (e2ee:ecdh: — rejected, DP-15) and PBKDF2 (e2ee:v1:) paths
  *   - group epoch packets (create/decapsulate/rotate)
  *   - PQF1 file payloads (decryptFileBytes, kinds DM/group/manual)
  *   - safety-number parsers (QR payload, 60-digit compare, hex->digits)
@@ -584,33 +584,32 @@ describe('DP deepening-1 — coverage-guided fuzzing (setup)', () => {
     assert.equal(SN.parseAndCompareQrPayload(`PQ-MPRBA-SAFETY-v1:${'ab'.repeat(32)}`, 'ab'.repeat(32)).status, 'MATCH');
   });
 
-  // -- DP-4 REGRESSION: ECDH legacy messages can never be decrypted with the
-  // app's parameterization — deriveECDHSharedAesKey binds the HKDF info to
-  // `peerUsername`, and the two sides pass DIFFERENT names (encrypt: the
-  // recipient's name; decrypt: the sender's name). --
-  it('DP-4 REGRESSION: ECDH legacy decrypt fails with the app\'s parameterization (peerUsername asymmetry in HKDF info)', async () => {
+  // -- DP-4 REGRESSION (fixed by DP-15, round 3): the legacy ECDH message
+  // path was REMOVED. Encrypting to a bare ECDH-only peer is now rejected
+  // fail-closed (no undecryptable e2ee:ecdh: payload is ever produced), and
+  // any e2ee:ecdh: payload is rejected on decrypt. --
+  it('DP-4 REGRESSION (fixed by DP-15): ECDH-only peers are rejected fail-closed; e2ee:ecdh: payloads are rejected on decrypt', async () => {
     await refreshFixtures();
     const bobJwk = JSON.stringify(JSON.parse(bobBundle).ecdhJwk);
     const aliceJwk = JSON.stringify(JSON.parse(aliceBundle).ecdhJwk);
-    // Encrypt as alice (the app's call: peerUsername = recipient 'bob').
-    const enc = await C.encryptMessageText('DP4-ECDH-SECRET', ROOM_DM, {
-      myUsername: 'alice', peerUsername: 'bob', peerPublicKey: bobJwk,
-    });
-    assert.ok(enc.startsWith('e2ee:ecdh:'));
-    // Decrypt as bob with the APP's parameterization (peerUsername = sender 'alice'):
-    // the HKDF info differs ('...:alice' vs '...:bob'), so the recipient can
-    // NEVER decrypt an ECDH message (this IS the finding).
+    // Encrypt as alice to a bare ECDH-only peer: rejected, no payload produced.
     await assert.rejects(
-      () => C.decryptMessageText(enc, ROOM_DM, { myUsername: 'bob', peerUsername: 'alice', peerPublicKey: aliceJwk, sender: 'alice' }),
-      (err: any) => err instanceof C.E2EEError && err.code === 'DECRYPTION_FAILED',
+      () => C.encryptMessageText('DP4-ECDH-SECRET', ROOM_DM, {
+        myUsername: 'alice', peerUsername: 'bob', peerPublicKey: bobJwk,
+      }),
+      (err: any) => err instanceof C.E2EEError && err.code === 'INVALID_BUNDLE',
     );
-    // Controls: a symmetric parameterization decrypts, and the sender
-    // re-reads their own message fine — so the sender gets no signal.
-    const ok = await C.decryptMessageText(enc, ROOM_DM, { myUsername: 'bob', peerUsername: 'bob', peerPublicKey: aliceJwk, sender: 'alice' });
-    assert.equal(ok.text, 'DP4-ECDH-SECRET');
-    assert.equal(ok.mode, 'ECDH');
-    const self = await C.decryptMessageText(enc, ROOM_DM, { myUsername: 'alice', peerUsername: 'bob', peerPublicKey: bobJwk, sender: 'alice' });
-    assert.equal(self.text, 'DP4-ECDH-SECRET');
+    // A well-formed-looking legacy payload is rejected on decrypt.
+    const legacyPayload = `e2ee:ecdh:${Buffer.from(new Uint8Array(12)).toString('base64')}:${Buffer.from(new Uint8Array(32)).toString('base64')}`;
+    await assert.rejects(
+      () => C.decryptMessageText(legacyPayload, ROOM_DM, { myUsername: 'bob', peerUsername: 'alice', peerPublicKey: aliceJwk, sender: 'alice' }),
+      (err: any) => err instanceof C.E2EEError && err.code === 'MALFORMED_PAYLOAD',
+    );
+    // And without any peer key at all.
+    await assert.rejects(
+      () => C.decryptMessageText(legacyPayload, ROOM_DM, { myUsername: 'bob' }),
+      (err: any) => err instanceof C.E2EEError,
+    );
   });
 });
 
@@ -748,28 +747,19 @@ describe('DP campaigns — decryptMessageText (PQ ratchet / group epoch / ECDH /
     });
   });
 
-  it('C3: coverage-guided fuzz of ECDH + PBKDF2 legacy paths', { timeout: 300_000 }, async () => {
+  it('C3: coverage-guided fuzz of the removed ECDH path + PBKDF2 legacy path', { timeout: 300_000 }, async () => {
     await refreshFixtures();
-    // ECDH seed: encrypt to a bare ECDH-only JWK (no PQ material) -> e2ee:ecdh: payload.
-    const bobJwk = JSON.stringify(JSON.parse(bobBundle).ecdhJwk);
+    // DP-15 (round 3): the ECDH message path was removed — there is no valid
+    // ECDH seed anymore. The campaign feeds a static well-formed-looking
+    // e2ee:ecdh: string and mutations of it, and asserts EVERY input throws
+    // E2EEError (never decrypts, never returns plaintext).
     const aliceJwk = JSON.stringify(JSON.parse(aliceBundle).ecdhJwk);
-    const ecdhSeed = await C.encryptMessageText('DP-FUZZ-ECDH-SECRET', ROOM_DM, {
-      myUsername: 'alice', peerUsername: 'bob', peerPublicKey: bobJwk,
-    });
-    assert.ok(ecdhSeed.startsWith('e2ee:ecdh:'), 'ECDH seed must use the ecdh prefix');
+    const ecdhSeed = `e2ee:ecdh:${Buffer.from(new Uint8Array(12)).toString('base64')}:${Buffer.from(new Uint8Array(48)).toString('base64')}`;
     const pbkdfSeed = await C.encryptMessageText('DP-FUZZ-PBKDF2-SECRET', ROOM_DM, { customSecret: 'correct horse battery staple' });
     assert.ok(pbkdfSeed.startsWith('e2ee:v1:'), 'PBKDF2 seed must use the v1 prefix');
 
-    // Decrypt-side peer key is ALICE's JWK (bob derives ECDH(bobPriv, alicePub)).
-    // NOTE (DP-4): the APP decrypts with peerUsername = the sender ('alice'),
-    // but the encryptor used peerUsername = the recipient ('bob'), and the
-    // HKDF info binds that name — so with the app's parameterization the
-    // recipient can NEVER decrypt. The campaign therefore decrypts with the
-    // SYMMETRIC parameterization (peerUsername='bob', matching encrypt) so the
-    // ECDH decrypt path is actually exercised; DP-4 is covered by its own
-    // regression test with the app's parameterization.
     const ecdhOpts = { myUsername: 'bob', peerUsername: 'bob', peerPublicKey: aliceJwk, sender: 'alice' };
-    await runCampaign<string>('C3a-ecdh-decrypt', [ecdhSeed], {
+    await runCampaign<string>('C3a-ecdh-rejected', [ecdhSeed], {
       budget: 300,
       mutate: (parent, r) => {
         if (r.next() < 0.05) return { input: parent, desc: 'CONTROL unmutated seed' };
@@ -778,13 +768,9 @@ describe('DP campaigns — decryptMessageText (PQ ratchet / group epoch / ECDH /
       },
       run: async (input, desc) => {
         const outcome = await runAsync(() => C.decryptMessageText(input, ROOM_DM, ecdhOpts));
-        recordOutcome('C3a-ecdh-decrypt', desc, outcome, 0);
+        recordOutcome('C3a-ecdh-rejected', desc, outcome, 0);
         if (outcome.kind === 'returned') {
-          const res = outcome.value as { text: string };
-          if (desc.startsWith('CONTROL') && input === ecdhSeed && res.text === 'DP-FUZZ-ECDH-SECRET') countControlAccept('C3a-ecdh-decrypt');
-          if (input !== ecdhSeed || res.text !== 'DP-FUZZ-ECDH-SECRET') {
-            stats.unexpectedAccepts.push({ campaign: 'C3a-ecdh-decrypt', label: desc, detail: `decrypted to ${JSON.stringify(res.text).slice(0, 80)}` });
-          }
+          stats.unexpectedAccepts.push({ campaign: 'C3a-ecdh-rejected', label: desc, detail: `e2ee:ecdh: payload decrypted to ${JSON.stringify((outcome.value as { text: string }).text).slice(0, 80)}` });
         }
       },
     });
@@ -830,7 +816,7 @@ describe('DP campaigns — PQF1 files, key bundles, epoch packets', () => {
       myUsername: 'alice', peerPublicKey: bobBundle, peerUsername: 'bob',
     });
     const groupFile = await C.encryptFileBytes(plain, 'group__dp4-group', { groupMembers: ['alice', 'bob'] });
-    assert.equal(dmFile[4], 1, 'DM file kind byte is 1');
+    assert.equal(dmFile[4], 4, 'DM file kind byte is 4 (per-file ML-KEM key, M10)');
     assert.equal(groupFile[4], 2, 'group file kind byte is 2');
     const seeds: Array<{ bytes: Uint8Array; opts: any }> = [
       { bytes: dmFile, opts: { myUsername: 'bob', peerPublicKey: aliceBundle, peerUsername: 'alice' } },
@@ -854,10 +840,20 @@ describe('DP campaigns — PQF1 files, key bundles, epoch packets', () => {
             const diffs: number[] = [];
             for (let i = 0; i < sd.bytes.length; i++) if (input.bytes[i] !== sd.bytes[i]) diffs.push(i);
             if (diffs.length === 0) return true;
-            // KNOWN leniency (W3 noted, S1 sweep confirms): for DM files
-            // (kind 1) decryptFileBytes IGNORES the epoch header bytes
-            // (5..8), so an epoch-only mutant still decrypts to the plaintext.
-            if (sd.bytes[4] === 1 && input.bytes[4] === 1 && diffs.every((d) => d >= 5 && d <= 8)) return true;
+            // KNOWN leniencies for kind-4 DM files (receiver = bob):
+            // (a) the epoch header bytes (5..8) are IGNORED for DM files
+            // (W3 noted, S1 sweep confirms); (b) the file carries TWO
+            // ML-KEM capsules (M10) — bob only uses his own (ctPeer 21..1108
+            // + wrapPeer 1109..1140), so bytes in the SENDER's capsule region
+            // (ctSelf 1141..2228 + wrapSelf 2229..2260) are invisible to him.
+            // Either way the file still decrypts to the IDENTICAL plaintext
+            // (plainOk is required above) — the AES-GCM tag still protects
+            // the plaintext itself.
+            if (
+              sd.bytes[4] === 4 &&
+              input.bytes[4] === 4 &&
+              diffs.every(d => (d >= 5 && d <= 8) || (d >= 1141 && d <= 2260))
+            ) return true;
             return false;
           });
           if (desc.startsWith('CONTROL') && expectedAccept) countControlAccept('C4a-pqf1');
@@ -1339,7 +1335,7 @@ describe('DP campaigns — raw primitives, safety-number parsers, helpers', () =
 });
 
 describe('DP systematic sweeps (exhaustive small domains)', () => {
-  it('S1: PQF1 kind byte 0..255 — only kind 1 accepts a DM file; epoch bytes are ignored for DM, binding for group', { timeout: 120_000 }, async () => {
+  it('S1: PQF1 kind byte 0..255 — only kind 4 accepts a new DM file (kind 1 is legacy-decrypt only); epoch bytes are ignored for DM, binding for group', { timeout: 120_000 }, async () => {
     await refreshFixtures();
     await setupGroup('dpS1-group', 1);
     const plain = new TextEncoder().encode(SECRET_FILE);
@@ -1357,13 +1353,13 @@ describe('DP systematic sweeps (exhaustive small domains)', () => {
       const outcome = await runAsync(() => C.decryptFileBytes(mutated, ROOM_DM, dmOpts));
       if (outcome.kind === 'returned') {
         dmAccepted++;
-        assert.equal(kind, 1, `only kind 1 may decrypt a DM file, but kind ${kind} did`);
+        assert.equal(kind, 4, `only kind 4 may decrypt a new DM file, but kind ${kind} did`);
         assert.deepEqual(Array.from(outcome.value as Uint8Array), Array.from(plain));
       } else {
         assert.equal(outcome.kind, 'threw-e2ee', `kind ${kind} must throw E2EEError`);
       }
     }
-    assert.equal(dmAccepted, 1, 'exactly one kind value (1) may decrypt the DM file');
+    assert.equal(dmAccepted, 1, 'exactly one kind value (4) may decrypt the DM file');
     // Epoch bytes: ignored for DM files (accepted with any epoch), binding for group files.
     for (const epoch of [0, 2, 0x7fffffff, 0xffffffff]) {
       countCase('S1-kind-sweep');
@@ -1384,7 +1380,7 @@ describe('DP systematic sweeps (exhaustive small domains)', () => {
       }
     }
     assert.equal(groupAccepted, 1, 'exactly one epoch value (1) may decrypt the group file');
-    console.log('    [dp] S1: kind sweep 0..255 done (1 accept), epoch sweep done (DM: ignored, group: only 1)');
+    console.log('    [dp] S1: kind sweep 0..255 done (1 accept: kind 4), epoch sweep done (DM: ignored, group: only 1)');
   });
 
   it('S2: ML-KEM ciphertext single-bit sweep — corrupt ct never yields the true secret', { timeout: 120_000 }, async () => {
@@ -1489,8 +1485,10 @@ describe('DP summary', () => {
     // Control proof: the campaigns must have reached successful decrypt/parse
     // paths, not just fail-closed ones. (C3b/C4b have tiny budgets, so they
     // are checked with >= 0 here and reported above; the large campaigns
-    // must each show at least one control accept.)
-    for (const c of ['C1-pq-decrypt', 'C2-group-decrypt', 'C3a-ecdh-decrypt', 'C4a-pqf1', 'C5-bundle-parse', 'C6-epoch-packet']) {
+    // must each show at least one control accept.) C3a-ecdh-rejected is
+    // intentionally absent: DP-15 removed the ECDH path, so that campaign is
+    // rejection-only by design and has no valid control to accept.
+    for (const c of ['C1-pq-decrypt', 'C2-group-decrypt', 'C4a-pqf1', 'C5-bundle-parse', 'C6-epoch-packet']) {
       assert.ok((stats.controlAccepts[c] || 0) > 0, `campaign ${c} never accepted an unmutated control seed — deep paths may not have been reached`);
     }
     if (GUIDED) {

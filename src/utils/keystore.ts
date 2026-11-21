@@ -34,8 +34,9 @@ export const PUBLIC_KEY_CACHE_PREFIX = 'chat_pubkey_v4_';
 const IDB_NAME = 'pq_mprba_keystore_v4';
 const IDB_STORE = 'identity_keys';
 const IDB_REPLAY_STORE = 'replay_protection_v1';
+const IDB_PASSWORD_ROOT_STORE = 'password_wrapped_root_v1';
 export const IDB_TOFU_STORE = 'tofu_pinned_keys_v1';
-const IDB_VERSION = 3;
+const IDB_VERSION = 4;
 
 const LEGACY_STORAGE_PREFIXES = [
   'chat_ecdh_kp_',
@@ -59,13 +60,19 @@ export interface PasswordProtectedWrappingKeyBlob {
   iterations: number;
 }
 
+/** Password blob as stored in IndexedDB (keyPath 'username'). */
+interface StoredPasswordRootBlob extends PasswordProtectedWrappingKeyBlob {
+  username: string;
+}
+
 export interface StoredIdentityRecordV4 {
   v: 4;
   username: string;
   createdAt: number;
   ecdhPublicJwk: JsonWebKey;
   ecdhPrivateKey: CryptoKey; // extractable: false
-  wrappingKey: CryptoKey; // AES-GCM 256-bit, extractable: false
+  wrappingKey: CryptoKey | null; // AES-GCM 256-bit, extractable: false — null وقتی هویت با رمز عبور محافظت می‌شود (L8): کلید پوششی فقط در حافظهٔ نشست باز می‌شود و هرگز ذخیره نمی‌شود
+  passwordProtected?: boolean; // L8: true یعنی کلید پوششی با رمز عبور پیچیده شده و در IDB ذخیره نیست
   mlkemPublicKeyB64: string;
   mlkemSecretWrapped: WrappedSecretBlob;
   mldsaPublicKeyB64: string;
@@ -85,6 +92,27 @@ const publicMetaMemoryCache = new Map<string, PublicKeyMetadataV4>();
 
 // In-memory IndexedDB fallback used ONLY when globalThis.indexedDB is absent (e.g. Node.js tests)
 const nodeMemoryIdbStore = new Map<string, StoredIdentityRecordV4>();
+
+// L8: fallback for the password-wrapped wrapping-key blob (Node tests only)
+const nodeMemoryPasswordRootStore = new Map<string, StoredPasswordRootBlob>();
+
+// L8: session-scoped cache of unlocked wrapping keys (memory only — never
+// persisted). Cleared by lockIdentity() and by resetInMemoryKeyStoreForTests().
+const sessionWrappingKeys = new Map<string, CryptoKey>();
+
+/** Thrown when an identity is password-protected and not unlocked (L8). */
+export class IdentityLockedError extends Error {
+  readonly code = 'IDENTITY_LOCKED' as const;
+  constructor(message = 'Identity key is protected by a password — unlock it to continue') {
+    super(message);
+    this.name = 'IdentityLockedError';
+  }
+}
+
+function zeroizeBytes(buf: Uint8Array | null | undefined): void {
+  if (!buf) return;
+  buf.fill(0);
+}
 
 export function getWebCrypto(): Crypto {
   const c = globalThis.crypto;
@@ -140,6 +168,9 @@ function openKeyStoreDB(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(IDB_TOFU_STORE)) {
         db.createObjectStore(IDB_TOFU_STORE, { keyPath: 'key' });
+      }
+      if (!db.objectStoreNames.contains(IDB_PASSWORD_ROOT_STORE)) {
+        db.createObjectStore(IDB_PASSWORD_ROOT_STORE, { keyPath: 'username' });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -261,8 +292,81 @@ export async function pinPeerIdentityKeyTOFU(
 }
 
 /**
+ * بازپین کردن همگام کلید هویت همتا (M4 — round 3). برخلاف pin که هرگز
+ * روی پین موجود نمی‌نویسد، این تابع پین را بازنویسی می‌کند و فقط از مسیر
+ * تأیید صریح کاربر (markContactVerified) فراخوانی می‌شود: وقتی کاربر پس از
+ * چرخش قانونی کلید، کلید جدید را صریحاً تأیید می‌کند، پین باید به کلید جدید
+ * منتقل شود؛ در غیر این صورت هر مشاهدهٔ بعدی دوباره CHANGED می‌زد و هشدار
+ * برای همیشه گیر می‌کرد.
+ */
+export function repinPeerIdentityKeyTOFUSync(
+  myUsername: string,
+  peerUsername: string,
+  mldsaPubB64: string,
+  mlkemPubB64?: string
+): PinnedPeerKeyRecord {
+  const normMy = normalizeKeystoreUsername(myUsername);
+  const normPeer = normalizeKeystoreUsername(peerUsername);
+  const key = `${normMy}::${normPeer}`;
+
+  const record: PinnedPeerKeyRecord = {
+    key,
+    myUsername: normMy,
+    peerUsername: normPeer,
+    mldsaPubB64,
+    mlkemPubB64,
+    pinnedAt: Date.now(),
+  };
+
+  tofuMemoryCache.set(key, record);
+  nodeMemoryTofuStore.set(key, record);
+  return record;
+}
+
+/**
+ * بازپین کردن کلید هویت همتا در مخزن با دوام IndexedDB (M4 — round 3).
+ * فقط از مسیر تأیید صریح کاربر فراخوانی می‌شود.
+ */
+export async function repinPeerIdentityKeyTOFU(
+  myUsername: string,
+  peerUsername: string,
+  mldsaPubB64: string,
+  mlkemPubB64?: string
+): Promise<PinnedPeerKeyRecord> {
+  const record = repinPeerIdentityKeyTOFUSync(myUsername, peerUsername, mldsaPubB64, mlkemPubB64);
+
+  if (!hasBrowserIndexedDB()) {
+    return record;
+  }
+
+  try {
+    const db = await openKeyStoreDB();
+    if (!db.objectStoreNames.contains(IDB_TOFU_STORE)) return record;
+    return new Promise(resolve => {
+      const tx = db.transaction(IDB_TOFU_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_TOFU_STORE);
+      store.put(record);
+      tx.oncomplete = () => resolve(record);
+      tx.onerror = () => resolve(record);
+    });
+  } catch {
+    return record;
+  }
+}
+
+/**
  * بررسی سابقه Replay در انبار با دوام IndexedDB (H3 / M1)
  */
+
+// انبار دائم Replay بدون کران رشد می‌کرد — هر پیام یک ورودی برای همیشه.
+// کران‌ها (راند ۳): TTL سی روز + حداکثر ۱۰٬۰۰۰ ورودی. پیام DM قدیمی پس از
+// چرخش راتچت دیگر رمزگشایی نمی‌شود، پس حذف ورودی‌های قدیمی امن است؛ برای
+// پیام گروهیِ همان اپوک، پس از این کران فقط پیام‌های قدیمی‌تر از ۱۰٬۰۰۰
+// پیام اخیر یا ۳۰ روز از محافظت Replay خارج می‌شوند (مصالحهٔ مستند).
+export const DURABLE_REPLAY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const DURABLE_REPLAY_MAX_ENTRIES = 10_000;
+const DURABLE_REPLAY_PRUNE_SAMPLE_RATE = 0.05;
+
 export async function isDurableReplaySeen(roomId: string, token: string): Promise<boolean> {
   const key = `${roomId}::${token}`;
   if (!hasBrowserIndexedDB()) {
@@ -290,6 +394,16 @@ export async function recordDurableReplaySeen(roomId: string, token: string): Pr
   const key = `${roomId}::${token}`;
   if (!hasBrowserIndexedDB()) {
     nodeMemoryReplayStore.add(key);
+    // کران حافظه در تست‌های Node: قدیمی‌ترین‌ها (ترتیب درج) حذف می‌شوند.
+    if (nodeMemoryReplayStore.size > DURABLE_REPLAY_MAX_ENTRIES) {
+      const excess = nodeMemoryReplayStore.size - DURABLE_REPLAY_MAX_ENTRIES;
+      let removed = 0;
+      for (const oldKey of nodeMemoryReplayStore) {
+        if (removed >= excess) break;
+        nodeMemoryReplayStore.delete(oldKey);
+        removed++;
+      }
+    }
     return;
   }
   try {
@@ -299,6 +413,63 @@ export async function recordDurableReplaySeen(roomId: string, token: string): Pr
       const tx = db.transaction(IDB_REPLAY_STORE, 'readwrite');
       const store = tx.objectStore(IDB_REPLAY_STORE);
       store.put({ key, timestamp: Date.now() });
+      tx.oncomplete = () => {
+        resolve();
+        // هرس نمونه‌ای (۵٪) تا هزینهٔ اسکن روی هر پیام نیفتد.
+        if (Math.random() < DURABLE_REPLAY_PRUNE_SAMPLE_RATE) {
+          void pruneDurableReplaySeen();
+        }
+      };
+      tx.onerror = () => resolve();
+    });
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * هرس انبار دائم Replay: ورودی‌های قدیمی‌تر از TTL و — اگر هنوز بیش از
+ * حداکثر بود — قدیمی‌ترین ورودی‌ها حذف می‌شوند. Best-effort؛ خطا نادیده
+ * گرفته می‌شود تا هرگز مسیر پیام را خراب نکند.
+ */
+export async function pruneDurableReplaySeen(nowMs: number = Date.now()): Promise<void> {
+  if (!hasBrowserIndexedDB()) {
+    if (nodeMemoryReplayStore.size > DURABLE_REPLAY_MAX_ENTRIES) {
+      const excess = nodeMemoryReplayStore.size - DURABLE_REPLAY_MAX_ENTRIES;
+      let removed = 0;
+      for (const oldKey of nodeMemoryReplayStore) {
+        if (removed >= excess) break;
+        nodeMemoryReplayStore.delete(oldKey);
+        removed++;
+      }
+    }
+    return;
+  }
+  try {
+    const db = await openKeyStoreDB();
+    if (!db.objectStoreNames.contains(IDB_REPLAY_STORE)) return;
+    const entries = await new Promise<Array<{ key: string; timestamp: number }>>(resolve => {
+      const tx = db.transaction(IDB_REPLAY_STORE, 'readonly');
+      const store = tx.objectStore(IDB_REPLAY_STORE);
+      const req = store.getAll();
+      req.onsuccess = () => resolve((req.result as Array<{ key: string; timestamp: number }>) || []);
+      req.onerror = () => resolve([]);
+    });
+    const cutoff = nowMs - DURABLE_REPLAY_TTL_MS;
+    const stale = entries.filter(e => (e.timestamp || 0) < cutoff).map(e => e.key);
+    let toDelete = stale;
+    if (entries.length - stale.length > DURABLE_REPLAY_MAX_ENTRIES) {
+      const fresh = entries
+        .filter(e => (e.timestamp || 0) >= cutoff)
+        .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      const excess = fresh.length - DURABLE_REPLAY_MAX_ENTRIES;
+      toDelete = [...stale, ...fresh.slice(0, excess).map(e => e.key)];
+    }
+    if (toDelete.length === 0) return;
+    await new Promise<void>(resolve => {
+      const tx = db.transaction(IDB_REPLAY_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_REPLAY_STORE);
+      for (const key of toDelete) store.delete(key);
       tx.oncomplete = () => resolve();
       tx.onerror = () => resolve();
     });
@@ -422,13 +593,15 @@ export async function loadIdentityRecordV4(
 
   if (!record) return null;
 
-  // Enforce version marker v === 4 and non-extractable CryptoKey invariants
+  // Enforce version marker v === 4 and non-extractable CryptoKey invariants.
+  // L8: a password-protected record has wrappingKey === null by design — the
+  // wrapping key is only held in the session cache after unlock.
   if (
     record.v !== KEY_STORAGE_VERSION ||
     !record.ecdhPrivateKey ||
     record.ecdhPrivateKey.extractable !== false ||
-    !record.wrappingKey ||
-    record.wrappingKey.extractable !== false ||
+    (!record.passwordProtected && (!record.wrappingKey || record.wrappingKey.extractable !== false)) ||
+    (record.passwordProtected && record.wrappingKey !== null && record.wrappingKey !== undefined) ||
     !record.mlkemSecretWrapped?.iv ||
     !record.mlkemSecretWrapped?.ciphertext ||
     !record.mldsaSecretWrapped?.iv ||
@@ -459,9 +632,14 @@ export async function saveIdentityRecordV4(record: StoredIdentityRecordV4): Prom
 
   if (
     normalizedRecord.ecdhPrivateKey.extractable !== false ||
-    normalizedRecord.wrappingKey.extractable !== false
+    (!normalizedRecord.passwordProtected &&
+      (!normalizedRecord.wrappingKey || normalizedRecord.wrappingKey.extractable !== false))
   ) {
     throw new Error('Refusing to store extractable private or wrapping CryptoKey');
+  }
+  // L8: never persist a usable wrapping key alongside a protected record.
+  if (normalizedRecord.passwordProtected) {
+    normalizedRecord.wrappingKey = null;
   }
 
   if (hasBrowserIndexedDB()) {
@@ -490,6 +668,8 @@ export async function saveIdentityRecordV4(record: StoredIdentityRecordV4): Prom
 export async function deleteIdentityRecordV4(username: string): Promise<void> {
   const norm = normalizeKeystoreUsername(username);
   publicMetaMemoryCache.delete(norm);
+  sessionWrappingKeys.delete(norm);
+  await deletePasswordRootBlob(norm);
   const ls = getSafeLocalStorage();
   if (ls) {
     try {
@@ -683,10 +863,250 @@ export async function unwrapRootKeyWithPassphrase(
 }
 
 /**
+ * L8 — ذخیره‌سازی blob کلید پوششیِ پیچیده‌شده با رمز عبور.
+ * Blob در IndexedDB (store جدا، keyPath 'username') یا در تست‌های Node در
+ * حافظه نگه داشته می‌شود. ترتیب ذخیره‌سازی در enablePasswordProtection
+ * عمدی است: اول blob، بعد رکورد — اگر ذخیرهٔ رکورد شکست بخورد، رکورد هنوز
+ * محافظت‌نشده و کلید قدیمی سالم است و blob یتیم فقط بازنویسی می‌شود.
+ */
+async function savePasswordRootBlob(
+  username: string,
+  blob: PasswordProtectedWrappingKeyBlob
+): Promise<void> {
+  const norm = normalizeKeystoreUsername(username);
+  const stored: StoredPasswordRootBlob = { ...blob, username: norm };
+  if (hasBrowserIndexedDB()) {
+    const db = await openKeyStoreDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(IDB_PASSWORD_ROOT_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_PASSWORD_ROOT_STORE);
+      const req = store.put(stored);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error || new Error('IndexedDB put failed'));
+    });
+    db.close();
+  } else {
+    nodeMemoryPasswordRootStore.set(norm, stored);
+  }
+}
+
+async function loadPasswordRootBlob(
+  username: string
+): Promise<PasswordProtectedWrappingKeyBlob | null> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm) return null;
+  if (hasBrowserIndexedDB()) {
+    const db = await openKeyStoreDB();
+    const res = await new Promise<StoredPasswordRootBlob | null>((resolve, reject) => {
+      const tx = db.transaction(IDB_PASSWORD_ROOT_STORE, 'readonly');
+      const store = tx.objectStore(IDB_PASSWORD_ROOT_STORE);
+      const req = store.get(norm);
+      req.onsuccess = () => resolve((req.result as StoredPasswordRootBlob) || null);
+      req.onerror = () => reject(req.error || new Error('IndexedDB get failed'));
+    });
+    db.close();
+    return res;
+  }
+  return nodeMemoryPasswordRootStore.get(norm) || null;
+}
+
+async function deletePasswordRootBlob(username: string): Promise<void> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm) return;
+  if (hasBrowserIndexedDB()) {
+    const db = await openKeyStoreDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(IDB_PASSWORD_ROOT_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_PASSWORD_ROOT_STORE);
+      const req = store.delete(norm);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error || new Error('IndexedDB delete failed'));
+    });
+    db.close();
+  } else {
+    nodeMemoryPasswordRootStore.delete(norm);
+  }
+}
+
+/** کلید پوششیِ بازشدهٔ نشست (فقط حافظه) — برای crypto.ts. */
+export function getSessionWrappingKey(username: string): CryptoKey | null {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm) return null;
+  return sessionWrappingKeys.get(norm) || null;
+}
+
+/** آیا محافظت با رمز عبور برای این هویت فعال است؟ (blob + پرچم رکورد هر دو لازم‌اند) */
+export async function isPasswordProtectionEnabled(username: string): Promise<boolean> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm) return false;
+  const blob = await loadPasswordRootBlob(norm);
+  if (!blob) return false;
+  const record = await loadIdentityRecordV4(norm);
+  return !!record?.passwordProtected;
+}
+
+/** آیا هویت در این نشست قابل استفاده است؟ (محافظت‌نشده، یا بازشده) */
+export async function isIdentityUnlocked(username: string): Promise<boolean> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm) return false;
+  const record = await loadIdentityRecordV4(norm);
+  if (!record?.passwordProtected) return true;
+  return sessionWrappingKeys.has(norm);
+}
+
+/**
+ * فعال‌کردن محافظت با رمز عبور (L8): یک کلید پوششی تازهٔ EXTRACTABLE ساخته
+ * می‌شود، بایت‌های خام آن با رمز عبور پیچیده و ذخیره می‌شود، رازهای ML-KEM و
+ * ML-DSA زیر کلید تازه دوباره پیچیده می‌شوند و رکورد با wrappingKey=null و
+ * passwordProtected=true ذخیره می‌شود. نشست بلافاصله با نسخهٔ
+ * non-extractable کلید تازه باز می‌ماند تا کاربر مجبور به باز کردن فوری نشود.
+ */
+export async function enablePasswordProtection(username: string, passphrase: string): Promise<void> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm) throw new Error('Username cannot be empty');
+  if (!passphrase || passphrase.length < 8) {
+    throw new Error('Passphrase must be at least 8 characters');
+  }
+  const record = await loadIdentityRecordV4(norm);
+  if (!record) throw new Error('Identity key is not initialized');
+  if (record.passwordProtected) throw new Error('Password protection is already enabled');
+  if (!record.wrappingKey) throw new Error('Identity wrapping key is missing');
+
+  const webCrypto = getWebCrypto();
+  // ۱. کلید پوششی تازهٔ قابل‌استخراج + بایت‌های خام آن.
+  const newWrappingKey = await webCrypto.subtle.generateKey(
+    { name: 'AES-GCM', length: 256 },
+    true,
+    ['encrypt', 'decrypt']
+  );
+  const rawBytes = new Uint8Array(await webCrypto.subtle.exportKey('raw', newWrappingKey));
+  let blob: PasswordProtectedWrappingKeyBlob;
+  try {
+    blob = await wrapRootKeyWithPassphrase(rawBytes, passphrase);
+  } catch (err) {
+    zeroizeBytes(rawBytes);
+    throw err;
+  }
+  // نسخهٔ non-extractable برای استفاده در نشست (invariant کلیدهای پوششی حفظ می‌شود).
+  const runtimeKey = await webCrypto.subtle.importKey(
+    'raw',
+    rawBytes as unknown as BufferSource,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+  zeroizeBytes(rawBytes);
+
+  // ۲. باز کردن رازها با کلید قدیمی و دوباره پیچیدن زیر کلید تازه.
+  const mlkemSecret = await unwrapSecretBytes(record.wrappingKey, norm, 'ML-KEM-768', record.mlkemSecretWrapped);
+  const mldsaSecret = await unwrapSecretBytes(record.wrappingKey, norm, 'ML-DSA-65', record.mldsaSecretWrapped);
+  let mlkemSecretWrapped: WrappedSecretBlob;
+  let mldsaSecretWrapped: WrappedSecretBlob;
+  try {
+    mlkemSecretWrapped = await wrapSecretBytes(newWrappingKey, norm, 'ML-KEM-768', mlkemSecret);
+    mldsaSecretWrapped = await wrapSecretBytes(newWrappingKey, norm, 'ML-DSA-65', mldsaSecret);
+  } finally {
+    zeroizeBytes(mlkemSecret);
+    zeroizeBytes(mldsaSecret);
+  }
+
+  // ۳. اول blob، بعد رکورد (ترتیب امن — توضیح در savePasswordRootBlob).
+  await savePasswordRootBlob(norm, blob);
+  await saveIdentityRecordV4({
+    ...record,
+    wrappingKey: null,
+    passwordProtected: true,
+    mlkemSecretWrapped,
+    mldsaSecretWrapped,
+  });
+  sessionWrappingKeys.set(norm, runtimeKey);
+}
+
+/**
+ * غیرفعال‌کردن محافظت با رمز عبور (L8): رمز عبور فعلی بررسی می‌شود، یک
+ * کلید پوششی تازهٔ non-extractable ساخته و رازها زیر آن دوباره پیچیده
+ * می‌شوند، رکورد بدون پرچم ذخیره و blob حذف می‌شود.
+ */
+export async function disablePasswordProtection(username: string, passphrase: string): Promise<void> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm) throw new Error('Username cannot be empty');
+  const record = await loadIdentityRecordV4(norm);
+  if (!record || !record.passwordProtected) {
+    throw new Error('Password protection is not enabled');
+  }
+  // رمز عبور را بررسی کن (رمز اشتباه → IdentityLockedError).
+  await unlockIdentityWithPassphrase(norm, passphrase);
+  const sessionKey = sessionWrappingKeys.get(norm);
+  if (!sessionKey) throw new IdentityLockedError();
+
+  const newWrappingKey = await generateNonExtractableWrappingKey();
+  const mlkemSecret = await unwrapSecretBytes(sessionKey, norm, 'ML-KEM-768', record.mlkemSecretWrapped);
+  const mldsaSecret = await unwrapSecretBytes(sessionKey, norm, 'ML-DSA-65', record.mldsaSecretWrapped);
+  let mlkemSecretWrapped: WrappedSecretBlob;
+  let mldsaSecretWrapped: WrappedSecretBlob;
+  try {
+    mlkemSecretWrapped = await wrapSecretBytes(newWrappingKey, norm, 'ML-KEM-768', mlkemSecret);
+    mldsaSecretWrapped = await wrapSecretBytes(newWrappingKey, norm, 'ML-DSA-65', mldsaSecret);
+  } finally {
+    zeroizeBytes(mlkemSecret);
+    zeroizeBytes(mldsaSecret);
+  }
+
+  // اول رکورد (با کلید تازه)، بعد حذف blob — اگر حذف blob شکست بخورد،
+  // رکورد محافظت‌نشده است و blob یتیم بی‌اثر می‌ماند.
+  await saveIdentityRecordV4({
+    ...record,
+    wrappingKey: newWrappingKey,
+    passwordProtected: false,
+    mlkemSecretWrapped,
+    mldsaSecretWrapped,
+  });
+  await deletePasswordRootBlob(norm);
+  sessionWrappingKeys.delete(norm);
+}
+
+/**
+ * باز کردن هویت محافظت‌شده با رمز عبور برای این نشست (L8). رمز اشتباه →
+ * IdentityLockedError (خطای AES-GCM auth به بیرون درز نمی‌کند).
+ */
+export async function unlockIdentityWithPassphrase(username: string, passphrase: string): Promise<void> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm) throw new IdentityLockedError('Username cannot be empty');
+  const blob = await loadPasswordRootBlob(norm);
+  if (!blob) throw new IdentityLockedError('Password protection is not enabled for this identity');
+  let rawBytes: Uint8Array;
+  try {
+    rawBytes = await unwrapRootKeyWithPassphrase(blob, passphrase);
+  } catch {
+    throw new IdentityLockedError('Incorrect passphrase');
+  }
+  try {
+    const key = await getWebCrypto().subtle.importKey(
+      'raw',
+      rawBytes as unknown as BufferSource,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
+    sessionWrappingKeys.set(norm, key);
+  } finally {
+    zeroizeBytes(rawBytes);
+  }
+}
+
+/** قفل‌کردن هویت در این نشست (کلید پوششی از حافظه پاک می‌شود). */
+export function lockIdentity(username: string): void {
+  const norm = normalizeKeystoreUsername(username);
+  if (norm) sessionWrappingKeys.delete(norm);
+}
+
+/**
  * Reset in-memory test store & caches (for isolated unit testing only).
  */
 export function resetInMemoryKeyStoreForTests(): void {
   nodeMemoryIdbStore.clear();
   nodeMemoryReplayStore.clear();
+  nodeMemoryPasswordRootStore.clear();
+  sessionWrappingKeys.clear();
   publicMetaMemoryCache.clear();
 }
