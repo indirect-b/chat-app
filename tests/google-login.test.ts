@@ -14,6 +14,7 @@ import {
   getGoogleClientId,
   getGoogleRedirectUri,
   isGoogleConfigured,
+  parseCookies,
   validateEmail,
   verifyGoogleIdToken,
 } from '../src/server/google';
@@ -203,5 +204,21 @@ describe('verifyGoogleIdToken (fake verifier — never calls Google)', () => {
         emailVerified: true,
       }))
     );
+  });
+});
+
+describe('HttpOnly cookie session support (L9)', () => {
+  it('parses session_token from cookie header', () => {
+    const header = 'session_token=test-token-xyz; other_cookie=hello%20world; theme=dark';
+    const parsed = parseCookies(header);
+    assert.equal(parsed.session_token, 'test-token-xyz');
+    assert.equal(parsed.other_cookie, 'hello world');
+    assert.equal(parsed.theme, 'dark');
+  });
+
+  it('handles empty or malformed cookie header safely', () => {
+    assert.deepEqual(parseCookies(undefined), {});
+    assert.deepEqual(parseCookies(''), {});
+    assert.deepEqual(parseCookies('badcookie; valid=123'), { valid: '123' });
   });
 });

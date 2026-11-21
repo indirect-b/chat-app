@@ -201,3 +201,18 @@ export class PendingRecoveryCodes {
     return pending.code;
   }
 }
+
+/**
+ * تجزیه کوکی‌های ارسالی کلاینت (L9 - HttpOnly Cookie support)
+ */
+export function parseCookies(header: string | undefined): Record<string, string> {
+  const list: Record<string, string> = {};
+  if (!header) return list;
+  header.split(';').forEach(cookie => {
+    const parts = cookie.split('=');
+    if (parts.length >= 2) {
+      list[parts[0].trim()] = decodeURIComponent(parts.slice(1).join('=').trim());
+    }
+  });
+  return list;
+}

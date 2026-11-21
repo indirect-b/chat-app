@@ -33,6 +33,7 @@ import {
   checkGoogleRedirectRequest,
   buildGoogleRedirectUrl,
   PendingRecoveryCodes,
+  parseCookies,
   GOOGLE_DISABLED_MSG,
   GOOGLE_LOGIN_FAILED_MSG,
 } from './src/server/google';
@@ -158,18 +159,6 @@ async function fileStartsWithMagic(filePath: string, magic: string): Promise<boo
 // متغیرهای درون‌حافظه‌ای توکن‌های موقت
 const adminTokens: Record<string, { username: string; expire: number; adminAt: number }> = {};
 export const userSessions: Record<string, { username: string; expire: number }> = {};
-
-export function parseCookies(header: string | undefined): Record<string, string> {
-  const list: Record<string, string> = {};
-  if (!header) return list;
-  header.split(';').forEach(cookie => {
-    const parts = cookie.split('=');
-    if (parts.length >= 2) {
-      list[parts[0].trim()] = decodeURIComponent(parts.slice(1).join('=').trim());
-    }
-  });
-  return list;
-}
 
 export async function saveUserSession(token: string, username: string, expireMs: number): Promise<void> {
   userSessions[token] = { username, expire: expireMs };
