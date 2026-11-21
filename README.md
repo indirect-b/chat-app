@@ -17,7 +17,7 @@ The server never sees plaintext, and never learns who is talking to whom.
 [![Crypto](https://img.shields.io/badge/crypto-ML--KEM--768%20%2B%20AES--256--GCM-purple)](#-the-pq-mprba-protocol)
 [![Stars](https://img.shields.io/github/stars/indirect-b/chat-app?style=social)](https://github.com/indirect-b/chat-app/stargazers)
 
-**🚀 Live demo:** https://chatapp-server-1i2a.onrender.com &nbsp;·&nbsp; use **⚡ Quick Test Login** — no sign-up needed
+**🚀 Live demo:** https://chatapp-server-1i2a.onrender.com &nbsp;·&nbsp; Google sign-in only
 <br/><sub>(free-tier hosting: the first load may take ~30s while the server wakes up)</sub>
 
 </div>
@@ -446,6 +446,52 @@ Vectors fetched fresh on 2026-11-21 from `usnistgov/ACVP-Server` (vsId 42, FIPS 
 </details>
 
 
+## 🌐 Live verification — 21 November 2026
+
+**Separate from the self-assessment above.** The section above ran the test suites against the code; this section checked what is actually deployed and running at https://chatapp-server-1i2a.onrender.com on 2026-11-21 06:48–07:12 (UTC 03:18–03:42). Method: unauthenticated HTTP probes from the auditor's machine, plus a signed-in browser session as the author's own account (indirectnebula6@gmail.com) in a brand-new test room only — the account had no prior chats or groups, no existing room, chat or file was touched, nothing was deleted, and no destructive test (account deletion, load/flood) was run.
+
+### What the deployed code is
+
+The production bundle was downloaded from the live server and compared byte-for-byte with a fresh local production build (`vite build`) of the same audited checkout:
+
+| Chunk | Served | Local build | Verdict |
+| --- | ---: | ---: | --- |
+| `ChatApp` (all protocol + UI code) | 140,733 B | 140,733 B | **Identical** — the only differing bytes are the 8-character hash in the `vendor-crypto` import specifier. |
+| `vendor-crypto` (noble primitives) | 69,490 B | 69,487 B | Same logic; 3 bytes differ in a minifier-equivalent Keccak emission. Markers present: Keccak, Kyber modulus `3329`. |
+| `vendor-react-dom` | 207,018 B | 207,006 B | Same logic; 12 bytes differ in a minifier-equivalent (De Morgan) emission. |
+| `esm` | 41,189 B | 41,209 B | One expression differs in a query-string parser (`r[1]` vs `r.slice(1).join('=')`) — a dependency-version difference, not protocol code. |
+| Entry `index` | 11,131 B | 11,227 B | Chunk-filename references + bootstrap; no app logic. |
+| `AuthScreen`, `TermsScreen`, `rolldown-runtime`, `vendor-react`, CSS | — | — | Identical filenames (content hashes match). |
+
+Protocol markers found in the served bundle: `e2ee:pq:v2:`, `REPLAY_DETECTED`, `MAX_SKIP`, `e2ee:gep:v2:`, `mlkem768`, `mldsa65`. **Conclusion: the code running live is the code that was audited.** Differences are build-tooling noise (minifier, one dependency version), not different logic.
+
+### What was checked live
+
+| Check | Method | Result |
+| --- | --- | --- |
+| Deployed version | `GET /api/health` | ✅ `6.5.0`, `database: ok` — matches the audited code. |
+| Served security headers | `GET /` | ✅ Strict CSP (`default-src 'self'`, no `unsafe-inline`/`unsafe-eval`), HSTS `max-age=31536000; includeSubDomains; preload`, `X-Frame-Options: DENY`, `frame-ancestors 'none'`, `nosniff`, COOP/CORP `same-origin`. |
+| Public uploads removed | `GET /uploads/test.jpg` | ✅ 404. |
+| Media gating, no session | `GET /api/media/…` | ✅ 401. |
+| Profile endpoint, no session | `GET /api/user/me` | ⚠️ 200 with `{"ok":false}` — leaks nothing, but answers 200 instead of 401. |
+| Unknown API paths | `GET /api/groups`, `/api/auth/me` | `{"ok":false,"error":"Not Found"}`. |
+| Login screen | Signed-in browser session | ✅ Google-only (`ورود با گوگل` + recovery-code login). **No "Quick Test Login" button exists** — the "Live demo" line in this README used to claim it; corrected with this update. |
+| Google profile sync | Signed-in browser session | ✅ Display name "Indirect Nebula" from Google. A photo avatar is shown; its source URL is not exposed, so it is not proven to be the Google photo. |
+| Send + deliver | Test room `live-test-2026-11-21`, message "live test 1" 06:51 | ✅ Delivered ✓✓, Epoch #1. |
+| **History after reload (finding H3)** | Reloaded the test room | ❌ **Confirmed live:** every message became undecryptable — text reads "🔒 [پیام رمزنگاری‌شده - کلید این نشست در دسترس نیست یا بازنشانی شده است]", media reads "🔒 رسانه در دسترس نیست". Cause per the app's own Session Key dialog: RAM-only ratchet key, zeroized on reload, no PBKDF2 override set. |
+| Media upload | Uploaded `live-test-file.txt` (15 B) | ⚠️ Uploaded, but the UI gave no feedback at all — no preview, message or error — so it was repeated 4× (07:07–07:09), creating 4 duplicate media messages. All 4 locked after the reload (H3). Left as-is, not deleted. |
+| Media link, logged out | UI inspection | Not possible — the app exposes no media link anywhere (no download, no copy-link); the blob id sits inside the encrypted payload. API-level gating (401) was verified instead. |
+| Cold start | First request after idle | ~28 s to first byte (free tier sleeps); warm requests ~1–2 s. |
+| Transient login notice | First load | A notice briefly said Google login was unavailable and to try later; it disappeared and sign-in then worked. |
+
+### Not tested live
+
+- **Socket-level adversarial tests** (live equivalents of A1–A3, B1–B4, C1–C8, D1–D5, E1–E3, F1–F7): need a captured outgoing Socket.IO frame. No frame was captured in this pass and no live replay/tamper test was run. They need a frame captured with F12 (Network → WS → socket.io → Messages).
+- Two-client decryption (a second account was not signed in).
+- Account deletion (destructive by design — deliberately not run against production).
+- Rate limiting / behaviour under load (not probed).
+
+
 ## 🏗️ Architecture
 
 ```mermaid
@@ -502,7 +548,7 @@ cp .env.example .env   # then fill in your secrets
 npm run dev            # full-stack dev server (Express + Vite + Socket.IO)
 ```
 
-Open http://localhost:3000 — use **Quick Test Login** to explore instantly, or log in with a Bale ID.
+Open http://localhost:3000 and sign in with Google.
 Production: `npm run build` then `npm start`.
 
 ### Environment variables
