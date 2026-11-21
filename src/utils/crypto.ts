@@ -127,6 +127,8 @@ interface RatchetSessionState {
   kemCipherTextB64: string; // کپسول ML-KEM-768 برای همگام‌سازی طرف مقابل
   peerKemFingerprint: string;
   skippedKeys: Map<number, SkippedKeyEntry>;
+  sessionEpoch?: number;
+  previousSession?: RatchetSessionState;
 }
 
 export interface GroupEpochKeyRecord {
@@ -764,6 +766,10 @@ function zeroizeRatchetState(state: RatchetSessionState): void {
   }
   state.skippedKeys.clear();
   state.seenRecvSteps.clear();
+  if (state.previousSession) {
+    zeroizeRatchetState(state.previousSession);
+    state.previousSession = undefined;
+  }
 }
 
 export function clearRatchetSession(myUsername: string, roomId: string): void {
@@ -852,6 +858,22 @@ async function ensurePQRatchetSession(
 
   // اگر کپسول جدیدی از سمت مقابل آمده که نیاز به Decapsulation دارد
   if (incomingKemCipherB64 && (!existing || existing.kemCipherTextB64 !== incomingKemCipherB64 || existing.peerKemFingerprint !== peerFingerprint)) {
+    // اگر کپسول ورودی با نشست جدیدتر (previousSession که sessionEpoch بالاتری دارد) مطابقت دارد،
+    // آن را با حفظ کامل seenRecvSteps بازیابی کن تا حمله Replay از طریق تناوب کپسول (H1) مسدود شود
+    if (
+      existing &&
+      existing.previousSession &&
+      existing.previousSession.kemCipherTextB64 === incomingKemCipherB64 &&
+      existing.previousSession.peerKemFingerprint === peerFingerprint &&
+      (existing.previousSession.sessionEpoch ?? 0) > (existing.sessionEpoch ?? 0)
+    ) {
+      const restored = existing.previousSession;
+      restored.previousSession = existing;
+      existing.previousSession = undefined;
+      saveRatchetState(normMyUser, roomId, restored);
+      return restored;
+    }
+
     const cipherBytes = base64ToBuf(incomingKemCipherB64);
     if (cipherBytes.byteLength !== ml_kem768.lengths.cipherText) {
       throw new E2EEError('MALFORMED_PAYLOAD', 'Invalid ML-KEM-768 ciphertext length');
@@ -887,8 +909,14 @@ async function ensurePQRatchetSession(
       const sendChain = amIFirst ? chainA : chainB;
       const recvChain = amIFirst ? chainB : chainA;
 
-      if (existing) {
-        zeroizeRatchetState(existing);
+      const isRevertingToPrevious = existing?.previousSession?.kemCipherTextB64 === incomingKemCipherB64;
+      const targetEpoch = isRevertingToPrevious
+        ? (existing?.previousSession?.sessionEpoch ?? 0)
+        : (existing?.sessionEpoch ?? 0) + 1;
+
+      if (existing && existing.previousSession) {
+        zeroizeRatchetState(existing.previousSession);
+        existing.previousSession = undefined;
       }
 
       const newState: RatchetSessionState = {
@@ -901,6 +929,8 @@ async function ensurePQRatchetSession(
         kemCipherTextB64: incomingKemCipherB64,
         peerKemFingerprint: peerFingerprint,
         skippedKeys: new Map<number, SkippedKeyEntry>(),
+        sessionEpoch: targetEpoch,
+        previousSession: existing || undefined,
       };
 
       saveRatchetState(normMyUser, roomId, newState);
@@ -950,8 +980,9 @@ async function ensurePQRatchetSession(
     const sendChain = amIFirst ? chainA : chainB;
     const recvChain = amIFirst ? chainB : chainA;
 
-    if (existing) {
-      zeroizeRatchetState(existing);
+    if (existing && existing.previousSession) {
+      zeroizeRatchetState(existing.previousSession);
+      existing.previousSession = undefined;
     }
 
     const newState: RatchetSessionState = {
@@ -964,6 +995,8 @@ async function ensurePQRatchetSession(
       kemCipherTextB64: bufToBase64(cipherText),
       peerKemFingerprint: peerFingerprint,
       skippedKeys: new Map<number, SkippedKeyEntry>(),
+      sessionEpoch: (existing?.sessionEpoch ?? 0) + 1,
+      previousSession: existing || undefined,
     };
 
     saveRatchetState(normMyUser, roomId, newState);
