@@ -1994,9 +1994,9 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       >
         {!currentRoom ? (
           <div className="empty-state" id="emptyState">
-            <div style={{ fontSize: '52px' }}>💬</div>
-            <p>یه مخاطب انتخاب کن</p>
-            <small>با دکمه + مخاطب جدید اضافه کن • مجهز به رمزنگاری سرتاسری (E2EE)</small>
+            <div className="empty-state-icon" aria-hidden="true">💬</div>
+            <p>گفت‌وگویی انتخاب نشده است</p>
+            <small>یک مخاطب را انتخاب کنید یا گفت‌وگوی جدید آغاز نمایید • مجهز به رمزنگاری سرتاسری PQ-MPRBA</small>
           </div>
         ) : (
           <div id="chatView" className="chat-view">
@@ -2103,20 +2103,21 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                   padding: '5px 10px',
                   borderRadius: '14px',
                   background: currentPQStatus?.isPQ
-                    ? 'rgba(124,58,237,0.18)'
+                    ? 'rgba(6, 182, 212, 0.14)'
                     : currentPQStatus?.reason === 'INVALID_MLDSA_SIGNATURE'
-                    ? 'rgba(239,68,68,0.2)'
-                    : 'rgba(234,179,8,0.18)',
+                    ? 'rgba(244, 63, 94, 0.18)'
+                    : 'rgba(245, 158, 11, 0.16)',
                   color: currentPQStatus?.isPQ
-                    ? '#c4b5fd'
+                    ? '#22d3ee'
                     : currentPQStatus?.reason === 'INVALID_MLDSA_SIGNATURE'
-                    ? '#ef4444'
-                    : '#facc15',
-                  border: currentPQStatus && !currentPQStatus.isPQ
-                    ? currentPQStatus.reason === 'INVALID_MLDSA_SIGNATURE'
-                      ? '1px solid rgba(239,68,68,0.45)'
-                      : '1px solid rgba(234,179,8,0.4)'
-                    : 'none',
+                    ? '#fb7185'
+                    : '#fbbf24',
+                  border:
+                    currentPQStatus && !currentPQStatus.isPQ
+                      ? currentPQStatus.reason === 'INVALID_MLDSA_SIGNATURE'
+                        ? '1px solid rgba(244, 63, 94, 0.45)'
+                        : '1px solid rgba(245, 158, 11, 0.4)'
+                      : '1px solid rgba(6, 182, 212, 0.3)',
                   gap: '4px',
                 }}
               >
