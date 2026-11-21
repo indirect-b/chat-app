@@ -914,7 +914,15 @@ app.get('/api/groups/:username', async (req: Request, res: Response) => {
     return res.status(403).json({ ok: false, msg: 'unauthorized' });
   }
   const { rows } = await pool.query('SELECT * FROM groups');
-  const myGroups = rows.filter((g: any) => JSON.parse(g.members).includes(req.params.username));
+  const targetUser = decodeURIComponent(String(req.params.username)).trim();
+  const myGroups = rows.filter((g: any) => {
+    try {
+      const members: string[] = JSON.parse(g.members);
+      return members.some(m => m.toLowerCase() === targetUser.toLowerCase() || m === targetUser);
+    } catch {
+      return false;
+    }
+  });
   res.json({
     ok: true,
     groups: myGroups.map((g: any) => ({
@@ -1201,6 +1209,77 @@ app.post('/api/admin/add-to-group', async (req: Request, res: Response) => {
     });
   });
   res.json({ ok: true, epoch: newEpoch });
+});
+
+// اضافه کردن عضو جدید به گروه پس از ساخت توسط توزیع‌کننده (M6)
+app.post('/api/group/:id/add-member', async (req: Request, res: Response) => {
+  const sessionUser = getSessionUsername(req);
+  if (!sessionUser) return res.status(401).json({ ok: false, msg: 'unauthorized' });
+  const { username } = req.body;
+  if (!username || typeof username !== 'string') return res.status(400).json({ ok: false, msg: 'invalid username' });
+  const cleanUser = username.trim().replace(/^@+/, '');
+  const { rows } = await pool.query('SELECT * FROM groups WHERE id = $1', [req.params.id]);
+  if (!rows.length) return res.json({ ok: false, msg: 'group not found' });
+  const group = rows[0];
+  const members: string[] = JSON.parse(group.members);
+  if (members[0] !== sessionUser) return res.status(403).json({ ok: false, msg: 'only distributor can add members' });
+  if (members.includes(cleanUser)) return res.json({ ok: true, msg: 'already member', members, epoch: group.epoch });
+  members.push(cleanUser);
+  const newEpoch = (Number(group.epoch) || 1) + 1;
+  await pool.query('UPDATE groups SET members = $1, epoch = $2 WHERE id = $3', [
+    JSON.stringify(members),
+    newEpoch,
+    req.params.id,
+  ]);
+  presence.emitToUser(io, cleanUser, 'new-group', {
+    id: req.params.id,
+    name: group.name,
+    members,
+    epoch: newEpoch,
+  });
+  members.forEach(m => {
+    presence.emitToUser(io, m, 'group-epoch-rotated', {
+      groupId: req.params.id,
+      name: group.name,
+      epoch: newEpoch,
+      members,
+    });
+  });
+  res.json({ ok: true, epoch: newEpoch, members });
+});
+
+// حذف عضو از گروه پس از ساخت توسط توزیع‌کننده (M6)
+app.post('/api/group/:id/remove-member', async (req: Request, res: Response) => {
+  const sessionUser = getSessionUsername(req);
+  if (!sessionUser) return res.status(401).json({ ok: false, msg: 'unauthorized' });
+  const { username } = req.body;
+  if (!username || typeof username !== 'string') return res.status(400).json({ ok: false, msg: 'invalid username' });
+  const cleanUser = username.trim().replace(/^@+/, '');
+  const { rows } = await pool.query('SELECT * FROM groups WHERE id = $1', [req.params.id]);
+  if (!rows.length) return res.json({ ok: false, msg: 'group not found' });
+  const group = rows[0];
+  const members: string[] = JSON.parse(group.members);
+  if (members[0] !== sessionUser) return res.status(403).json({ ok: false, msg: 'only distributor can remove members' });
+  if (cleanUser === sessionUser) return res.status(400).json({ ok: false, msg: 'cannot remove distributor' });
+  const idx = members.indexOf(cleanUser);
+  if (idx === -1) return res.json({ ok: true, members, epoch: group.epoch });
+  members.splice(idx, 1);
+  const newEpoch = (Number(group.epoch) || 1) + 1;
+  await pool.query('UPDATE groups SET members = $1, epoch = $2 WHERE id = $3', [
+    JSON.stringify(members),
+    newEpoch,
+    req.params.id,
+  ]);
+  presence.emitToUser(io, cleanUser, 'group-removed', { id: req.params.id });
+  members.forEach(m => {
+    presence.emitToUser(io, m, 'group-epoch-rotated', {
+      groupId: req.params.id,
+      name: group.name,
+      epoch: newEpoch,
+      members,
+    });
+  });
+  res.json({ ok: true, epoch: newEpoch, members });
 });
 
 app.get('/api/admin/groups', async (req: Request, res: Response) => {

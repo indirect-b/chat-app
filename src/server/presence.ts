@@ -19,23 +19,29 @@ export class PresenceManager {
   public setOnline(socketId: string, username: string): void {
     this.onlineSockets.set(socketId, username);
     this.usernameToSocket.set(username, socketId);
+    this.usernameToSocket.set(username.toLowerCase(), socketId);
   }
 
   public setOffline(socketId: string): string | undefined {
     const username = this.onlineSockets.get(socketId);
     this.onlineSockets.delete(socketId);
-    if (username && this.usernameToSocket.get(username) === socketId) {
-      this.usernameToSocket.delete(username);
+    if (username) {
+      if (this.usernameToSocket.get(username) === socketId) {
+        this.usernameToSocket.delete(username);
+      }
+      if (this.usernameToSocket.get(username.toLowerCase()) === socketId) {
+        this.usernameToSocket.delete(username.toLowerCase());
+      }
     }
     return username;
   }
 
   public getSocketIdByUsername(username: string): string | undefined {
-    return this.usernameToSocket.get(username);
+    return this.usernameToSocket.get(username) || this.usernameToSocket.get(username.toLowerCase());
   }
 
   public isOnline(username: string): boolean {
-    return this.usernameToSocket.has(username);
+    return this.usernameToSocket.has(username) || this.usernameToSocket.has(username.toLowerCase());
   }
 
   public getOnlineCount(): number {

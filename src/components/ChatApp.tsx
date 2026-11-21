@@ -35,6 +35,7 @@ import {
   rotateSessionRatchetOnly,
 } from '../utils/safetyNumber';
 import { SafetyNumberModal } from './SafetyNumberModal';
+import { deleteIdentityRecordV4 } from '../utils/keystore';
 
 interface ChatAppProps {
   myUsername: string;
@@ -517,11 +518,22 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         }
         return false;
       }
-      // ۳. ساخت بسته با باندل‌های تأییدشده اعضا.
+      // ۳. ساخت بسته با باندل‌های تأییدشده اعضا (با دریافت کلید از سرور در صورت عدم حضور در کش).
       const bundles: Record<string, ReturnType<typeof parsePeerKeyBundle> | null> = {};
       for (const m of members) {
         if (m === myUsername) continue;
-        const bundleStr = peerPublicKeysRef.current[m] || getStoredPeerPublicKey(m);
+        let bundleStr = peerPublicKeysRef.current[m] || getStoredPeerPublicKey(m);
+        if (!bundleStr) {
+          try {
+            const uRes = await fetch('/api/user/' + encodeURIComponent(m)).then(r => r.json());
+            if (uRes.ok && uRes.user?.public_key) {
+              bundleStr = uRes.user.public_key;
+              syncPeerPublicKeyAndObserve(m, bundleStr);
+            }
+          } catch {
+            // ignore
+          }
+        }
         bundles[m] = bundleStr ? parsePeerKeyBundle(bundleStr, m) : null;
       }
       const packet = await createGroupEpochPacket(bundles);
@@ -548,7 +560,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   const getPeerKeyForRoom = useCallback(
     (roomId: string): string | null => {
       if (roomId.startsWith('group__')) return null;
-      const partner = roomId.split('__').find(u => u !== myUsername);
+      const partner = roomId.split('__').find(u => u.toLowerCase() !== myUsername.toLowerCase());
       if (!partner) return null;
       if (peerPublicKeysRef.current[partner]) return peerPublicKeysRef.current[partner];
       const stored = getStoredPeerPublicKey(partner);
@@ -640,7 +652,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   const processDecryption = useCallback(
     async (msg: ChatMessage, roomId: string): Promise<DecryptedChatMessage> => {
       let peerPublicKey = getPeerKeyForRoom(roomId);
-      const partner = roomId.startsWith('group__') ? undefined : roomId.split('__').find(u => u !== myUsername);
+      const partner = roomId.startsWith('group__') ? undefined : roomId.split('__').find(u => u.toLowerCase() !== myUsername.toLowerCase());
       if (!peerPublicKey && partner) {
         try {
           const uRes = await fetch('/api/user/' + encodeURIComponent(partner)).then(r => r.json());
@@ -830,7 +842,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     const onNewMessage = async ({ roomId, msg }: { roomId: string; msg: ChatMessage }) => {
       const partnerId = roomId.startsWith('group__')
         ? roomId.replace('group__', '')
-        : roomId.split('__').find(u => u !== myUsername);
+        : roomId.split('__').find(u => u.toLowerCase() !== myUsername.toLowerCase());
 
       const decMsg = await processDecryption(msg, roomId);
       const previewStr =
@@ -1399,7 +1411,8 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   };
 
   const handleAddContact = async () => {
-    const clean = newContactInput.trim().replace('@', '');
+    const raw = newContactInput.trim();
+    const clean = raw.startsWith('@') ? raw.replace(/^@+/, '').trim() : raw;
     if (!clean) return;
     // (profile-auth) the server only accepts adding to your own contact list.
     const sessionToken = getSessionToken();
@@ -1448,7 +1461,10 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     }
     const extra = extraMemberInput
       .split(/[,،\s]+/)
-      .map(s => s.replace('@', '').trim())
+      .map(s => {
+        const t = s.trim();
+        return t.startsWith('@') ? t.replace(/^@+/, '').trim() : t;
+      })
       .filter(Boolean);
     const members = Array.from(new Set([...groupMembersSelected, ...extra])).filter(
       u => u !== myUsername
@@ -3061,6 +3077,33 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               <option value="busy">🔴 مشغول</option>
               <option value="away">🟡 غایب</option>
             </select>
+            <div style={{ marginTop: '14px', marginBottom: '14px', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '10px' }}>
+              <button
+                type="button"
+                style={{
+                  width: '100%',
+                  background: 'rgba(239, 68, 68, 0.15)',
+                  border: '1px solid rgba(239, 68, 68, 0.35)',
+                  color: '#f87171',
+                  borderRadius: '8px',
+                  padding: '7px 10px',
+                  fontSize: '12px',
+                  cursor: 'pointer',
+                  fontWeight: 600,
+                  fontFamily: 'inherit',
+                }}
+                onClick={async () => {
+                  if (window.confirm('آیا از حذف کلیدهای هویت پساکوانتومی این دستگاه اطمینان دارید؟ نشست‌های جاری بازنشانی خواهند شد.')) {
+                    await deleteIdentityRecordV4(myUsername);
+                    localStorage.clear();
+                    sessionStorage.clear();
+                    window.location.reload();
+                  }
+                }}
+              >
+                🗑️ حذف کلیدهای هویت از این دستگاه (Reset Device Identity)
+              </button>
+            </div>
             <div className="modal-btns">
               <button type="button" onClick={handleSaveProfile}>
                 ذخیره
@@ -3482,10 +3525,94 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                               : SAFETY_STRINGS_FA.safetyNumber}
                           </button>
                         )}
+
+                        {!isMe && currentGroupMembersList[0] === myUsername && (
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              if (!window.confirm(`آیا از حذف ${member} از گروه اطمینان دارید؟`)) return;
+                              const sessionToken = getSessionToken();
+                              const res = await fetch(`/api/group/${encodeURIComponent(currentPartner!)}/remove-member`, {
+                                method: 'POST',
+                                headers: {
+                                  'Content-Type': 'application/json',
+                                  ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+                                },
+                                body: JSON.stringify({ username: member }),
+                              }).then(r => r.json());
+                              if (res.ok) {
+                                showToast(`عضو ${member} از گروه حذف شد`);
+                                setContactProfileModal({ open: false, user: null });
+                              } else {
+                                showToast(res.msg || 'خطا در حذف عضو');
+                              }
+                            }}
+                            style={{
+                              background: 'rgba(239, 68, 68, 0.2)',
+                              border: '1px solid rgba(239, 68, 68, 0.4)',
+                              color: '#ef4444',
+                              borderRadius: '7px',
+                              padding: '5px 9px',
+                              fontSize: '11px',
+                              fontWeight: 600,
+                              cursor: 'pointer',
+                              fontFamily: 'inherit',
+                              marginRight: '6px',
+                            }}
+                          >
+                            حذف
+                          </button>
+                        )}
                       </div>
                     );
                   })}
                 </div>
+                {currentGroupMembersList[0] === myUsername && (
+                  <div style={{ marginTop: '12px', display: 'flex', gap: '8px' }}>
+                    <input
+                      type="text"
+                      placeholder="نام کاربری یا ایمیل عضو جدید..."
+                      id="newGroupMemberInput"
+                      style={{ flex: 1, padding: '7px 10px', fontSize: '12px', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px', color: '#fff' }}
+                    />
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const input = document.getElementById('newGroupMemberInput') as HTMLInputElement;
+                        const val = input ? input.value.trim().replace(/^@+/, '') : '';
+                        if (!val) return;
+                        const sessionToken = getSessionToken();
+                        const res = await fetch(`/api/group/${encodeURIComponent(currentPartner!)}/add-member`, {
+                          method: 'POST',
+                          headers: {
+                            'Content-Type': 'application/json',
+                            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+                          },
+                          body: JSON.stringify({ username: val }),
+                        }).then(r => r.json());
+                        if (res.ok) {
+                          showToast(`عضو جدید اضافه شد`);
+                          input.value = '';
+                          setContactProfileModal({ open: false, user: null });
+                        } else {
+                          showToast(res.msg || 'خطا در افزودن عضو');
+                        }
+                      }}
+                      style={{
+                        background: 'var(--accent)',
+                        color: '#fff',
+                        borderRadius: '8px',
+                        border: 'none',
+                        padding: '7px 12px',
+                        fontSize: '12px',
+                        cursor: 'pointer',
+                        fontWeight: 600,
+                      }}
+                    >
+                      + افزودن
+                    </button>
+                  </div>
+                )}
               </div>
             )}
 

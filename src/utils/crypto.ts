@@ -668,7 +668,7 @@ export function getRoomPQStatus(options: {
     isPQ: true,
     type: 'PQ_HYBRID_VERIFIED',
     badge: '🛡️ PQ-KEM',
-    tooltip: 'رمزنگاری تماماً پساکوانتومی ترکیبی (ML-KEM-768 + ECDH P-256) با امضای هویت تأییدشده‌ی ML-DSA-65 (FIPS 204)',
+    tooltip: 'رمزنگاری هیبریدی پساکوانتومی (Hybrid PQ: ML-KEM-768 + ECDH P-256) با امضای هویت تأییدشده‌ی ML-DSA-65 (FIPS 204)',
   };
 }
 
@@ -1495,7 +1495,12 @@ export async function encryptMessageText(
           aesKey,
           encoded
         );
-        return `${E2EE_GROUP_EPOCH_PREFIX}${fsm.currentEpoch}:${epochRec.membersHash}:${bufToBase64(iv)}:${bufToBase64(cipherBuffer)}`;
+        const payload = `${E2EE_GROUP_EPOCH_PREFIX}${fsm.currentEpoch}:${epochRec.membersHash}:${bufToBase64(iv)}:${bufToBase64(cipherBuffer)}`;
+        const payloadHashKey = bufToBase64(sha256(new TextEncoder().encode(payload))).slice(0, 24);
+        if (options?.myUsername) {
+          saveSentPlaintextInMemory(options.myUsername, roomId, payloadHashKey, plainText);
+        }
+        return payload;
       } finally {
         zeroizeBuffer(msgKeyBytes);
       }
@@ -1836,9 +1841,27 @@ export async function decryptMessageText(
       throw new E2EEError('DECRYPTION_FAILED', 'Group epoch membersHash mismatch');
     }
 
-    // جلوگیری از Replay پیام گروهی: همان بار نباید دو بار پذیرفته شود.
+    const normMy = options?.myUsername ? normalizeKeystoreUsername(options.myUsername) : '';
+    const normSender = options?.sender ? normalizeKeystoreUsername(options.sender) : '';
+    const isSelfSent = Boolean(normMy && normSender && normMy === normSender);
+
+    if (isSelfSent) {
+      const cached = getSentPlaintextFromMemory(normMy, roomId, payloadHashKey);
+      if (cached !== null) {
+        return {
+          text: cached,
+          isEncrypted: true,
+          mode: 'GROUP-EPOCH-FSM',
+          epoch: msgEpoch,
+          mldsaVerified: true,
+          failed: false,
+        };
+      }
+    }
+
+    // جلوگیری از Replay پیام گروهی: همان بار نباید دو بار پذیرفته شود (مگر خود فرستنده در حال نمایش پیامش باشد)
     const seenSet = epochRec.seenMessageSet || (epochRec.seenMessageSet = new Set(epochRec.seenMessageKeys || []));
-    if (seenSet.has(payloadHashKey)) {
+    if (!isSelfSent && seenSet.has(payloadHashKey)) {
       throw new E2EEError('REPLAY_DETECTED', 'Replayed group message rejected');
     }
     const rootKeyBytes = epochRec.rootKey;
@@ -2212,3 +2235,24 @@ export function setE2EEEnabled(enabled: boolean): void {
     // ignore
   }
 }
+
+// M15: آزمون سلامت خودکار پساکوانتومی هنگام لود ماژول (KAT Round-Trip Self-Test)
+export function runStartupCryptoSelfTest(): boolean {
+  try {
+    const kem = ml_kem768.keygen();
+    const { cipherText, sharedSecret } = ml_kem768.encapsulate(kem.publicKey);
+    const decSec = ml_kem768.decapsulate(cipherText, kem.secretKey);
+    if (sharedSecret.length !== 32 || decSec.length !== 32) return false;
+    for (let i = 0; i < 32; i++) {
+      if (sharedSecret[i] !== decSec[i]) return false;
+    }
+    const dsa = ml_dsa65.keygen();
+    const msg = new TextEncoder().encode('PQ-MPRBA-SELF-TEST');
+    const sig = ml_dsa65.sign(msg, dsa.secretKey);
+    return ml_dsa65.verify(sig, msg, dsa.publicKey);
+  } catch (err) {
+    console.error('CRITICAL: Post-quantum crypto self-test failed at startup:', err);
+    return false;
+  }
+}
+runStartupCryptoSelfTest();
