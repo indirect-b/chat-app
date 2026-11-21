@@ -14,6 +14,7 @@ import {
   decryptMessageText,
   encryptMessageText,
   ensureUserHybridKeyPair,
+  getGroupSecurityBadge,
   getVerifiedBundleCacheStats,
   parsePeerKeyBundle,
   parsePeerKeyBundleStrict,
@@ -619,6 +620,21 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
 
     assert.equal(computeSafetyNumberForContact('bob-m5', tamperedStr, 'alice-m5'), null);
     assert.equal(markContactVerified('bob-m5', 'alice-m5', tamperedStr), null);
+  });
+
+  it('M7: group security badge is shown only when active epoch key exists in memory', async () => {
+    const badgeNoKey = getGroupSecurityBadge('group__no-key-group', 0);
+    assert.equal(badgeNoKey.isPQ, false);
+    assert.match(badgeNoKey.badge, /بدون کلید/);
+
+    const bundleStr = (await ensureUserHybridKeyPair('alice-m7'))!;
+    const bundle = parsePeerKeyBundleStrict(bundleStr, 'alice-m7');
+    const packet = await createGroupEpochPacket({ 'alice-m7': bundle });
+    await rotateGroupEpoch('with-key-group', 1, ['alice-m7'], packet.epochKeyB64);
+
+    const badgeWithKey = getGroupSecurityBadge('group__with-key-group', 1);
+    assert.equal(badgeWithKey.isPQ, true);
+    assert.match(badgeWithKey.badge, /Epoch #1/);
   });
 
   it('enforces strict Helmet CSP without unsafe-inline, unsafe-eval, or unpinned CDN assets', () => {

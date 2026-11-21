@@ -591,6 +591,29 @@ export interface RoomPQSecurityStatus {
 /**
  * تعیین وضعیت دقیق امنیتی اتاق و جلوگیری قطعی از تنزل خاموش (Silent Downgrade Protection)
  */
+export function hasActiveGroupEpochKey(roomId: string): boolean {
+  const cleanId = roomId.startsWith('group__') ? roomId.slice('group__'.length) : roomId;
+  const fsm = groupFsmMap.get(cleanId);
+  if (!fsm) return false;
+  const epochRec = fsm.epochs[fsm.currentEpoch];
+  return !!(epochRec && epochRec.rootKey && epochRec.rootKey.byteLength === 32);
+}
+
+export function getGroupSecurityBadge(roomId: string, currentEpoch: number): { isPQ: boolean; badge: string; tooltip: string } {
+  if (hasActiveGroupEpochKey(roomId) && currentEpoch > 0) {
+    return {
+      isPQ: true,
+      badge: `🔒 Epoch #${currentEpoch}`,
+      tooltip: 'رمزنگاری گروهی پساکوانتومی فعال و دارای کلید اپوک معتبر است',
+    };
+  }
+  return {
+    isPQ: false,
+    badge: '⚠️ بدون کلید اپوک',
+    tooltip: 'کلید اپوک برای این گروه هنوز ایجاد یا دریافت نشده است',
+  };
+}
+
 export function getRoomPQStatus(options: {
   roomId: string;
   isGroup: boolean;

@@ -22,6 +22,7 @@ import {
   isE2EEPayload,
   VoprfBlindTokenRecord,
   getRoomPQStatus,
+  getGroupSecurityBadge,
   parsePeerKeyBundle,
   getStoredPeerPublicKey,
   setStoredPeerPublicKey,
@@ -2051,7 +2052,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               >
                 {e2eeActive
                   ? currentIsGroup
-                    ? `🔒 Epoch #${currentGroupEpoch}`
+                    ? getGroupSecurityBadge(currentRoom, currentGroupEpoch).badge
                     : currentPQStatus?.isPQ
                     ? '🔒 PQ-KEM'
                     : currentPQStatus?.badge || '⚠️ غیر کوانتومی'
