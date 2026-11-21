@@ -31,6 +31,7 @@ import {
   clearRatchetSession,
   getMyMLDSAPublicKey,
   parsePeerKeyBundle,
+  parsePeerKeyBundleStrict,
 } from './crypto';
 
 export const SAFETY_PROTOCOL_ID = 'PQ-MPRBA-SAFETY-v1';
@@ -185,14 +186,18 @@ export function extractPeerMldsaPublicKeyBytes(
   expectedPeerUsername?: string
 ): { rawBytes: Uint8Array; base64: string } | null {
   if (!peerPublicKeyStr) return null;
-  const parsed = parsePeerKeyBundle(peerPublicKeyStr, expectedPeerUsername);
-  if (!parsed.hasMLDSA || !parsed.mldsaPub || parsed.mldsaPub.byteLength === 0) {
+  try {
+    const parsed = parsePeerKeyBundleStrict(peerPublicKeyStr, expectedPeerUsername, { skipCache: true });
+    if (!parsed.hasMLDSA || !parsed.mldsaPub || parsed.mldsaPub.byteLength === 0) {
+      return null;
+    }
+    return {
+      rawBytes: parsed.mldsaPub,
+      base64: bufToBase64(parsed.mldsaPub),
+    };
+  } catch {
     return null;
   }
-  return {
-    rawBytes: parsed.mldsaPub,
-    base64: bufToBase64(parsed.mldsaPub),
-  };
 }
 
 /**

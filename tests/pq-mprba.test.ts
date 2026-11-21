@@ -611,6 +611,16 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     assert.equal(afterWindow.allowed, true);
   });
 
+  it('M5: rejects tampered-signature bundle before extracting safety-number keys', async () => {
+    const aliceBundleStr = (await ensureUserHybridKeyPair('alice-m5'))!;
+    const aliceBundle = JSON.parse(aliceBundleStr);
+    aliceBundle.mldsaSigB64 = bufToBase64(new Uint8Array(3309).fill(0x42));
+    const tamperedStr = JSON.stringify(aliceBundle);
+
+    assert.equal(computeSafetyNumberForContact('bob-m5', tamperedStr, 'alice-m5'), null);
+    assert.equal(markContactVerified('bob-m5', 'alice-m5', tamperedStr), null);
+  });
+
   it('enforces strict Helmet CSP without unsafe-inline, unsafe-eval, or unpinned CDN assets', () => {
     const serverSrc = fs.readFileSync(path.resolve(process.cwd(), 'server.ts'), 'utf8');
     const adminHtml = fs.readFileSync(path.resolve(process.cwd(), 'public/admin.html'), 'utf8');
