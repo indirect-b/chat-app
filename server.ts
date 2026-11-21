@@ -1,6 +1,6 @@
 // sync checkpoint — no behavior change (verified)
 import 'dotenv/config';
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import helmet from 'helmet';
 import http from 'http';
 import { Server as SocketIOServer } from 'socket.io';
@@ -15,7 +15,7 @@ import { config, verifyAdminSecret } from './src/server/config';
 import * as bale from './src/server/bale';
 import { pool, init } from './src/server/db';
 import { presence } from './src/server/presence';
-import { getRoomId, resolveMediaAccess, canUploadToRoom } from './src/server/media';
+import { getRoomId, resolveMediaAccess, canUploadToRoom, isRoomMember } from './src/server/media';
 import { checkRoomReadAccess, checkOwnGroupsAccess, checkOwnUsername } from './src/server/roomAccess';
 import {
   generateRecoveryCode,
@@ -44,6 +44,8 @@ import {
 
 const APP_VERSION = '6.5.0';
 const recoverRateLimiter = new RecoveryRateLimiter(5, 15 * 60 * 1000);
+const googleLoginLimiter = new RecoveryRateLimiter(20, 15 * 60 * 1000);
+const voprfRateLimiter = new RecoveryRateLimiter(60, 60 * 1000);
 
 // کلید سرور برای پروتکل احراز هویت کور Ristretto255-VOPRF (RFC 9497)
 // در صورت وجود VOPRF_SEED اختصاصی (۳۲ بایت Base64) از آن استفاده می‌شود؛ در غیاب
@@ -426,15 +428,21 @@ async function completeGoogleSignIn(
 }> {
   const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [email]);
   let recoveryCode: string | undefined;
-  const isNew = rows.length === 0;
+  let isNew = rows.length === 0;
   if (isNew) {
     recoveryCode = generateRecoveryCode();
     const recoveryCodeHash = await hashRecoveryCode(recoveryCode);
-    await pool.query(
-      'INSERT INTO users (username, bale_chat_id, joined_at, recovery_code_hash, email, display_name, avatar, name_custom, avatar_custom) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
-      [email, null, new Date().toISOString(), recoveryCodeHash, email, profile.name, profile.picture, 0, 0]
-    );
-  } else {
+    try {
+      await pool.query(
+        'INSERT INTO users (username, bale_chat_id, joined_at, recovery_code_hash, email, display_name, avatar, name_custom, avatar_custom) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+        [email, null, new Date().toISOString(), recoveryCodeHash, email, profile.name, profile.picture, 0, 0]
+      );
+    } catch {
+      isNew = false;
+      recoveryCode = undefined;
+    }
+  }
+  if (!isNew) {
     const { rows: stored } = await pool.query(
       'SELECT display_name, avatar, name_custom, avatar_custom FROM users WHERE username = $1',
       [email]
@@ -460,6 +468,12 @@ async function completeGoogleSignIn(
 
 app.post('/api/google-login', async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
+  const clientIp = (req.ip || (req.socket && req.socket.remoteAddress) || 'unknown').toString();
+  const limit = googleLoginLimiter.checkAndConsume(clientIp, 'google-login');
+  if (!limit.allowed) {
+    res.setHeader('Retry-After', String(limit.retryAfterSec));
+    return res.status(429).json({ ok: false, msg: 'Too many requests' });
+  }
   if (!isGoogleConfigured()) return res.json({ ok: false, msg: GOOGLE_DISABLED_MSG });
   const idToken = String((req.body || {}).idToken || '').trim();
   if (!idToken) return res.json({ ok: false, msg: GOOGLE_LOGIN_FAILED_MSG });
@@ -505,6 +519,12 @@ app.post('/api/google-login', async (req: Request, res: Response) => {
 app.post('/api/google-redirect', async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
   res.setHeader('Referrer-Policy', 'no-referrer');
+  const clientIp = (req.ip || (req.socket && req.socket.remoteAddress) || 'unknown').toString();
+  const limit = googleLoginLimiter.checkAndConsume(clientIp, 'google-login');
+  if (!limit.allowed) {
+    res.setHeader('Retry-After', String(limit.retryAfterSec));
+    return res.status(429).send('Too many requests');
+  }
   if (!isGoogleConfigured()) {
     return res.status(403).send(GOOGLE_DISABLED_MSG);
   }
@@ -636,6 +656,12 @@ app.post('/api/quick-login', (_req: Request, res: Response) => {
 
 // ===== RISTRETTO255-VOPRF BLINDED IDENTITY EVALUATION (RFC 9497) =====
 app.post('/api/voprf/evaluate', (req: Request, res: Response) => {
+  const clientIp = (req.ip || (req.socket && req.socket.remoteAddress) || 'unknown').toString();
+  const limit = voprfRateLimiter.checkAndConsume(clientIp, 'voprf');
+  if (!limit.allowed) {
+    res.setHeader('Retry-After', String(limit.retryAfterSec));
+    return res.status(429).json({ ok: false, msg: 'Too many requests' });
+  }
   try {
     const { blindedB64 } = req.body;
     if (!blindedB64) return res.status(400).json({ ok: false });
@@ -669,7 +695,18 @@ app.get('/api/user/:username', async (req: Request, res: Response) => {
 
 app.post('/api/user/public-key', async (req: Request, res: Response) => {
   const { username, publicKey } = req.body;
-  if (!username || !publicKey) return res.json({ ok: false });
+  if (!username || !publicKey || typeof publicKey !== 'string') return res.json({ ok: false });
+  if (publicKey.length < 50 || publicKey.length > 32768) {
+    return res.status(400).json({ ok: false, msg: 'invalid public key bundle length' });
+  }
+  try {
+    const parsed = JSON.parse(publicKey);
+    if (!parsed || typeof parsed !== 'object' || !parsed.ecdhJwk || typeof parsed.ecdhJwk !== 'object') {
+      return res.status(400).json({ ok: false, msg: 'invalid public key bundle format' });
+    }
+  } catch {
+    return res.status(400).json({ ok: false, msg: 'malformed bundle json' });
+  }
   // فقط کاربر احراز هویت شده با نشست معتبر امکان ثبت و تغییر باندل را دارد؛
   // در غیر این صورت هر کسی می‌توانست باندل هر کاربری را جایگزین کند.
   const sessionUser = getSessionUsername(req);
@@ -687,6 +724,16 @@ app.post('/api/user/public-key', async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
+// صدور مجدد کد بازیابی برای کاربر احراز هویت شده
+app.post(['/api/auth/reissue-recovery-code', '/api/reissue-recovery-code'], async (req: Request, res: Response) => {
+  const sessionUser = getSessionUsername(req);
+  if (!sessionUser) return res.status(401).json({ ok: false, msg: 'unauthorized' });
+  const newCode = generateRecoveryCode();
+  const hash = await hashRecoveryCode(newCode);
+  await pool.query('UPDATE users SET recovery_code_hash = $1 WHERE username = $2', [hash, sessionUser]);
+  res.json({ ok: true, recoveryCode: newCode });
+});
+
 // ===== GROUP EPOCH KEY PACKETS =====
 // بسته کلید اپوک گروه: توزیع‌کننده (سازنده گروه) کلید تصادفی اپوک را با
 // ML-KEM-768 به هر عضو کپسوله می‌کند؛ سرور فقط کپسول‌ها را نگه می‌دارد و
@@ -695,14 +742,18 @@ app.post('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
   const sessionUser = getSessionUsername(req);
   if (!sessionUser) return res.status(401).json({ ok: false });
   const { epoch, keys } = req.body as { epoch?: unknown; keys?: unknown };
-  if (typeof epoch !== 'number' || !Number.isInteger(epoch) || epoch < 1) {
+  if (typeof epoch !== 'number' || !Number.isSafeInteger(epoch) || epoch < 1 || epoch > Number.MAX_SAFE_INTEGER) {
     return res.json({ ok: false, msg: 'invalid epoch' });
   }
   if (!keys || typeof keys !== 'object' || Array.isArray(keys)) {
     return res.json({ ok: false, msg: 'invalid keys' });
   }
-  for (const [u, ct] of Object.entries(keys as Record<string, unknown>)) {
-    if (typeof u !== 'string' || !u || typeof ct !== 'string' || !/^[A-Za-z0-9+/=]+$/.test(ct)) {
+  const keyEntries = Object.entries(keys as Record<string, unknown>);
+  if (keyEntries.length > 200) {
+    return res.json({ ok: false, msg: 'too many key entries' });
+  }
+  for (const [u, ct] of keyEntries) {
+    if (typeof u !== 'string' || !u || typeof ct !== 'string' || ct.length > 2048 || !/^[A-Za-z0-9+/=]+$/.test(ct)) {
       return res.json({ ok: false, msg: 'invalid key entry' });
     }
   }
@@ -710,6 +761,20 @@ app.post('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
   if (!rows.length) return res.json({ ok: false, msg: 'group not found' });
   const members: string[] = JSON.parse(rows[0].members);
   if (!members.includes(sessionUser)) return res.status(403).json({ ok: false });
+  // H2: انحصار چرخش اپوک به توزیع‌کننده گروه (عضو اول)
+  if (members[0] !== sessionUser) {
+    return res.status(403).json({ ok: false, msg: 'only group distributor can post epoch packets' });
+  }
+  // DP-10: جلوگیری از rollback اپوک
+  const rawPrev = await getSetting(`group_epoch_packet_${req.params.id}`);
+  if (rawPrev) {
+    try {
+      const prev = JSON.parse(rawPrev);
+      if (typeof prev.epoch === 'number' && epoch <= prev.epoch) {
+        return res.json({ ok: false, msg: 'epoch must be greater than current epoch' });
+      }
+    } catch {}
+  }
   const packet = { epoch, keys, postedBy: sessionUser, postedAt: new Date().toISOString() };
   await setSetting(`group_epoch_packet_${req.params.id}`, JSON.stringify(packet));
   // پخش فوری به اعضای آنلاین
@@ -1518,12 +1583,20 @@ io.on('connection', async (socket) => {
     io.emit('msg-reaction', { roomId, msgId, reactions });
   });
 
-  socket.on('forward-message', async ({ msgId, toRooms }: any) => {
-    if (!currentUser) return;
+  socket.on('forward-message', async (data: any) => {
+    if (!currentUser || !data || typeof data !== 'object') return;
+    const { msgId, toRooms } = data;
+    if (typeof msgId !== 'string' || !Array.isArray(toRooms) || toRooms.length === 0 || toRooms.length > 50) return;
     const { rows } = await pool.query('SELECT * FROM messages WHERE id=$1', [msgId]);
     if (!rows.length) return;
     const orig = rows[0];
+    const canReadOrig = await isRoomMember(currentUser, orig.room_id, (sql, params) => pool.query(sql, params));
+    if (!canReadOrig) return;
+
     for (const roomId of toRooms) {
+      if (typeof roomId !== 'string' || !roomId) continue;
+      const canWriteDest = await isRoomMember(currentUser, roomId, (sql, params) => pool.query(sql, params));
+      if (!canWriteDest) continue;
       const newMsg = {
         id: uuidv4(),
         room_id: roomId,
@@ -1785,6 +1858,13 @@ async function start(): Promise<void> {
       return sendNotFound(req, res);
     });
   }
+
+  // Global error handler middleware (DP-3)
+  app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
+    console.error('Unhandled express route error:', err && err.message ? err.message : String(err));
+    if (res.headersSent) return next(err);
+    res.status(500).json({ ok: false, msg: 'Internal server error' });
+  });
 
   server.listen(config.PORT, '0.0.0.0', () => {
     console.log(`✅ سرور TypeScript + React نسخه ${APP_VERSION} روی پورت ${config.PORT}`);
