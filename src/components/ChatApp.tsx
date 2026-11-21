@@ -1890,27 +1890,13 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         </div>
 
         {activeTab === 'groups' && (
-          <div style={{ padding: '8px 12px 2px' }}>
+          <div className="group-create-bar">
             <button
               type="button"
+              className="btn-create-group"
               onClick={() => setGroupModalOpen(true)}
-              style={{
-                width: '100%',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: '8px',
-                padding: '9px 12px',
-                borderRadius: '10px',
-                background: 'rgba(124, 58, 237, 0.16)',
-                border: '1px dashed rgba(124, 58, 237, 0.45)',
-                color: '#c4b5fd',
-                fontSize: '12.5px',
-                fontWeight: 600,
-                cursor: 'pointer',
-              }}
             >
-              <span>➕</span>
+              <span aria-hidden="true">➕</span>
               <span>ایجاد گروه / روم جدید</span>
             </button>
           </div>
@@ -1918,31 +1904,23 @@ export const ChatApp: React.FC<ChatAppProps> = ({
 
         <div className="chat-list" id="chatList">
           {filteredRooms.length === 0 ? (
-            <div style={{ textAlign: 'center', padding: '36px 16px', color: '#9ca3af', fontSize: '13px' }}>
+            <div className="chat-list-empty">
               {activeTab === 'groups' ? (
                 <div>
-                  <div style={{ fontSize: '32px', marginBottom: '8px' }}>👥</div>
-                  <p style={{ margin: '0 0 10px' }}>هنوز عضوی در گروهی نیستید</p>
+                  <div className="empty-icon" aria-hidden="true">👥</div>
+                  <p>هنوز عضوی در گروهی نیستید</p>
                   <button
                     type="button"
+                    className="btn-primary-sm"
                     onClick={() => setGroupModalOpen(true)}
-                    style={{
-                      padding: '7px 16px',
-                      borderRadius: '8px',
-                      background: 'var(--primary, #7c3aed)',
-                      color: '#fff',
-                      border: 'none',
-                      cursor: 'pointer',
-                      fontSize: '12px',
-                    }}
                   >
                     ساخت گروه جدید
                   </button>
                 </div>
               ) : (
                 <div>
-                  <div style={{ fontSize: '32px', marginBottom: '8px' }}>💬</div>
-                  <p style={{ margin: 0 }}>مخاطبی یافت نشد</p>
+                  <div className="empty-icon" aria-hidden="true">💬</div>
+                  <p>مخاطبی یافت نشد</p>
                 </div>
               )}
             </div>
@@ -1996,16 +1974,11 @@ export const ChatApp: React.FC<ChatAppProps> = ({
             </button>
             <button
               type="button"
-              className="foot-btn"
+              className="foot-btn foot-btn-changelog"
               onClick={() => setChangelogModalOpen(true)}
-              style={{
-                background: 'rgba(124, 58, 237, 0.18)',
-                border: '1px solid rgba(124, 58, 237, 0.4)',
-                color: '#c4b5fd',
-              }}
               title="مشاهده تغییرات و معماری اختصاصی PQ-MPRBA v6.0"
             >
-              🚀 چنج‌لاگ v6.0
+              <span aria-hidden="true">🚀</span> چنج‌لاگ v6.0
             </button>
           </div>
           <div className="my-id">
