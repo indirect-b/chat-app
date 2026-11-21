@@ -17,7 +17,7 @@
 - **Account & Data Rights:** Terms of service, offline account data export (JSON), and permanent account deletion secured by recovery codes.
 
 ## 3. Durable Constraints
-- **Design Persona & Direction:** Dark-first, moody, minimalist, cosmic nebula/cyan accent. Zero purple-blue gradients, zero generic AI slop.
+- **Design Persona & Direction:** Dark-first, moody, minimalist, cosmic nebula/cyan accent. Zero purple-blue gradients, zero generic template cliches.
 - **Language & Directionality:** Persian RTL (`dir="rtl"`) first. English/code blocks inside (`dir="ltr"`) must never break layout.
 - **Performance Budget:** 60fps on low-end hardware (e.g. Intel Core i7-5500U / GeForce 940M / HDD). Composite-only CSS animations (transform, opacity). No CPU/GPU-heavy 3D/shader bloat.
 - **Security Invariant:** Never modify cryptographic algorithms, keystore storage, or verification logic. Keep trust signals prominent and uncompromised.

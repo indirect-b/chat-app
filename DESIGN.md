@@ -1,7 +1,7 @@
 # DESIGN.md — Chat App Visual Design System
 
 ## 1. Visual World: Nebula Minimal (Dark-First)
-A precise, focused, and moody aesthetic designed for high-focus communications. The interface eliminates visual clutter, generic AI gradient slop, and oversized decoration in favor of high-contrast legibility, tactile micro-interactions, and cryptographic clarity.
+A precise, focused, and moody aesthetic designed for high-focus communications. The interface eliminates visual clutter, generic template gradient clutter, and oversized decoration in favor of high-contrast legibility, tactile micro-interactions, and cryptographic clarity.
 
 - **Anchor Tone:** Deep cosmic black (`#090a0f`) and slate-toned dark surfaces (`#0e1117`, `#141822`).
 - **Signature Accent:** Nebula Cyan (`#06b6d4`, `#22d3ee`) with controlled deep cyan undertones (`rgba(6, 182, 212, 0.15)`).
