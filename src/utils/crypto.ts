@@ -137,6 +137,7 @@ export interface GroupEpochKeyRecord {
   createdAt: number;
   membersHash: string;
   seenMessageKeys?: string[]; // شناسه پیام‌های تحویل‌شده در این اپوک جهت جلوگیری از Replay
+  seenMessageSet?: Set<string>;
 }
 
 export interface GroupEpochState {
@@ -1836,7 +1837,8 @@ export async function decryptMessageText(
     }
 
     // جلوگیری از Replay پیام گروهی: همان بار نباید دو بار پذیرفته شود.
-    if (epochRec.seenMessageKeys?.includes(payloadHashKey)) {
+    const seenSet = epochRec.seenMessageSet || (epochRec.seenMessageSet = new Set(epochRec.seenMessageKeys || []));
+    if (seenSet.has(payloadHashKey)) {
       throw new E2EEError('REPLAY_DETECTED', 'Replayed group message rejected');
     }
     const rootKeyBytes = epochRec.rootKey;
@@ -1863,10 +1865,10 @@ export async function decryptMessageText(
         cipherBytes as unknown as BufferSource
       );
       const plainText = new TextDecoder('utf-8', { fatal: true }).decode(decryptedBuffer);
-      // ثبت پیام به‌عنوان تحویل‌شده پس از رمزگشایی موفق
-      const seen = epochRec.seenMessageKeys || (epochRec.seenMessageKeys = []);
-      seen.push(payloadHashKey);
-      if (seen.length > 500) seen.splice(0, seen.length - 500);
+      // ثبت پیام به‌عنوان تحویل‌شده پس از رمزگشایی موفق بدون فراموشی خاموش در طول اپوک (M2)
+      seenSet.add(payloadHashKey);
+      if (!epochRec.seenMessageKeys) epochRec.seenMessageKeys = [];
+      epochRec.seenMessageKeys.push(payloadHashKey);
       return {
         text: plainText,
         isEncrypted: true,
