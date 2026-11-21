@@ -42,8 +42,7 @@ export const config: ServerConfig = {
 
 export function verifyAdminSecret(candidate: string | undefined): boolean {
   if (!candidate || typeof candidate !== 'string') return false;
-  const a = Buffer.from(candidate, 'utf-8');
-  const b = Buffer.from(config.ADMIN_PASSWORD, 'utf-8');
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
+  const hashA = crypto.createHash('sha256').update(candidate, 'utf-8').digest();
+  const hashB = crypto.createHash('sha256').update(config.ADMIN_PASSWORD, 'utf-8').digest();
+  return crypto.timingSafeEqual(hashA, hashB);
 }

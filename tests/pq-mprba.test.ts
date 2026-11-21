@@ -41,6 +41,7 @@ import {
   hashRecoveryCode,
   verifyRecoveryCode,
 } from '../src/server/recovery';
+import { config, verifyAdminSecret } from '../src/server/config';
 
 class MemoryStorage implements Storage {
   private map = new Map<string, string>();
@@ -674,6 +675,18 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     // 4. Deterministic reproducibility
     const matrix2 = generateQrCodeMatrix(payload);
     assert.deepEqual(matrix, matrix2);
+  });
+
+  it('I4: verifies admin secret with SHA-256 pre-hashing without leaking password length via timing path', () => {
+    // Valid password matches
+    assert.equal(verifyAdminSecret(config.ADMIN_PASSWORD), true);
+
+    // Wrong passwords of various lengths fail in constant-time path
+    assert.equal(verifyAdminSecret('wrong'), false);
+    assert.equal(verifyAdminSecret('x'.repeat(config.ADMIN_PASSWORD.length)), false);
+    assert.equal(verifyAdminSecret('x'.repeat(config.ADMIN_PASSWORD.length + 10)), false);
+    assert.equal(verifyAdminSecret(''), false);
+    assert.equal(verifyAdminSecret(undefined), false);
   });
 
   it('enforces strict Helmet CSP without unsafe-inline, unsafe-eval, or unpinned CDN assets', () => {
