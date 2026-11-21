@@ -1814,7 +1814,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               </div>
               <div>
                 <div id="myName" style={{ fontSize: '14px', fontWeight: 600 }}>
-                  @{myUsername}
+                  <bdi dir="ltr">@{myUsername}</bdi>
                 </div>
                 <div id="myStatusLabel" style={{ fontSize: '11px', color: '#9ca3af' }}>
                   {myProfile.status === 'online'
@@ -1982,7 +1982,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
             </button>
           </div>
           <div className="my-id">
-            @<span id="myIdDisplay">{myUsername}</span>
+            <bdi dir="ltr">@<span id="myIdDisplay">{myUsername}</span></bdi>
           </div>
         </div>
       </div>

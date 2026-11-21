@@ -223,11 +223,17 @@
   border-radius: var(--radius-md);
   border: 1px solid transparent;
   cursor: pointer;
-  transition: all var(--duration-fast) var(--ease-out-cubic);
+  transition: background var(--duration-fast) var(--ease-out-cubic),
+              border-color var(--duration-fast) var(--ease-out-cubic),
+              transform var(--duration-fast) var(--ease-out-cubic);
 }
 
 .chat-item:hover {
   background: var(--bg-surface-hover);
+}
+
+.chat-item:active {
+  transform: scale(0.99);
 }
 
 .chat-item.active {
@@ -291,6 +297,9 @@
   display: flex;
   align-items: center;
   gap: 4px;
+  unicode-bidi: plaintext;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .ci-time {
@@ -505,6 +514,7 @@
   font-size: 15px;
   font-weight: 600;
   color: var(--text-primary);
+  unicode-bidi: plaintext;
 }
 
 .chat-header-status {
@@ -592,6 +602,8 @@
   font-size: 14.5px;
   line-height: 1.55;
   word-break: break-word;
+  overflow-wrap: anywhere;
+  unicode-bidi: plaintext;
   position: relative;
   user-select: text;
   box-shadow: var(--shadow-sm);
