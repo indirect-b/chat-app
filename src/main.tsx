@@ -1,5 +1,6 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
+import 'sonner/dist/styles.css';
 import '../public/css/base.css';
 import '../public/css/auth.css';
 import '../public/css/chat.css';

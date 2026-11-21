@@ -30,3 +30,11 @@ Thumbs.db
 # لاگ‌ها
 *.log
 npm-debug.log*
+
+# Agent harnesses
+.agent/
+.agents/
+.claude/
+.dsh/
+.gemini/
+.impeccable/

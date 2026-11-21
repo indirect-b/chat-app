@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, Suspense } from 'react';
 import type { Socket } from 'socket.io-client';
+import { Toaster, toast } from 'sonner';
 import { BlockedInfo } from './types';
 
 const AuthScreen = React.lazy(() =>
@@ -104,6 +105,11 @@ export const App: React.FC = () => {
   }, []);
 
   const showToast = useCallback((text: string) => {
+    try {
+      toast(text);
+    } catch {
+      // fallback
+    }
     const id = Date.now() + Math.random();
     setToasts(prev => [...prev, { id, text }]);
     setTimeout(() => {
@@ -410,6 +416,7 @@ export const App: React.FC = () => {
         </div>
       )}
 
+      <Toaster dir="rtl" theme="dark" position="top-center" richColors closeButton />
       <div id="toastRoot">
         {toasts.map(t => (
           <div key={t.id} className="toast-msg">
