@@ -79,6 +79,17 @@ function getSafeLocalStorage(): Storage | null {
   return null;
 }
 
+function getSafeSessionStorage(): Storage | null {
+  try {
+    if (typeof globalThis !== 'undefined' && 'sessionStorage' in globalThis && globalThis.sessionStorage) {
+      return globalThis.sessionStorage;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
 export function getStoredPeerPublicKey(peerUsername: string): string | null {
   const ls = getSafeLocalStorage();
   if (!ls) return null;
@@ -2228,23 +2239,33 @@ export function isEncryptedFileBytes(data: Uint8Array | null | undefined): boole
 }
 
 export function getRoomSecret(roomId: string): string {
-  const ls = getSafeLocalStorage();
-  if (!ls) return '';
+  const ss = getSafeSessionStorage();
+  if (!ss) return '';
   try {
-    return ls.getItem(`${ROOM_KEY_STORAGE_PREFIX}${roomId}`) || '';
+    return ss.getItem(`${ROOM_KEY_STORAGE_PREFIX}${roomId}`) || '';
   } catch {
     return '';
   }
 }
 
 export function setRoomSecret(roomId: string, secret: string): void {
-  const ls = getSafeLocalStorage();
-  if (!ls) return;
+  const ss = getSafeSessionStorage();
+  if (!ss) return;
   try {
+    // M9 Remediation: ensure room passphrases are stored in ephemeral sessionStorage only,
+    // and actively clean up any stale legacy copy that may exist in persistent localStorage.
+    const ls = getSafeLocalStorage();
+    if (ls) {
+      try {
+        ls.removeItem(`${ROOM_KEY_STORAGE_PREFIX}${roomId}`);
+      } catch {
+        // ignore
+      }
+    }
     if (secret.trim()) {
-      ls.setItem(`${ROOM_KEY_STORAGE_PREFIX}${roomId}`, secret.trim());
+      ss.setItem(`${ROOM_KEY_STORAGE_PREFIX}${roomId}`, secret.trim());
     } else {
-      ls.removeItem(`${ROOM_KEY_STORAGE_PREFIX}${roomId}`);
+      ss.removeItem(`${ROOM_KEY_STORAGE_PREFIX}${roomId}`);
     }
   } catch {
     // ignore

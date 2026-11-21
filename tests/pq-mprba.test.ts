@@ -15,12 +15,14 @@ import {
   encryptMessageText,
   ensureUserHybridKeyPair,
   getGroupSecurityBadge,
+  getRoomSecret,
   getVerifiedBundleCacheStats,
   parsePeerKeyBundle,
   parsePeerKeyBundleStrict,
   resetAllCryptoStateForTests,
   rotateGroupEpoch,
   serializeMessageForSigning,
+  setRoomSecret,
   withUnwrappedMLDSASecretKey,
   zeroizeBuffer,
 } from '../src/utils/crypto';
@@ -66,8 +68,14 @@ class MemoryStorage implements Storage {
 }
 
 const mockLocalStorage = new MemoryStorage();
+const mockSessionStorage = new MemoryStorage();
 Object.defineProperty(globalThis, 'localStorage', {
   value: mockLocalStorage,
+  configurable: true,
+  writable: true,
+});
+Object.defineProperty(globalThis, 'sessionStorage', {
+  value: mockSessionStorage,
   configurable: true,
   writable: true,
 });
@@ -75,6 +83,7 @@ Object.defineProperty(globalThis, 'localStorage', {
 describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
   beforeEach(() => {
     mockLocalStorage.clear();
+    mockSessionStorage.clear();
     resetAllCryptoStateForTests();
   });
 
@@ -723,5 +732,26 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     assert.equal(adminHtml.includes('fonts.googleapis.com'), false, 'admin.html must not load unpinned Google Fonts CDN');
     assert.equal(/<style[\s>]/i.test(adminHtml), false, 'admin.html must not contain inline <style> blocks');
     assert.equal(/<script(?![^>]*\bsrc=)[^>]*>/i.test(adminHtml), false, 'admin.html must not contain inline <script> blocks');
+  });
+
+  it('stores room passphrases in ephemeral sessionStorage and never in localStorage (M9)', () => {
+    const roomId = 'confidential-team-room';
+    const secret = 'ultra-secure-passphrase-2026';
+    setRoomSecret(roomId, secret);
+
+    assert.equal(getRoomSecret(roomId), secret);
+    assert.equal(mockSessionStorage.getItem(`chat_e2ee_pass_${roomId}`), secret);
+    assert.equal(mockLocalStorage.getItem(`chat_e2ee_pass_${roomId}`), null);
+
+    // Also verify cleanup of legacy localStorage entry if one existed prior to setRoomSecret
+    mockLocalStorage.setItem(`chat_e2ee_pass_${roomId}`, 'stale-leaked-secret');
+    setRoomSecret(roomId, secret);
+    assert.equal(mockLocalStorage.getItem(`chat_e2ee_pass_${roomId}`), null);
+    assert.equal(mockSessionStorage.getItem(`chat_e2ee_pass_${roomId}`), secret);
+
+    // Verify clearing
+    setRoomSecret(roomId, '');
+    assert.equal(getRoomSecret(roomId), '');
+    assert.equal(mockSessionStorage.getItem(`chat_e2ee_pass_${roomId}`), null);
   });
 });
