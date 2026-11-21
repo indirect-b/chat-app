@@ -272,47 +272,84 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
 
   return (
     <div id="authScreen" className="auth-screen">
+      <div className="auth-ambient-glow" aria-hidden="true">
+        <div className="ambient-nebula-blob blob-1" />
+        <div className="ambient-nebula-blob blob-2" />
+      </div>
+
       <div id={`step${step}`} className="auth-box">
         <header role="banner" aria-label="سربرگ صفحه" className="auth-banner">
           <a href="/" className="auth-brand">
-            <span className="auth-brand-icon" aria-hidden="true">
-              💬
+            <span className="auth-brand-icon-wrap" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 2L4 5v6c0 5.55 3.84 10.74 8 12 4.16-1.26 8-6.45 8-12V5l-8-3z" />
+                <path d="M12 8v4" />
+                <path d="M12 16h.01" />
+              </svg>
             </span>
-            <span className="auth-brand-name">سامانه پیام‌رسان</span>
+            <span className="auth-brand-name">پیام‌رسان امن</span>
           </a>
+          <div className="auth-security-badge" aria-label="پروتکل امنیتی PQ-MPRBA">
+            <span className="badge-pulse-dot" aria-hidden="true" />
+            <span>ML-KEM-768</span>
+          </div>
         </header>
 
         <main id="main-content" tabIndex={-1}>
           {step === 1 && (
-            <>
+            <div className="auth-step-anim">
               <div className="auth-logo">
-                <div className="logo-circle" aria-hidden="true">
-                  💬
+                <div className="logo-circle-container">
+                  <div className="logo-halo" aria-hidden="true" />
+                  <div className="logo-circle" aria-hidden="true">
+                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="url(#cyanGrad)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <defs>
+                        <linearGradient id="cyanGrad" x1="0" y1="0" x2="24" y2="24" gradientUnits="userSpaceOnUse">
+                          <stop stopColor="#22d3ee" />
+                          <stop stopColor="#06b6d4" />
+                        </linearGradient>
+                      </defs>
+                      <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+                      <circle cx="9" cy="12" r="1" fill="#22d3ee" />
+                      <circle cx="12" cy="12" r="1" fill="#22d3ee" />
+                      <circle cx="15" cy="12" r="1" fill="#22d3ee" />
+                    </svg>
+                  </div>
                 </div>
                 <h1>پیام‌رسان</h1>
-                <p>ورود با گوگل • مجهز به رمزنگاری E2EE</p>
+                <p>ورود با گوگل • مجهز به رمزنگاری پسا-کوانتومی E2EE</p>
               </div>
-              {googleClientId && googleReady ? (
-                <div
-                  ref={googleBtnRef}
-                  style={{ display: 'flex', justifyContent: 'center', marginBottom: '12px' }}
-                />
-              ) : (
-                <p className="auth-msg" role="status">
-                  ورود با گوگل فعلاً در دسترس نیست. لطفاً بعداً دوباره تلاش کنید.
-                </p>
-              )}
+
+              <div className="google-btn-container">
+                {googleClientId && googleReady ? (
+                  <div
+                    ref={googleBtnRef}
+                    className="google-btn-wrapper"
+                  />
+                ) : (
+                  <div className="google-btn-loading" role="status">
+                    <span className="spinner-dot" aria-hidden="true" />
+                    <span>در حال اتصال امن به درگاه گوگل...</span>
+                  </div>
+                )}
+              </div>
+
               <div className="auth-form">
                 <button
                   type="button"
-                  className="btn-ghost"
+                  className="btn-recovery-link"
                   onClick={() => {
                     setMsg({ text: '', isOk: false });
                     setRecoveryError('');
                     setStep(5);
                   }}
                 >
-                  🔑 ورود با کد بازیابی (در صورت عدم دسترسی به حساب گوگل)
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <circle cx="7.5" cy="15.5" r="5.5" />
+                    <path d="m21 2-9.6 9.6" />
+                    <path d="m15.5 7.5 3 3L22 7l-3-3" />
+                  </svg>
+                  <span>ورود اضطراری با کد بازیابی (عدم دسترسی به گوگل)</span>
                 </button>
                 <p
                   id="msg1"
@@ -323,18 +360,22 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                   {msg.text}
                 </p>
               </div>
-            </>
+            </div>
           )}
 
           {step === 4 && (
-            <>
+            <div className="auth-step-anim">
               <div className="auth-logo">
                 <div
                   className="logo-circle"
-                  style={{ background: 'rgba(245, 158, 11, 0.15)', borderColor: '#f59e0b', boxShadow: '0 0 20px rgba(245, 158, 11, 0.25)' }}
+                  style={{ background: 'rgba(245, 158, 11, 0.15)', borderColor: '#f59e0b', boxShadow: '0 0 24px rgba(245, 158, 11, 0.3)' }}
                   aria-hidden="true"
                 >
-                  🗝️
+                  <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="7.5" cy="15.5" r="5.5" />
+                    <path d="m21 2-9.6 9.6" />
+                    <path d="m15.5 7.5 3 3L22 7l-3-3" />
+                  </svg>
                 </div>
                 <h1>{recoveryHeading}</h1>
                 <p>این کد فقط یک‌بار نمایش داده می‌شود و در سرور به‌صورت هش نگهداری می‌گردد.</p>
@@ -342,19 +383,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
               <div className="auth-form">
                 <div
                   dir="ltr"
-                  style={{
-                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                    fontSize: '14px',
-                    letterSpacing: '1px',
-                    padding: '14px 12px',
-                    borderRadius: '12px',
-                    background: 'rgba(245, 158, 11, 0.12)',
-                    border: '1px solid rgba(245, 158, 11, 0.4)',
-                    color: '#fef3c7',
-                    textAlign: 'center',
-                    wordBreak: 'break-all',
-                    userSelect: 'all',
-                  }}
+                  className="recovery-code-card"
                 >
                   {issuedRecoveryCode}
                 </div>
@@ -362,7 +391,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                   اگر به حساب گوگل خود دسترسی ندارید، می‌توانید با این کد یک‌بارمصرف وارد حساب خود
                   شوید. پس از هر بار استفاده، کد جدیدی جایگزین آن می‌شود.
                 </p>
-                <button type="button" className="btn-ghost" onClick={handleCopyRecoveryCode}>
+                <button type="button" className="btn-recovery-copy" onClick={handleCopyRecoveryCode}>
                   {recoveryCopied ? '✅ کپی شد' : '📋 کپی کد بازیابی'}
                 </button>
                 <div className="rules-check">
@@ -379,7 +408,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                 <button
                   type="button"
                   disabled={!recoverySavedChecked}
-                  className={!recoverySavedChecked ? 'btn-disabled' : ''}
+                  className={`btn-primary-action ${!recoverySavedChecked ? 'btn-disabled' : ''}`}
                   onClick={() => {
                     setIssuedRecoveryCode('');
                     onAuthenticated(pendingAuthUsername);
@@ -388,18 +417,22 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                   ادامه به پیام‌رسان
                 </button>
               </div>
-            </>
+            </div>
           )}
 
           {step === 5 && (
-            <>
+            <div className="auth-step-anim">
               <div className="auth-logo">
                 <div
                   className="logo-circle"
-                  style={{ background: 'var(--bg-surface-2)', borderColor: 'var(--accent-cyan)', boxShadow: '0 0 20px var(--accent-cyan-dim)' }}
+                  style={{ background: 'var(--bg-surface-2)', borderColor: 'var(--accent-cyan)', boxShadow: '0 0 24px var(--accent-cyan-dim)' }}
                   aria-hidden="true"
                 >
-                  🔑
+                  <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="var(--accent-cyan)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="7.5" cy="15.5" r="5.5" />
+                    <path d="m21 2-9.6 9.6" />
+                    <path d="m15.5 7.5 3 3L22 7l-3-3" />
+                  </svg>
                 </div>
                 <h1>ورود با کد بازیابی</h1>
                 <p>در صورت عدم دسترسی به حساب گوگل از کد بازیابی یک‌بارمصرف استفاده کنید</p>
@@ -446,11 +479,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                     setRecoveryCodeInput(e.target.value);
                     if (recoveryError) setRecoveryError('');
                   }}
-                  style={{
-                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                    fontSize: '13px',
-                    textAlign: 'center',
-                  }}
+                  className="recovery-input-field"
                 />
                 <p
                   id="recoveryError"
@@ -460,19 +489,19 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                 >
                   {recoveryError}
                 </p>
-                <button type="submit">ورود با کد بازیابی</button>
+                <button type="submit" className="btn-primary-action">ورود با کد بازیابی</button>
                 <button
                   type="button"
-                  className="btn-ghost"
+                  className="btn-recovery-link"
                   onClick={() => {
                     setRecoveryError('');
                     setStep(1);
                   }}
                 >
-                  برگشت به ورود با گوگل
+                  ← برگشت به ورود با گوگل
                 </button>
               </form>
-            </>
+            </div>
           )}
         </main>
 
