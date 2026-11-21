@@ -149,6 +149,11 @@ export function parseGoogleCsrfCookie(cookieHeader: string | undefined): string 
 /** Outcome of the redirect-request gate (decided before any token is issued). */
 export type GoogleRedirectGate = 'ok' | 'bad_request' | 'forbidden';
 
+export function getGoogleRedirectUri(env: Record<string, string | undefined> = process.env): string {
+  const uri = env.GOOGLE_REDIRECT_URI?.trim();
+  return uri || 'https://chatapp-server-1i2a.onrender.com/api/google-redirect';
+}
+
 /**
  * Gate a redirect-mode login request. Missing credential is a malformed
  * request (400); a missing or mismatched CSRF token fails closed (403).

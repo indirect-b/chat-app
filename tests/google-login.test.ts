@@ -12,6 +12,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   getGoogleClientId,
+  getGoogleRedirectUri,
   isGoogleConfigured,
   validateEmail,
   verifyGoogleIdToken,
@@ -88,6 +89,12 @@ describe('getGoogleClientId / isGoogleConfigured', () => {
     process.env.GOOGLE_CLIENT_ID = '   ';
     assert.equal(getGoogleClientId(), null);
     assert.equal(isGoogleConfigured(), false);
+  });
+
+  it('DP-8: reads GOOGLE_REDIRECT_URI from environment variable with fallback', () => {
+    assert.equal(getGoogleRedirectUri({}), 'https://chatapp-server-1i2a.onrender.com/api/google-redirect');
+    assert.equal(getGoogleRedirectUri({ GOOGLE_REDIRECT_URI: 'https://custom.example.com/oauth/callback' }), 'https://custom.example.com/oauth/callback');
+    assert.equal(getGoogleRedirectUri({ GOOGLE_REDIRECT_URI: '   ' }), 'https://chatapp-server-1i2a.onrender.com/api/google-redirect');
   });
 });
 

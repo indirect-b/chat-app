@@ -27,8 +27,18 @@ declare global {
 // Redirect-mode login URI: Google POSTs the credential back here.
 // Must be registered as an Authorized redirect URI in the Google Cloud
 // Console OAuth client, otherwise Google refuses the redirect.
-const GOOGLE_REDIRECT_LOGIN_URI =
-  'https://chatapp-server-1i2a.onrender.com/api/google-redirect';
+export function getGoogleRedirectLoginUri(envOverride?: string): string {
+  if (envOverride?.trim()) return envOverride.trim();
+  if (typeof process !== 'undefined' && process.env?.GOOGLE_REDIRECT_URI?.trim()) {
+    return process.env.GOOGLE_REDIRECT_URI.trim();
+  }
+  if (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_GOOGLE_REDIRECT_URI?.trim()) {
+    return (import.meta as any).env.VITE_GOOGLE_REDIRECT_URI.trim();
+  }
+  return 'https://chatapp-server-1i2a.onrender.com/api/google-redirect';
+}
+
+export const GOOGLE_REDIRECT_LOGIN_URI = getGoogleRedirectLoginUri();
 
 interface AuthScreenProps {
   onAuthenticated: (username: string) => void;
