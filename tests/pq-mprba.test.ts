@@ -36,6 +36,8 @@ import {
   loadIdentityRecordV4,
   pinPeerIdentityKeyTOFU,
   getPinnedPeerIdentityKeyTOFU,
+  wrapRootKeyWithPassphrase,
+  unwrapRootKeyWithPassphrase,
 } from '../src/utils/keystore';
 import {
   computeSafetyNumberForContact,
@@ -1028,5 +1030,28 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     assert.equal(changedObs.state, 'CHANGED');
     assert.ok(changedObs.auditHistory.length >= 1);
     assert.equal(changedObs.auditHistory[0].previousKeyB64, bobMldsa1B64);
+  });
+
+  it('protects root wrapping key with opt-in user passphrase and PBKDF2 (L8)', async () => {
+    const rawKey = new Uint8Array(32);
+    globalThis.crypto.getRandomValues(rawKey);
+
+    const passphrase = 'SuperSecureUserPassphrase!2026';
+    const blob = await wrapRootKeyWithPassphrase(rawKey, passphrase, 5000);
+
+    assert.equal(blob.salt.length, 16);
+    assert.equal(blob.iv.length, 12);
+    assert.equal(blob.iterations, 5000);
+    assert.notDeepEqual(blob.wrappedKeyBytes, rawKey);
+
+    // Unwrapping with correct passphrase recovers original raw key bytes
+    const recovered = await unwrapRootKeyWithPassphrase(blob, passphrase);
+    assert.deepEqual(recovered, rawKey);
+
+    // Unwrapping with wrong passphrase fails closed (OperationError / tag mismatch)
+    await assert.rejects(
+      () => unwrapRootKeyWithPassphrase(blob, 'WrongPassphrase!'),
+      (err: any) => err instanceof Error
+    );
   });
 });

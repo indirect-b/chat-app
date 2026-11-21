@@ -52,6 +52,13 @@ export interface WrappedSecretBlob {
   ciphertext: Uint8Array;
 }
 
+export interface PasswordProtectedWrappingKeyBlob {
+  salt: Uint8Array;
+  iv: Uint8Array;
+  wrappedKeyBytes: Uint8Array;
+  iterations: number;
+}
+
 export interface StoredIdentityRecordV4 {
   v: 4;
   username: string;
@@ -577,6 +584,101 @@ export async function unwrapSecretBytes(
     wrappingKey,
     wrapped.ciphertext as unknown as BufferSource
   );
+  return new Uint8Array(plainBuf);
+}
+
+/**
+ * حفاظت اختیاری از کلید ریشه‌ای (Root Wrapping Key) با رمز عبور کاربر و PBKDF2 (L8)
+ */
+export async function wrapRootKeyWithPassphrase(
+  keyBytes: Uint8Array,
+  passphrase: string,
+  iterations = 100_000
+): Promise<PasswordProtectedWrappingKeyBlob> {
+  const webCrypto = getWebCrypto();
+  const salt = webCrypto.getRandomValues(new Uint8Array(16));
+  const iv = webCrypto.getRandomValues(new Uint8Array(12));
+
+  const pwKey = await webCrypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(passphrase),
+    { name: 'PBKDF2' },
+    false,
+    ['deriveKey']
+  );
+
+  const derivedKey = await webCrypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: salt as unknown as BufferSource,
+      iterations,
+      hash: 'SHA-256',
+    },
+    pwKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+
+  const aad = new TextEncoder().encode('PQ-MPRBA:ROOT-WRAPPING-KEY-V1');
+  const ctBuf = await webCrypto.subtle.encrypt(
+    {
+      name: 'AES-GCM',
+      iv: iv as unknown as BufferSource,
+      additionalData: aad as unknown as BufferSource,
+    },
+    derivedKey,
+    keyBytes as unknown as BufferSource
+  );
+
+  return {
+    salt,
+    iv,
+    wrappedKeyBytes: new Uint8Array(ctBuf),
+    iterations,
+  };
+}
+
+/**
+ * گشودن کلید ریشه‌ای حفاظت‌شده با رمز عبور کاربر (L8)
+ */
+export async function unwrapRootKeyWithPassphrase(
+  blob: PasswordProtectedWrappingKeyBlob,
+  passphrase: string
+): Promise<Uint8Array> {
+  const webCrypto = getWebCrypto();
+  const pwKey = await webCrypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(passphrase),
+    { name: 'PBKDF2' },
+    false,
+    ['deriveKey']
+  );
+
+  const derivedKey = await webCrypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: blob.salt as unknown as BufferSource,
+      iterations: blob.iterations,
+      hash: 'SHA-256',
+    },
+    pwKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+
+  const aad = new TextEncoder().encode('PQ-MPRBA:ROOT-WRAPPING-KEY-V1');
+  const plainBuf = await webCrypto.subtle.decrypt(
+    {
+      name: 'AES-GCM',
+      iv: blob.iv as unknown as BufferSource,
+      additionalData: aad as unknown as BufferSource,
+    },
+    derivedKey,
+    blob.wrappedKeyBytes as unknown as BufferSource
+  );
+
   return new Uint8Array(plainBuf);
 }
 
