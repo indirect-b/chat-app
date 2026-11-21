@@ -1670,6 +1670,13 @@ export async function encryptMessageText(
 
 /**
  * رمزگشایی پیام متنی (Fail-Closed: ورودی‌های ناقص، دستکاری‌شده، فاقد امضای معتبر یا تکراری با E2EEError رد می‌شوند)
+ *
+ * [SECURITY INVARIANT — AUDIT L16 / SIDE-CHANNEL & ORACLE CONFINEMENT]:
+ * All distinct decryption error codes thrown by this function (such as 'REPLAY_DETECTED',
+ * 'SIGNATURE_INVALID', 'DECRYPTION_FAILED', 'MAX_SKIP_EXCEEDED', 'MALFORMED_PAYLOAD') are
+ * strictly confined to client-side runtime evaluation and local UI diagnostic state. They are
+ * NEVER transmitted over network sockets or REST endpoints to the server or to remote peers,
+ * preventing any remote error-oracle or padding/plaintext-leakage attack.
  */
 export async function decryptMessageText(
   payload: string,
