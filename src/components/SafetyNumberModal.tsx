@@ -397,7 +397,9 @@ export const SafetyNumberModal: React.FC<SafetyNumberModalProps> = ({
                 width: '44px',
                 height: '44px',
                 borderRadius: '50%',
-                background: 'linear-gradient(135deg,#7c3aed,#06b6d4)',
+                background: 'var(--bg-surface-2)',
+                border: '2px solid var(--accent-cyan)',
+                boxShadow: '0 0 10px var(--accent-cyan-dim)',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
@@ -1206,7 +1208,9 @@ export const SafetyNumberModal: React.FC<SafetyNumberModalProps> = ({
                   id="numbersMatchVerifyBtn"
                   onClick={handleNumbersMatchAction}
                   style={{
-                    background: 'linear-gradient(135deg, #16a34a, #059669)',
+                    background: '#10b981',
+                    color: '#ffffff',
+                    fontWeight: 600,
                   }}
                 >
                   ✓ {SAFETY_STRINGS_FA.numbersMatch} (

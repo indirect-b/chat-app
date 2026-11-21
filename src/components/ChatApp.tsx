@@ -2924,8 +2924,8 @@ export const ChatApp: React.FC<ChatAppProps> = ({
 
             <div
               style={{
-                background: 'rgba(124,58,237,0.12)',
-                border: '1px solid rgba(124,58,237,0.35)',
+                background: 'var(--bg-surface-active)',
+                border: '1px solid var(--accent-cyan-border)',
                 borderRadius: '10px',
                 padding: '10px 12px',
                 fontSize: '11.5px',
@@ -3227,7 +3227,9 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                   width: '70px',
                   height: '70px',
                   borderRadius: '50%',
-                  background: 'linear-gradient(135deg,#7c3aed,#06b6d4)',
+                  background: 'var(--bg-surface-2)',
+                  border: '2px solid var(--accent-cyan)',
+                  boxShadow: '0 0 14px var(--accent-cyan-dim)',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
@@ -3354,7 +3356,9 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 width: '70px',
                 height: '70px',
                 borderRadius: '50%',
-                background: 'linear-gradient(135deg,#7c3aed,#06b6d4)',
+                background: 'var(--bg-surface-2)',
+                border: '2px solid var(--accent-cyan)',
+                boxShadow: '0 0 14px var(--accent-cyan-dim)',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
@@ -3469,13 +3473,13 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                           ? 'rgba(34, 197, 94, 0.12)'
                           : currentPartnerVerification.state === 'CHANGED'
                           ? 'rgba(239, 68, 68, 0.16)'
-                          : 'rgba(124, 58, 237, 0.12)',
+                          : 'rgba(6, 182, 212, 0.12)',
                       border:
                         currentPartnerVerification.state === 'VERIFIED'
                           ? '1px solid rgba(34, 197, 94, 0.4)'
                           : currentPartnerVerification.state === 'CHANGED'
                           ? '1px solid rgba(239, 68, 68, 0.5)'
-                          : '1px solid rgba(124, 58, 237, 0.35)',
+                          : '1px solid rgba(6, 182, 212, 0.35)',
                       borderRadius: '12px',
                       padding: '10px 12px',
                       marginBottom: '14px',
@@ -3658,7 +3662,8 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                               width: '30px',
                               height: '30px',
                               borderRadius: '50%',
-                              background: 'linear-gradient(135deg,#7c3aed,#06b6d4)',
+                              background: 'var(--bg-surface-2)',
+                              border: '1.5px solid var(--accent-cyan)',
                               display: 'flex',
                               alignItems: 'center',
                               justifyContent: 'center',
@@ -3722,11 +3727,11 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                               background:
                                 state === 'CHANGED'
                                   ? '#ef4444'
-                                  : 'rgba(124, 58, 237, 0.25)',
+                                  : 'rgba(6, 182, 212, 0.2)',
                               border:
                                 state === 'CHANGED'
                                   ? 'none'
-                                  : '1px solid rgba(124, 58, 237, 0.5)',
+                                  : '1px solid rgba(6, 182, 212, 0.45)',
                               color: '#fff',
                               borderRadius: '7px',
                               padding: '5px 9px',
@@ -4020,14 +4025,14 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               direction: 'rtl',
             }}
           >
-            <h3 style={{ fontSize: '16px', marginBottom: '8px', color: '#ddd6fe' }}>
+            <h3 style={{ fontSize: '16px', marginBottom: '8px', color: 'var(--text-primary)' }}>
               🚀 چنج‌لاگ و تاریخچه تکامل معماری (نسخه v6.0 — PQ-MPRBA Edition)
             </h3>
 
             <div
               style={{
-                background: 'linear-gradient(135deg, rgba(124,58,237,0.18), rgba(6,182,212,0.12))',
-                border: '1px solid rgba(124,58,237,0.45)',
+                background: 'var(--bg-surface-active)',
+                border: '1px solid var(--accent-cyan-border)',
                 borderRadius: '12px',
                 padding: '12px 14px',
                 fontSize: '12.5px',
@@ -4035,7 +4040,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                 marginBottom: '12px',
               }}
             >
-              <div style={{ fontWeight: 700, color: '#a78bfa', fontSize: '13.5px', marginBottom: '6px' }}>
+              <div style={{ fontWeight: 700, color: 'var(--accent-cyan-light)', fontSize: '13.5px', marginBottom: '6px' }}>
                 🌟 ابداع و خلق پروتکل اختصاصی «PQ-MPRBA» (برای اولین بار در بستر وب)
               </div>
               <p style={{ margin: '0 0 8px 0', color: '#e5e7eb' }}>
@@ -4201,7 +4206,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                           cursor: 'pointer',
                           padding: '4px 6px',
                           borderRadius: '6px',
-                          background: isSelected ? 'rgba(124, 58, 237, 0.15)' : 'transparent',
+                          background: isSelected ? 'var(--bg-surface-active)' : 'transparent',
                         }}
                       >
                         <input

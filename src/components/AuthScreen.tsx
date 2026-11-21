@@ -331,7 +331,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
               <div className="auth-logo">
                 <div
                   className="logo-circle"
-                  style={{ background: 'linear-gradient(135deg,#f59e0b,#ef4444)' }}
+                  style={{ background: 'rgba(245, 158, 11, 0.15)', borderColor: '#f59e0b', boxShadow: '0 0 20px rgba(245, 158, 11, 0.25)' }}
                   aria-hidden="true"
                 >
                   🗝️
@@ -396,7 +396,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
               <div className="auth-logo">
                 <div
                   className="logo-circle"
-                  style={{ background: 'linear-gradient(135deg,#06b6d4,#7c3aed)' }}
+                  style={{ background: 'var(--bg-surface-2)', borderColor: 'var(--accent-cyan)', boxShadow: '0 0 20px var(--accent-cyan-dim)' }}
                   aria-hidden="true"
                 >
                   🔑
