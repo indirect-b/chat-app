@@ -30,6 +30,7 @@ import {
 } from '../src/utils/keystore';
 import {
   computeSafetyNumberForContact,
+  generateQrCodeMatrix,
   markContactVerified,
   observeContactPublicKey,
   rotateSessionRatchetOnly,
@@ -642,6 +643,37 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
       () => ensureUserHybridKeyPair(''),
       (err: unknown) => err instanceof E2EEError && err.code === 'MISSING_KEYS'
     );
+  });
+
+  it('I2: validates QR matrix output dimensions, finder patterns, and timing tracks against standard specs', () => {
+    const payload = 'PQ-MPRBA-SAFETY-v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const matrix = generateQrCodeMatrix(payload);
+
+    // 1. Dimensions: QR Version 5 must be exactly 37x37
+    assert.equal(matrix.length, 37);
+    assert.ok(matrix.every(row => row.length === 37));
+
+    // 2. Top-left finder pattern 7x7 outer border and center
+    for (let r = 0; r < 7; r++) {
+      for (let c = 0; c < 7; c++) {
+        const isBorder = r === 0 || r === 6 || c === 0 || c === 6;
+        const isCenter = r >= 2 && r <= 4 && c >= 2 && c <= 4;
+        if (isBorder || isCenter) {
+          assert.equal(matrix[r][c], true, `top-left finder module (${r},${c}) must be dark`);
+        } else {
+          assert.equal(matrix[r][c], false, `top-left finder ring (${r},${c}) must be light`);
+        }
+      }
+    }
+
+    // 3. Timing pattern on row 6 alternates
+    for (let c = 8; c <= 28; c++) {
+      assert.equal(matrix[6][c], c % 2 === 0, `timing row module (6,${c}) must alternate`);
+    }
+
+    // 4. Deterministic reproducibility
+    const matrix2 = generateQrCodeMatrix(payload);
+    assert.deepEqual(matrix, matrix2);
   });
 
   it('enforces strict Helmet CSP without unsafe-inline, unsafe-eval, or unpinned CDN assets', () => {
