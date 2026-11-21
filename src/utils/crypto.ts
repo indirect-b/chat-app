@@ -270,6 +270,11 @@ export function getMyMLDSAPublicKey(myUsername: string): string | null {
   return meta?.mldsaPublicKeyB64 || null;
 }
 
+export function getMyMLKEMPublicKey(myUsername: string): string | null {
+  const meta = getCachedPublicKeyMetadataV4(myUsername);
+  return meta?.mlkemPublicKeyB64 || null;
+}
+
 export async function withUnwrappedMLDSASecretKey<T>(
   myUsername: string,
   fn: (secretKey: Uint8Array) => Promise<T> | T

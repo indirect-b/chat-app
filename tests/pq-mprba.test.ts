@@ -6,6 +6,7 @@ import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js';
 import {
   E2EEError,
   KEY_STORAGE_VERSION,
+  base64ToBuf,
   bufToBase64,
   clearRatchetSession,
   clearVerifiedBundleCache,
@@ -33,10 +34,14 @@ import {
 } from '../src/utils/keystore';
 import {
   computeSafetyNumberForContact,
+  computeSafetyNumberFromRawKeysV2,
   generateQrCodeMatrix,
   markContactVerified,
   observeContactPublicKey,
+  parseAndCompareQrPayload,
   rotateSessionRatchetOnly,
+  SAFETY_PROTOCOL_ID_V2,
+  SAFETY_QR_PREFIX_V2,
 } from '../src/utils/safetyNumber';
 import {
   RecoveryRateLimiter,
@@ -781,5 +786,47 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     });
     assert.equal(dec.text, 'v2-ratchet-test');
     assert.equal(dec.mode, 'PQ-MLKEM-RATCHET');
+  });
+
+  it('computes Safety Number v2 binding both ML-DSA and ML-KEM keys (L2)', async () => {
+    const bobBundleStr = (await ensureUserHybridKeyPair('bob'))!;
+    const aliceBundleStr = (await ensureUserHybridKeyPair('alice'))!;
+
+    const snAlice = computeSafetyNumberForContact('alice', bobBundleStr, 'bob');
+    assert.ok(snAlice, 'Safety number should be computed');
+    assert.equal(snAlice.version, 'v2');
+    assert.ok(snAlice.qrPayload.startsWith(SAFETY_QR_PREFIX_V2));
+
+    const snBob = computeSafetyNumberForContact('bob', aliceBundleStr, 'alice');
+    assert.ok(snBob, 'Safety number should be computed');
+    assert.equal(snBob.version, 'v2');
+
+    // Both parties compute the identical 60-digit number and hash
+    assert.equal(snAlice.digits60, snBob.digits60);
+    assert.equal(snAlice.sha256Hex, snBob.sha256Hex);
+
+    // Tampering with peer's ML-KEM key alters the Safety Number (proving ML-KEM binding)
+    const tamperedBob = JSON.parse(bobBundleStr);
+    const fakeKem = new Uint8Array(1184);
+    fakeKem.fill(0x42);
+    tamperedBob.mlkemPubB64 = bufToBase64(fakeKem);
+    // Even if signature is re-signed on the bundle, safety number must differ
+    const snTampered = computeSafetyNumberFromRawKeysV2(
+      base64ToBuf(snAlice.myMldsaPubB64),
+      base64ToBuf(snAlice.myMlkemPubB64!),
+      base64ToBuf(tamperedBob.mldsaPubB64),
+      fakeKem
+    );
+    assert.notEqual(snTampered.sha256Hex, snAlice.sha256Hex);
+    assert.notEqual(snTampered.digits60, snAlice.digits60);
+
+    // QR comparison validates v2 code matching local hex
+    const qrMatch = parseAndCompareQrPayload(snAlice.qrPayload, snAlice.sha256Hex);
+    assert.equal(qrMatch.status, 'MATCH');
+
+    // QR comparison also supports backward-compatible v1 QR
+    const v1Qr = `PQ-MPRBA-SAFETY-v1:${snAlice.sha256Hex}`;
+    const qrV1Match = parseAndCompareQrPayload(v1Qr, snAlice.sha256Hex);
+    assert.equal(qrV1Match.status, 'MATCH');
   });
 });

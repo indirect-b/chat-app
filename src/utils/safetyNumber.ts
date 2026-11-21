@@ -31,12 +31,15 @@ import {
   clearRatchetSession,
   E2EEError,
   getMyMLDSAPublicKey,
+  getMyMLKEMPublicKey,
   parsePeerKeyBundle,
   parsePeerKeyBundleStrict,
 } from './crypto';
 
 export const SAFETY_PROTOCOL_ID = 'PQ-MPRBA-SAFETY-v1';
 export const SAFETY_QR_PREFIX = 'PQ-MPRBA-SAFETY-v1:';
+export const SAFETY_PROTOCOL_ID_V2 = 'PQ-MPRBA-SAFETY-v2';
+export const SAFETY_QR_PREFIX_V2 = 'PQ-MPRBA-SAFETY-v2:';
 
 const VERIFICATION_STORAGE_PREFIX = 'chat_safety_verifications_v1_';
 
@@ -109,12 +112,16 @@ export interface ContactVerificationRecord {
   state: VerificationState;
   knownMldsaPubB64: string | null;
   verifiedMldsaPubB64: string | null;
+  knownMlkemPubB64?: string | null;
+  verifiedMlkemPubB64?: string | null;
+  safetyVersion?: 'v1' | 'v2';
   verifiedAt: number | null;
   changedAt: number | null;
   auditHistory: ContactKeyAuditEntry[];
 }
 
 export interface SafetyNumberData {
+  version?: 'v1' | 'v2';
   digits60: string;
   groups12: string[];
   formattedDisplay: string;
@@ -124,6 +131,8 @@ export interface SafetyNumberData {
   peerKeyFingerprint: string;
   myMldsaPubB64: string;
   peerMldsaPubB64: string;
+  myMlkemPubB64?: string;
+  peerMlkemPubB64?: string;
 }
 
 export interface QrComparisonResult {
@@ -323,7 +332,87 @@ export function computeSafetyNumberFromRawKeys(
 }
 
 /**
- * محاسبه شماره ایمنی برای یک مخاطب مشخص بر اساس کلیدهای ML-DSA-65 موجود
+ * محاسبه قطعی شماره ایمنی پساکوانتومی نسخه ۲ (Spec v0.2 / PQ-MPRBA-SAFETY-v2):
+ * پیوند هر دو کلید عمومی امضای هویت ML-DSA-65 و کپسوله‌سازی ML-KEM-768 دو طرف مکالمه (L2):
+ * SHA-256( "PQ-MPRBA-SAFETY-v2" || 0x00 || lenBE32(party1) || party1 || lenBE32(party2) || party2 )
+ * که در آن party = mldsaPub || mlkemPub است و دو طرف بر اساس بایت‌های خام Lexicographical مرتب می‌شوند.
+ */
+export function computeSafetyNumberFromRawKeysV2(
+  myMldsaKey: Uint8Array,
+  myMlkemKey: Uint8Array,
+  peerMldsaKey: Uint8Array,
+  peerMlkemKey: Uint8Array
+): Omit<SafetyNumberData, 'myMldsaPubB64' | 'peerMldsaPubB64' | 'myMlkemPubB64' | 'peerMlkemPubB64'> {
+  try {
+    if (
+      !(myMldsaKey instanceof Uint8Array) ||
+      !(myMlkemKey instanceof Uint8Array) ||
+      !(peerMldsaKey instanceof Uint8Array) ||
+      !(peerMlkemKey instanceof Uint8Array)
+    ) {
+      throw new TypeError('Raw keys must be Uint8Array instances');
+    }
+
+    const myMaterial = new Uint8Array(myMldsaKey.length + myMlkemKey.length);
+    myMaterial.set(myMldsaKey, 0);
+    myMaterial.set(myMlkemKey, myMldsaKey.length);
+
+    const peerMaterial = new Uint8Array(peerMldsaKey.length + peerMlkemKey.length);
+    peerMaterial.set(peerMldsaKey, 0);
+    peerMaterial.set(peerMlkemKey, peerMldsaKey.length);
+
+    const cmp = compareRawBytesLexicographically(myMaterial, peerMaterial);
+    const firstMaterial = cmp <= 0 ? myMaterial : peerMaterial;
+    const secondMaterial = cmp <= 0 ? peerMaterial : myMaterial;
+
+    const domainBytes = new TextEncoder().encode(SAFETY_PROTOCOL_ID_V2);
+    const firstLenBE = encodeUint32BE(firstMaterial.byteLength);
+    const secondLenBE = encodeUint32BE(secondMaterial.byteLength);
+
+    const totalLen =
+      domainBytes.byteLength +
+      1 +
+      4 +
+      firstMaterial.byteLength +
+      4 +
+      secondMaterial.byteLength;
+
+    const preimage = new Uint8Array(totalLen);
+    let offset = 0;
+    preimage.set(domainBytes, offset);
+    offset += domainBytes.byteLength;
+    preimage[offset] = 0x00;
+    offset += 1;
+    preimage.set(firstLenBE, offset);
+    offset += 4;
+    preimage.set(firstMaterial, offset);
+    offset += firstMaterial.byteLength;
+    preimage.set(secondLenBE, offset);
+    offset += 4;
+    preimage.set(secondMaterial, offset);
+
+    const digest = sha256(preimage);
+    const sha256Hex = bytesToLowerHex(digest);
+    const { digits60, groups12, formattedDisplay } = hexDigestTo60Digits(sha256Hex);
+
+    return {
+      version: 'v2',
+      digits60,
+      groups12,
+      formattedDisplay,
+      sha256Hex,
+      qrPayload: `${SAFETY_QR_PREFIX_V2}${sha256Hex}`,
+      myKeyFingerprint: computeKeyFingerprintHex(myMldsaKey),
+      peerKeyFingerprint: computeKeyFingerprintHex(peerMldsaKey),
+    };
+  } catch (err: any) {
+    if (err instanceof E2EEError) throw err;
+    throw new E2EEError('MALFORMED_PAYLOAD', `Failed to compute safety number v2 from raw keys: ${err?.message || err}`);
+  }
+}
+
+/**
+ * محاسبه شماره ایمنی برای یک مخاطب مشخص بر اساس کلیدهای موجود (v2 کامل یا عقب‌گرد v1)
  */
 export function computeSafetyNumberForContact(
   myUsername: string,
@@ -334,9 +423,53 @@ export function computeSafetyNumberForContact(
   const peerKey = extractPeerMldsaPublicKeyBytes(peerPublicKeyStr, peerUsername);
   if (!myKey || !peerKey) return null;
 
+  // استخراج کلیدهای ML-KEM-768 برای نسخه ۲ شماره ایمنی (L2)
+  const myKemb64 = getMyMLKEMPublicKey(myUsername);
+  let myKemBytes: Uint8Array | null = null;
+  if (myKemb64) {
+    try {
+      const b = base64ToBuf(myKemb64);
+      if (b && b.byteLength > 0) myKemBytes = b;
+    } catch {
+      // ignore
+    }
+  }
+
+  let peerKemBytes: Uint8Array | null = null;
+  let peerKemb64: string | undefined = undefined;
+  if (peerPublicKeyStr) {
+    try {
+      const parsed = parsePeerKeyBundleStrict(peerPublicKeyStr, peerUsername, { skipCache: true });
+      if (parsed.hasMLKEM && parsed.mlkemPub && parsed.mlkemPub.byteLength > 0) {
+        peerKemBytes = parsed.mlkemPub;
+        peerKemb64 = bufToBase64(parsed.mlkemPub);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (myKemBytes && peerKemBytes) {
+    const core = computeSafetyNumberFromRawKeysV2(
+      myKey.rawBytes,
+      myKemBytes,
+      peerKey.rawBytes,
+      peerKemBytes
+    );
+    return {
+      ...core,
+      myMldsaPubB64: myKey.base64,
+      peerMldsaPubB64: peerKey.base64,
+      myMlkemPubB64: myKemb64 || undefined,
+      peerMlkemPubB64: peerKemb64,
+    };
+  }
+
+  // در نبود کلید کپسوله‌سازی، عقب‌گرد سازگار به نسخه ۱
   const core = computeSafetyNumberFromRawKeys(myKey.rawBytes, peerKey.rawBytes);
   return {
     ...core,
+    version: 'v1',
     myMldsaPubB64: myKey.base64,
     peerMldsaPubB64: peerKey.base64,
   };
@@ -402,12 +535,13 @@ export function compareSafetyNumberDigits(
 }
 
 /**
- * بررسی و مقایسه محتوای کد QR اسکن‌شده با هش محلی
- * قالب مجاز: PQ-MPRBA-SAFETY-v1:<64 lowercase hex chars>
+ * بررسی و مقایسه محتوای کد QR اسکن‌شده با هش محلی (پشتیبانی از v2 و v1 سازگار)
+ * قالب مجاز: PQ-MPRBA-SAFETY-v2:<64 hex> یا PQ-MPRBA-SAFETY-v1:<64 hex>
  */
 export function parseAndCompareQrPayload(
   scannedRaw: string,
-  expectedSha256Hex: string
+  expectedSha256Hex: string,
+  expectedV1Sha256Hex?: string
 ): QrComparisonResult {
   try {
     if (typeof scannedRaw !== 'string') {
@@ -421,14 +555,20 @@ export function parseAndCompareQrPayload(
       };
     }
 
-    if (!trimmed.startsWith(SAFETY_QR_PREFIX)) {
+    let hexPart = '';
+    let isV1 = false;
+    if (trimmed.startsWith(SAFETY_QR_PREFIX_V2)) {
+      hexPart = trimmed.slice(SAFETY_QR_PREFIX_V2.length);
+    } else if (trimmed.startsWith(SAFETY_QR_PREFIX)) {
+      hexPart = trimmed.slice(SAFETY_QR_PREFIX.length);
+      isV1 = true;
+    } else {
       return {
         status: 'PARSE_ERROR',
-        errorReason: 'پیشوند کد اسکن‌شده با استاندارد PQ-MPRBA-SAFETY-v1 مطابقت ندارد.',
+        errorReason: 'پیشوند کد اسکن‌شده با استاندارد PQ-MPRBA-SAFETY مطابقت ندارد.',
       };
     }
 
-    const hexPart = trimmed.slice(SAFETY_QR_PREFIX.length);
     if (!/^[0-9a-f]{64}$/.test(hexPart)) {
       return {
         status: 'PARSE_ERROR',
@@ -438,8 +578,9 @@ export function parseAndCompareQrPayload(
 
     const { digits60, groups12, formattedDisplay } = hexDigestTo60Digits(hexPart);
     const expectedClean = expectedSha256Hex ? expectedSha256Hex.trim().toLowerCase() : '';
+    const expectedV1Clean = expectedV1Sha256Hex ? expectedV1Sha256Hex.trim().toLowerCase() : '';
 
-    if (hexPart === expectedClean) {
+    if (hexPart === expectedClean || (isV1 && expectedV1Clean && hexPart === expectedV1Clean)) {
       return {
         status: 'MATCH',
         scannedHex: hexPart,
