@@ -17,6 +17,7 @@ import {
   getGroupSecurityBadge,
   getRoomSecret,
   getVerifiedBundleCacheStats,
+  HKDF_RATCHET_SALT_V2,
   parsePeerKeyBundle,
   parsePeerKeyBundleStrict,
   resetAllCryptoStateForTests,
@@ -753,5 +754,32 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     setRoomSecret(roomId, '');
     assert.equal(getRoomSecret(roomId), '');
     assert.equal(mockSessionStorage.getItem(`chat_e2ee_pass_${roomId}`), null);
+  });
+
+  it('uses domain-separated HKDF salt v2 for ratchet chain steps (I3)', async () => {
+    assert.deepEqual(
+      HKDF_RATCHET_SALT_V2,
+      new TextEncoder().encode('PQ-MPRBA-RATCHET-SALT-v2'),
+      'HKDF_RATCHET_SALT_V2 must be domain-separated'
+    );
+
+    const bobBundle = (await ensureUserHybridKeyPair('bob'))!;
+    const aliceBundle = (await ensureUserHybridKeyPair('alice'))!;
+    const roomId = 'alice__bob';
+
+    const enc = await encryptMessageText('v2-ratchet-test', roomId, {
+      myUsername: 'alice',
+      peerUsername: 'bob',
+      peerPublicKey: bobBundle,
+    });
+    assert.ok(enc.startsWith('e2ee:pq:v2:0:'));
+
+    const dec = await decryptMessageText(enc, roomId, {
+      myUsername: 'bob',
+      peerUsername: 'alice',
+      peerPublicKey: aliceBundle,
+    });
+    assert.equal(dec.text, 'v2-ratchet-test');
+    assert.equal(dec.mode, 'PQ-MLKEM-RATCHET');
   });
 });

@@ -140,6 +140,7 @@ interface RatchetSessionState {
   skippedKeys: Map<number, SkippedKeyEntry>;
   sessionEpoch?: number;
   previousSession?: RatchetSessionState;
+  hkdfSaltVersion?: 'v1' | 'v2';
 }
 
 export interface GroupEpochKeyRecord {
@@ -217,13 +218,20 @@ export function zeroizeBuffer(buf: Uint8Array | null | undefined): void {
   }
 }
 
+export const HKDF_RATCHET_SALT_V2 = new TextEncoder().encode('PQ-MPRBA-RATCHET-SALT-v2');
+
 /**
  * مشتق‌سازی زنجیره متقارن KDF_CK (ساختار استاندارد راتچت با HKDF-SHA256)
  * تولید کلید زنجیره بعدی (Next Chain Key) و کلید یک‌بارمصرف پیام (Message Key)
+ * با نمک تفکیک دامنه (Domain Separation Salt v2) برای نشست‌های جدید (I3)
  */
-function kdfChainStep(chainKey: Uint8Array): { nextChainKey: Uint8Array; messageKey: Uint8Array } {
-  const nextChainKey = hkdf(sha256, chainKey, undefined, new TextEncoder().encode('PQ-Ratchet-NextChain-v2'), 32);
-  const messageKey = hkdf(sha256, chainKey, undefined, new TextEncoder().encode('PQ-Ratchet-MsgKey-v2'), 32);
+function kdfChainStep(
+  chainKey: Uint8Array,
+  saltVersion: 'v1' | 'v2' = 'v2'
+): { nextChainKey: Uint8Array; messageKey: Uint8Array } {
+  const salt = saltVersion === 'v1' ? undefined : HKDF_RATCHET_SALT_V2;
+  const nextChainKey = hkdf(sha256, chainKey, salt, new TextEncoder().encode('PQ-Ratchet-NextChain-v2'), 32);
+  const messageKey = hkdf(sha256, chainKey, salt, new TextEncoder().encode('PQ-Ratchet-MsgKey-v2'), 32);
   return { nextChainKey, messageKey };
 }
 
@@ -972,6 +980,7 @@ async function ensurePQRatchetSession(
         skippedKeys: new Map<number, SkippedKeyEntry>(),
         sessionEpoch: targetEpoch,
         previousSession: existing || undefined,
+        hkdfSaltVersion: 'v2',
       };
 
       saveRatchetState(normMyUser, roomId, newState);
@@ -1038,6 +1047,7 @@ async function ensurePQRatchetSession(
       skippedKeys: new Map<number, SkippedKeyEntry>(),
       sessionEpoch: (existing?.sessionEpoch ?? 0) + 1,
       previousSession: existing || undefined,
+      hkdfSaltVersion: 'v2',
     };
 
     saveRatchetState(normMyUser, roomId, newState);
@@ -1091,7 +1101,7 @@ async function ratchetDecryptWithSkippedKeys(
     let currentRecvChain: Uint8Array = new Uint8Array(state.recvChainKey);
 
     while (targetRecvStep < msgStep) {
-      const { nextChainKey, messageKey } = kdfChainStep(currentRecvChain);
+      const { nextChainKey, messageKey } = kdfChainStep(currentRecvChain, state.hkdfSaltVersion);
       zeroizeBuffer(currentRecvChain);
       currentRecvChain = nextChainKey;
 
@@ -1102,7 +1112,7 @@ async function ratchetDecryptWithSkippedKeys(
       targetRecvStep++;
     }
 
-    const { nextChainKey, messageKey } = kdfChainStep(currentRecvChain);
+    const { nextChainKey, messageKey } = kdfChainStep(currentRecvChain, state.hkdfSaltVersion);
     zeroizeBuffer(currentRecvChain);
     newRecvChain = nextChainKey;
     targetRecvStep++;
@@ -1576,7 +1586,7 @@ export async function encryptMessageText(
           );
         }
 
-        const { nextChainKey, messageKey } = kdfChainStep(ratchetState.sendChainKey);
+        const { nextChainKey, messageKey } = kdfChainStep(ratchetState.sendChainKey, ratchetState.hkdfSaltVersion);
         const stepIndex = ratchetState.sendStep;
 
         let cipherBuffer: ArrayBuffer;
