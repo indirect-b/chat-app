@@ -34,7 +34,8 @@ export const PUBLIC_KEY_CACHE_PREFIX = 'chat_pubkey_v4_';
 const IDB_NAME = 'pq_mprba_keystore_v4';
 const IDB_STORE = 'identity_keys';
 const IDB_REPLAY_STORE = 'replay_protection_v1';
-const IDB_VERSION = 2;
+export const IDB_TOFU_STORE = 'tofu_pinned_keys_v1';
+const IDB_VERSION = 3;
 
 const LEGACY_STORAGE_PREFIXES = [
   'chat_ecdh_kp_',
@@ -97,7 +98,7 @@ function getSafeLocalStorage(): Storage | null {
   return null;
 }
 
-function hasBrowserIndexedDB(): boolean {
+export function hasBrowserIndexedDB(): boolean {
   try {
     return typeof globalThis !== 'undefined' && typeof globalThis.indexedDB !== 'undefined' && globalThis.indexedDB !== null;
   } catch {
@@ -106,6 +107,18 @@ function hasBrowserIndexedDB(): boolean {
 }
 
 const nodeMemoryReplayStore = new Set<string>();
+
+export interface PinnedPeerKeyRecord {
+  key: string;
+  myUsername: string;
+  peerUsername: string;
+  mldsaPubB64: string;
+  mlkemPubB64?: string;
+  pinnedAt: number;
+}
+
+const nodeMemoryTofuStore = new Map<string, PinnedPeerKeyRecord>();
+const tofuMemoryCache = new Map<string, PinnedPeerKeyRecord>();
 
 function openKeyStoreDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -118,10 +131,126 @@ function openKeyStoreDB(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(IDB_REPLAY_STORE)) {
         db.createObjectStore(IDB_REPLAY_STORE, { keyPath: 'key' });
       }
+      if (!db.objectStoreNames.contains(IDB_TOFU_STORE)) {
+        db.createObjectStore(IDB_TOFU_STORE, { keyPath: 'key' });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error || new Error('Failed to open IndexedDB keystore'));
   });
+}
+
+/**
+ * دریافت کلید پین‌شده همتا در مدل TOFU (Trust On First Use - M4)
+ */
+export async function getPinnedPeerIdentityKeyTOFU(
+  myUsername: string,
+  peerUsername: string
+): Promise<PinnedPeerKeyRecord | null> {
+  const normMy = normalizeKeystoreUsername(myUsername);
+  const normPeer = normalizeKeystoreUsername(peerUsername);
+  const key = `${normMy}::${normPeer}`;
+
+  if (tofuMemoryCache.has(key)) {
+    return tofuMemoryCache.get(key)!;
+  }
+
+  if (!hasBrowserIndexedDB()) {
+    return nodeMemoryTofuStore.get(key) || null;
+  }
+
+  try {
+    const db = await openKeyStoreDB();
+    if (!db.objectStoreNames.contains(IDB_TOFU_STORE)) return null;
+    return new Promise(resolve => {
+      const tx = db.transaction(IDB_TOFU_STORE, 'readonly');
+      const store = tx.objectStore(IDB_TOFU_STORE);
+      const req = store.get(key);
+      req.onsuccess = () => {
+        const res = (req.result as PinnedPeerKeyRecord) || null;
+        if (res) tofuMemoryCache.set(key, res);
+        resolve(res);
+      };
+      req.onerror = () => resolve(null);
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * خواندن همگام کلید پین‌شده از کش حافظه (M4)
+ */
+export function getPinnedPeerIdentityKeyTOFUSync(
+  myUsername: string,
+  peerUsername: string
+): PinnedPeerKeyRecord | null {
+  const normMy = normalizeKeystoreUsername(myUsername);
+  const normPeer = normalizeKeystoreUsername(peerUsername);
+  const key = `${normMy}::${normPeer}`;
+  return tofuMemoryCache.get(key) || nodeMemoryTofuStore.get(key) || null;
+}
+
+/**
+ * پین کردن همگام کلید دیده‌شده در کش حافظه TOFU (M4)
+ */
+export function pinPeerIdentityKeyTOFUSync(
+  myUsername: string,
+  peerUsername: string,
+  mldsaPubB64: string,
+  mlkemPubB64?: string
+): PinnedPeerKeyRecord {
+  const normMy = normalizeKeystoreUsername(myUsername);
+  const normPeer = normalizeKeystoreUsername(peerUsername);
+  const key = `${normMy}::${normPeer}`;
+
+  const existing = tofuMemoryCache.get(key) || nodeMemoryTofuStore.get(key);
+  if (existing) {
+    return existing;
+  }
+
+  const record: PinnedPeerKeyRecord = {
+    key,
+    myUsername: normMy,
+    peerUsername: normPeer,
+    mldsaPubB64,
+    mlkemPubB64,
+    pinnedAt: Date.now(),
+  };
+
+  tofuMemoryCache.set(key, record);
+  nodeMemoryTofuStore.set(key, record);
+  return record;
+}
+
+/**
+ * پین کردن اولین کلید دیده‌شدهٔ همتا در مخزن با دوام IndexedDB (Trust On First Use - M4)
+ */
+export async function pinPeerIdentityKeyTOFU(
+  myUsername: string,
+  peerUsername: string,
+  mldsaPubB64: string,
+  mlkemPubB64?: string
+): Promise<PinnedPeerKeyRecord> {
+  const record = pinPeerIdentityKeyTOFUSync(myUsername, peerUsername, mldsaPubB64, mlkemPubB64);
+
+  if (!hasBrowserIndexedDB()) {
+    return record;
+  }
+
+  try {
+    const db = await openKeyStoreDB();
+    if (!db.objectStoreNames.contains(IDB_TOFU_STORE)) return record;
+    return new Promise(resolve => {
+      const tx = db.transaction(IDB_TOFU_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_TOFU_STORE);
+      store.put(record);
+      tx.oncomplete = () => resolve(record);
+      tx.onerror = () => resolve(record);
+    });
+  } catch {
+    return record;
+  }
 }
 
 /**

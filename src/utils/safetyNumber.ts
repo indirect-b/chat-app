@@ -35,6 +35,11 @@ import {
   parsePeerKeyBundle,
   parsePeerKeyBundleStrict,
 } from './crypto';
+import {
+  getPinnedPeerIdentityKeyTOFUSync,
+  pinPeerIdentityKeyTOFU,
+  pinPeerIdentityKeyTOFUSync,
+} from './keystore';
 
 export const SAFETY_PROTOCOL_ID = 'PQ-MPRBA-SAFETY-v1';
 export const SAFETY_QR_PREFIX = 'PQ-MPRBA-SAFETY-v1:';
@@ -417,55 +422,60 @@ export function computeSafetyNumberFromRawKeysV2(
 export function computeSafetyNumberForContact(
   myUsername: string,
   peerPublicKeyStr: string | null | undefined,
-  peerUsername?: string
+  peerUsername?: string,
+  options?: { version?: 'v1' | 'v2' }
 ): SafetyNumberData | null {
   const myKey = extractMyMldsaPublicKeyBytes(myUsername);
   const peerKey = extractPeerMldsaPublicKeyBytes(peerPublicKeyStr, peerUsername);
   if (!myKey || !peerKey) return null;
 
-  // استخراج کلیدهای ML-KEM-768 برای نسخه ۲ شماره ایمنی (L2)
-  const myKemb64 = getMyMLKEMPublicKey(myUsername);
-  let myKemBytes: Uint8Array | null = null;
-  if (myKemb64) {
-    try {
-      const b = base64ToBuf(myKemb64);
-      if (b && b.byteLength > 0) myKemBytes = b;
-    } catch {
-      // ignore
-    }
-  }
+  const reqVersion = options?.version || 'v1';
 
-  let peerKemBytes: Uint8Array | null = null;
-  let peerKemb64: string | undefined = undefined;
-  if (peerPublicKeyStr) {
-    try {
-      const parsed = parsePeerKeyBundleStrict(peerPublicKeyStr, peerUsername, { skipCache: true });
-      if (parsed.hasMLKEM && parsed.mlkemPub && parsed.mlkemPub.byteLength > 0) {
-        peerKemBytes = parsed.mlkemPub;
-        peerKemb64 = bufToBase64(parsed.mlkemPub);
+  // استخراج کلیدهای ML-KEM-768 برای نسخه ۲ شماره ایمنی (L2) در صورت درخواست صریح یا موجود بودن کلیدها در حالت v2
+  if (reqVersion === 'v2') {
+    const myKemb64 = getMyMLKEMPublicKey(myUsername);
+    let myKemBytes: Uint8Array | null = null;
+    if (myKemb64) {
+      try {
+        const b = base64ToBuf(myKemb64);
+        if (b && b.byteLength > 0) myKemBytes = b;
+      } catch {
+        // ignore
       }
-    } catch {
-      // ignore
+    }
+
+    let peerKemBytes: Uint8Array | null = null;
+    let peerKemb64: string | undefined = undefined;
+    if (peerPublicKeyStr) {
+      try {
+        const parsed = parsePeerKeyBundleStrict(peerPublicKeyStr, peerUsername, { skipCache: true });
+        if (parsed.hasMLKEM && parsed.mlkemPub && parsed.mlkemPub.byteLength > 0) {
+          peerKemBytes = parsed.mlkemPub;
+          peerKemb64 = bufToBase64(parsed.mlkemPub);
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    if (myKemBytes && peerKemBytes) {
+      const core = computeSafetyNumberFromRawKeysV2(
+        myKey.rawBytes,
+        myKemBytes,
+        peerKey.rawBytes,
+        peerKemBytes
+      );
+      return {
+        ...core,
+        myMldsaPubB64: myKey.base64,
+        peerMldsaPubB64: peerKey.base64,
+        myMlkemPubB64: myKemb64 || undefined,
+        peerMlkemPubB64: peerKemb64,
+      };
     }
   }
 
-  if (myKemBytes && peerKemBytes) {
-    const core = computeSafetyNumberFromRawKeysV2(
-      myKey.rawBytes,
-      myKemBytes,
-      peerKey.rawBytes,
-      peerKemBytes
-    );
-    return {
-      ...core,
-      myMldsaPubB64: myKey.base64,
-      peerMldsaPubB64: peerKey.base64,
-      myMlkemPubB64: myKemb64 || undefined,
-      peerMlkemPubB64: peerKemb64,
-    };
-  }
-
-  // در نبود کلید کپسوله‌سازی، عقب‌گرد سازگار به نسخه ۱
+  // نسخه ۱ پیش‌فرض برای سازگاری کامل
   const core = computeSafetyNumberFromRawKeys(myKey.rawBytes, peerKey.rawBytes);
   return {
     ...core,
@@ -476,8 +486,15 @@ export function computeSafetyNumberForContact(
 }
 
 /**
- * نرمال‌سازی رشته شماره ایمنی هنگام مقایسه کپی/پیست (حذف تمام فاصله‌ها و کاراکترهای جداساز سفید)
+ * محاسبه شماره ایمنی نسخه ۲ برای یک مخاطب (الزام پیوند ML-KEM-768 به همراه ML-DSA-65 - L2)
  */
+export function computeSafetyNumberForContactV2(
+  myUsername: string,
+  peerPublicKeyStr: string | null | undefined,
+  peerUsername?: string
+): SafetyNumberData | null {
+  return computeSafetyNumberForContact(myUsername, peerPublicKeyStr, peerUsername, { version: 'v2' });
+}
 export function normalizeSafetyDigits(input: string): string {
   // تبدیل ارقام فارسی/عربی احتمالی در ورودی کاربر به ارقام لاتین و حذف تمام فاصله‌ها
   const persianDigits = '۰۱۲۳۴۵۶۷۸۹';
@@ -691,6 +708,42 @@ export function observeContactPublicKey(
 
   const all = loadAllVerificationRecords(myUsername);
   const newKeyB64 = extracted.base64;
+
+  // بررسی کلید پین‌شده در مدل TOFU (Trust On First Use - M4)
+  const pinned = getPinnedPeerIdentityKeyTOFUSync(myUsername, normContact);
+  if (!pinned) {
+    pinPeerIdentityKeyTOFUSync(myUsername, normContact, newKeyB64);
+    pinPeerIdentityKeyTOFU(myUsername, normContact, newKeyB64).catch(() => {});
+  } else if (pinned.mldsaPubB64 !== newKeyB64) {
+    let prevFingerprint = 'unknown';
+    try {
+      const prevBytes = base64ToBuf(pinned.mldsaPubB64);
+      prevFingerprint = computeKeyFingerprintHex(prevBytes);
+    } catch {
+      prevFingerprint = 'unknown';
+    }
+
+    const now = Date.now();
+    const auditEntry: ContactKeyAuditEntry = {
+      previousKeyFingerprint: prevFingerprint,
+      previousKeyB64: pinned.mldsaPubB64,
+      detectedAt: now,
+    };
+
+    const updated: ContactVerificationRecord = {
+      contactUsername: normContact,
+      state: 'CHANGED',
+      knownMldsaPubB64: newKeyB64,
+      verifiedMldsaPubB64: null,
+      verifiedAt: null,
+      changedAt: now,
+      auditHistory: [auditEntry, ...(currentRecord.auditHistory || [])].slice(0, 25),
+    };
+
+    all[normContact] = updated;
+    saveAllVerificationRecords(myUsername, all);
+    return updated;
+  }
 
   // اولین بار که کلید ML-DSA-65 این مخاطب در این دستگاه دیده می‌شود
   if (!currentRecord.knownMldsaPubB64) {

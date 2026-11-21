@@ -17,6 +17,7 @@ import {
   generateNonExtractableWrappingKey,
   getCachedPublicKeyMetadataV4,
   getWebCrypto,
+  hasBrowserIndexedDB,
   isDurableReplaySeen,
   loadIdentityRecordV4,
   normalizeKeystoreUsername,
@@ -1103,11 +1104,11 @@ async function ratchetDecryptWithSkippedKeys(
   const normMy = myUsername ? normalizeKeystoreUsername(myUsername) : '';
   const replayToken = `ratchet_${sessionKemTag}_recv_${normMy}_step_${msgStep}`;
 
-  // محافظت قطعی در برابر Replay Attack (H3: هم حافظه RAM و هم IndexedDB با دوام)
+  // محافظت قطعی در برابر Replay Attack (H3: هم حافظه RAM و هم IndexedDB با دوام در مرورگر)
   if (state.seenRecvSteps.has(msgStep)) {
     throw new E2EEError('REPLAY_DETECTED', `Replayed ratchet step ${msgStep} rejected`);
   }
-  if (roomId && (await isDurableReplaySeen(roomId, replayToken))) {
+  if (roomId && hasBrowserIndexedDB() && (await isDurableReplaySeen(roomId, replayToken))) {
     throw new E2EEError('REPLAY_DETECTED', `Replayed ratchet step ${msgStep} rejected`);
   }
 

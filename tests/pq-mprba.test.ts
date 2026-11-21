@@ -34,6 +34,8 @@ import {
   isDurableReplaySeen,
   KEY_STORAGE_VERSION_MARKER,
   loadIdentityRecordV4,
+  pinPeerIdentityKeyTOFU,
+  getPinnedPeerIdentityKeyTOFU,
 } from '../src/utils/keystore';
 import {
   computeSafetyNumberForContact,
@@ -795,12 +797,12 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     const bobBundleStr = (await ensureUserHybridKeyPair('bob'))!;
     const aliceBundleStr = (await ensureUserHybridKeyPair('alice'))!;
 
-    const snAlice = computeSafetyNumberForContact('alice', bobBundleStr, 'bob');
+    const snAlice = computeSafetyNumberForContact('alice', bobBundleStr, 'bob', { version: 'v2' });
     assert.ok(snAlice, 'Safety number should be computed');
     assert.equal(snAlice.version, 'v2');
     assert.ok(snAlice.qrPayload.startsWith(SAFETY_QR_PREFIX_V2));
 
-    const snBob = computeSafetyNumberForContact('bob', aliceBundleStr, 'alice');
+    const snBob = computeSafetyNumberForContact('bob', aliceBundleStr, 'alice', { version: 'v2' });
     assert.ok(snBob, 'Safety number should be computed');
     assert.equal(snBob.version, 'v2');
 
@@ -997,5 +999,34 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
         }),
       (err: unknown) => err instanceof E2EEError && err.code === 'REPLAY_DETECTED'
     );
+  });
+
+  it('implements TOFU peer identity key pinning in IndexedDB (M4)', async () => {
+    resetAllCryptoStateForTests();
+    const bobBundle1Str = (await ensureUserHybridKeyPair('bob-tofu'))!;
+    const parsed1 = parsePeerKeyBundle(bobBundle1Str, 'bob-tofu');
+    const bobMldsa1B64 = bufToBase64(parsed1.mldsaPub);
+
+    // Initial observation pins the key via TOFU
+    const initialObs = observeContactPublicKey('alice-tofu', 'bob-tofu', bobBundle1Str);
+    assert.equal(initialObs.state, 'UNVERIFIED');
+
+    // Confirm pinned record in TOFU store
+    const pinned = await getPinnedPeerIdentityKeyTOFU('alice-tofu', 'bob-tofu');
+    assert.ok(pinned, 'Key must be pinned in TOFU store');
+    assert.equal(pinned.mldsaPubB64, bobMldsa1B64);
+
+    // If server serves a different key for bob-tofu (MITM / replacement)
+    resetAllCryptoStateForTests();
+    const bobBundle2Str = (await ensureUserHybridKeyPair('bob-tofu'))!;
+    const parsed2 = parsePeerKeyBundle(bobBundle2Str, 'bob-tofu');
+    const bobMldsa2B64 = bufToBase64(parsed2.mldsaPub);
+    assert.notEqual(bobMldsa1B64, bobMldsa2B64, 'Keys must differ');
+
+    // Observation must detect divergence from pinned TOFU key and mark CHANGED
+    const changedObs = observeContactPublicKey('alice-tofu', 'bob-tofu', bobBundle2Str);
+    assert.equal(changedObs.state, 'CHANGED');
+    assert.ok(changedObs.auditHistory.length >= 1);
+    assert.equal(changedObs.auditHistory[0].previousKeyB64, bobMldsa1B64);
   });
 });
