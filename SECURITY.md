@@ -1,6 +1,6 @@
 # Security Policy & Web Trust Model
 
-**Version:** `6.1.0`
+**Version:** `6.5.0`
 
 This document states the security properties, structural limitations, and vulnerability disclosure process of `chat-app` plainly and honestly.
 
@@ -40,8 +40,8 @@ Only the latest release on the `main` branch is actively maintained for security
 
 | Version | Supported |
 | ------- | --------- |
-| `6.1.x` | Yes       |
-| `< 6.1` | No (legacy `v: 2`/`v: 3` localStorage keys are automatically discarded on upgrade) |
+| `6.5.x` | Yes       |
+| `< 6.5` | No (legacy `v: 2`/`v: 3` localStorage keys are automatically discarded on upgrade) |
 
 ---
 
