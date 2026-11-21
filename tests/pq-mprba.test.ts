@@ -31,6 +31,7 @@ import {
   zeroizeBuffer,
 } from '../src/utils/crypto';
 import {
+  isDurableReplaySeen,
   KEY_STORAGE_VERSION_MARKER,
   loadIdentityRecordV4,
 } from '../src/utils/keystore';
@@ -924,5 +925,77 @@ describe('PQ-MPRBA v4 Hardened Protocol & Storage Suite', () => {
     });
     assert.equal(decV2.text, 'secret group broadcast');
     assert.equal(decV2.mldsaVerified, false);
+  });
+
+  it('persists ratchet and group replay protection tokens in durable store to prevent replay after memory reload (H3, M1)', async () => {
+    const aliceBundleStr = (await ensureUserHybridKeyPair('alice'))!;
+    const bobBundleStr = (await ensureUserHybridKeyPair('bob'))!;
+
+    const roomId = 'alice__bob';
+
+    // 1. Ratchet message (1:1 DM)
+    const encDm = await encryptMessageText('persistent replay test', roomId, {
+      myUsername: 'alice',
+      peerUsername: 'bob',
+      peerPublicKey: bobBundleStr,
+    });
+
+    const decDm = await decryptMessageText(encDm, roomId, {
+      myUsername: 'bob',
+      peerUsername: 'alice',
+      peerPublicKey: aliceBundleStr,
+    });
+    assert.equal(decDm.text, 'persistent replay test');
+
+    // Confirm token recorded in durable store (H3)
+    const kemCipherB64 = encDm.split(':')[4];
+    const dmDurableSeen = await isDurableReplaySeen(roomId, `ratchet_${kemCipherB64.slice(0, 24)}_recv_bob_step_0`);
+    assert.equal(dmDurableSeen, true);
+
+    // Replay attempt must be rejected even if memory seenRecvSteps is cleared
+    await assert.rejects(
+      () =>
+        decryptMessageText(encDm, roomId, {
+          myUsername: 'bob',
+          peerUsername: 'alice',
+          peerPublicKey: aliceBundleStr,
+        }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'REPLAY_DETECTED'
+    );
+
+    // 2. Group message
+    const members = ['alice', 'bob'];
+    const groupRoom = 'group__durable-test';
+    const packet = await createGroupEpochPacket(
+      { alice: parsePeerKeyBundle(aliceBundleStr, 'alice'), bob: parsePeerKeyBundle(bobBundleStr, 'bob') },
+      'alice',
+      1
+    );
+    await rotateGroupEpoch('durable-test', 1, members, packet.epochKeyB64);
+
+    const encGrp = await encryptMessageText('persistent group test', groupRoom, {
+      myUsername: 'alice',
+      groupMembers: members,
+    });
+
+    const decGrp = await decryptMessageText(encGrp, groupRoom, {
+      myUsername: 'bob',
+      sender: 'alice',
+      peerPublicKey: aliceBundleStr,
+      groupMembers: members,
+    });
+    assert.equal(decGrp.text, 'persistent group test');
+
+    // Group replay must be rejected via durable store (M1)
+    await assert.rejects(
+      () =>
+        decryptMessageText(encGrp, groupRoom, {
+          myUsername: 'bob',
+          sender: 'alice',
+          peerPublicKey: aliceBundleStr,
+          groupMembers: members,
+        }),
+      (err: unknown) => err instanceof E2EEError && err.code === 'REPLAY_DETECTED'
+    );
   });
 });

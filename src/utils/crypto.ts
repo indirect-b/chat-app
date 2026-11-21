@@ -17,8 +17,10 @@ import {
   generateNonExtractableWrappingKey,
   getCachedPublicKeyMetadataV4,
   getWebCrypto,
+  isDurableReplaySeen,
   loadIdentityRecordV4,
   normalizeKeystoreUsername,
+  recordDurableReplaySeen,
   resetInMemoryKeyStoreForTests,
   saveIdentityRecordV4,
   unwrapSecretBytes,
@@ -1090,13 +1092,22 @@ async function ratchetDecryptWithSkippedKeys(
   state: RatchetSessionState,
   msgStep: number,
   iv: Uint8Array,
-  cipherBytes: Uint8Array
+  cipherBytes: Uint8Array,
+  roomId?: string,
+  myUsername?: string
 ): Promise<string> {
   const webCrypto = getWebCrypto();
   pruneExpiredSkippedKeys(state);
 
-  // محافظت قطعی در برابر Replay Attack
+  const sessionKemTag = state.kemCipherTextB64 ? state.kemCipherTextB64.slice(0, 24) : 'default';
+  const normMy = myUsername ? normalizeKeystoreUsername(myUsername) : '';
+  const replayToken = `ratchet_${sessionKemTag}_recv_${normMy}_step_${msgStep}`;
+
+  // محافظت قطعی در برابر Replay Attack (H3: هم حافظه RAM و هم IndexedDB با دوام)
   if (state.seenRecvSteps.has(msgStep)) {
+    throw new E2EEError('REPLAY_DETECTED', `Replayed ratchet step ${msgStep} rejected`);
+  }
+  if (roomId && (await isDurableReplaySeen(roomId, replayToken))) {
     throw new E2EEError('REPLAY_DETECTED', `Replayed ratchet step ${msgStep} rejected`);
   }
 
@@ -1175,6 +1186,9 @@ async function ratchetDecryptWithSkippedKeys(
     }
 
     state.seenRecvSteps.add(msgStep);
+    if (roomId) {
+      await recordDurableReplaySeen(roomId, replayToken);
+    }
     return plainText;
   } catch (err) {
     // در صورت خطا، هیچ تغییری در وضعیت راتچت commit نمی‌شود و بافرهای موقت zeroize می‌گردند
@@ -1919,7 +1933,9 @@ export async function decryptMessageText(
       ratchetState,
       msgStep,
       iv,
-      cipherBytes
+      cipherBytes,
+      roomId,
+      normMyUser
     );
 
     return {
@@ -2019,9 +2035,10 @@ export async function decryptMessageText(
       }
     }
 
-    // جلوگیری از Replay پیام گروهی: همان بار نباید دو بار پذیرفته شود (مگر خود فرستنده در حال نمایش پیامش باشد)
+    // جلوگیری از Replay پیام گروهی (M1: هم حافظه RAM و هم انبار دائم IndexedDB)
     const seenSet = epochRec.seenMessageSet || (epochRec.seenMessageSet = new Set(epochRec.seenMessageKeys || []));
-    if (!isSelfSent && seenSet.has(payloadHashKey)) {
+    const isDurableReplay = await isDurableReplaySeen(roomId, `group_msg_${msgEpoch}_${payloadHashKey}`);
+    if (!isSelfSent && (seenSet.has(payloadHashKey) || isDurableReplay)) {
       throw new E2EEError('REPLAY_DETECTED', 'Replayed group message rejected');
     }
     const rootKeyBytes = epochRec.rootKey;
@@ -2048,10 +2065,11 @@ export async function decryptMessageText(
         cipherBytes as unknown as BufferSource
       );
       const plainText = new TextDecoder('utf-8', { fatal: true }).decode(decryptedBuffer);
-      // ثبت پیام به‌عنوان تحویل‌شده پس از رمزگشایی موفق بدون فراموشی خاموش در طول اپوک (M2)
+      // ثبت پیام به‌عنوان تحویل‌شده پس از رمزگشایی موفق بدون فراموشی خاموش در طول اپوک (M2) و ثبت در انبار دائم (M1)
       seenSet.add(payloadHashKey);
       if (!epochRec.seenMessageKeys) epochRec.seenMessageKeys = [];
       epochRec.seenMessageKeys.push(payloadHashKey);
+      await recordDurableReplaySeen(roomId, `group_msg_${msgEpoch}_${payloadHashKey}`);
       return {
         text: plainText,
         isEncrypted: true,

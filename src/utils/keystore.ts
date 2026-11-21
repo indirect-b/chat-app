@@ -33,7 +33,8 @@ export const PUBLIC_KEY_CACHE_PREFIX = 'chat_pubkey_v4_';
 
 const IDB_NAME = 'pq_mprba_keystore_v4';
 const IDB_STORE = 'identity_keys';
-const IDB_VERSION = 1;
+const IDB_REPLAY_STORE = 'replay_protection_v1';
+const IDB_VERSION = 2;
 
 const LEGACY_STORAGE_PREFIXES = [
   'chat_ecdh_kp_',
@@ -104,6 +105,8 @@ function hasBrowserIndexedDB(): boolean {
   }
 }
 
+const nodeMemoryReplayStore = new Set<string>();
+
 function openKeyStoreDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = globalThis.indexedDB.open(IDB_NAME, IDB_VERSION);
@@ -112,10 +115,60 @@ function openKeyStoreDB(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(IDB_STORE)) {
         db.createObjectStore(IDB_STORE, { keyPath: 'username' });
       }
+      if (!db.objectStoreNames.contains(IDB_REPLAY_STORE)) {
+        db.createObjectStore(IDB_REPLAY_STORE, { keyPath: 'key' });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error || new Error('Failed to open IndexedDB keystore'));
   });
+}
+
+/**
+ * بررسی سابقه Replay در انبار با دوام IndexedDB (H3 / M1)
+ */
+export async function isDurableReplaySeen(roomId: string, token: string): Promise<boolean> {
+  const key = `${roomId}::${token}`;
+  if (!hasBrowserIndexedDB()) {
+    return nodeMemoryReplayStore.has(key);
+  }
+  try {
+    const db = await openKeyStoreDB();
+    if (!db.objectStoreNames.contains(IDB_REPLAY_STORE)) return false;
+    return new Promise(resolve => {
+      const tx = db.transaction(IDB_REPLAY_STORE, 'readonly');
+      const store = tx.objectStore(IDB_REPLAY_STORE);
+      const req = store.get(key);
+      req.onsuccess = () => resolve(Boolean(req.result));
+      req.onerror = () => resolve(false);
+    });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * ثبت توکن پیام تحویل‌شده در انبار با دوام IndexedDB (H3 / M1)
+ */
+export async function recordDurableReplaySeen(roomId: string, token: string): Promise<void> {
+  const key = `${roomId}::${token}`;
+  if (!hasBrowserIndexedDB()) {
+    nodeMemoryReplayStore.add(key);
+    return;
+  }
+  try {
+    const db = await openKeyStoreDB();
+    if (!db.objectStoreNames.contains(IDB_REPLAY_STORE)) return;
+    return new Promise(resolve => {
+      const tx = db.transaction(IDB_REPLAY_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_REPLAY_STORE);
+      store.put({ key, timestamp: Date.now() });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+  } catch {
+    // ignore
+  }
 }
 
 export function normalizeKeystoreUsername(username: string): string {
@@ -403,5 +456,6 @@ export async function unwrapSecretBytes(
  */
 export function resetInMemoryKeyStoreForTests(): void {
   nodeMemoryIdbStore.clear();
+  nodeMemoryReplayStore.clear();
   publicMetaMemoryCache.clear();
 }
