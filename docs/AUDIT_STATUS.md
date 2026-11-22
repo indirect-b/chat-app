@@ -401,7 +401,7 @@ Vectors fetched fresh on 2026-11-21 from `usnistgov/ACVP-Server` (vsId 42, FIPS 
 
 ## 5. Remediation — fix rounds, 21 November 2026
 
-**The findings in §4 are the record of what was found. This section is the record of what was done about them.** Three fix rounds ran on branch `fix/audit-2026-11-21` and were merged to `main` on 2026-11-22 (via the UI redesign branch). The code on `main` is now the fixed version. This is still a self-assessment follow-up — not an independent audit.
+**The findings in §4 are the record of what was found. This section is the record of what was done about them.** Three fix rounds ran on branch `fix/audit-2026-11-21` and were merged to `main` on 2026-11-22 (via the UI redesign branch). A fourth round ran on 2026-11-22 on branch `fix/audit-2026-11-22-round4` and was merged to `main` the same day. The code on `main` is now the fixed version. This is still a self-assessment follow-up — not an independent audit.
 
 ### Outcome
 
@@ -409,8 +409,8 @@ Of the **58 findings** (43 from §4 + 15 from the deepening pass, DP-1–DP-15):
 
 | Outcome | Count | Findings |
 | --- | ---: | --- |
-| ✅ Implemented | **48** | 6 High, 15 Medium, 20 Low, 7 Info |
-| ⛔ Stopped — documented, test-pinned | **7** | DP-12, DP-13, L1, L3, L5, L14, L15 |
+| ✅ Implemented | **53** | 6 High, 16 Medium, 24 Low, 7 Info |
+| ⛔ Stopped — documented, test-pinned | **2** | DP-13, L5 |
 | ⏸️ Accepted exception | **3** | M13, I6, L4 |
 
 No finding is left without an implementation or a documented stop/exception. The full per-finding status table (all 58, with what changed for each) is in the README's remediation section.
@@ -422,6 +422,10 @@ No finding is left without an implementation or a documented stop/exception. The
 - `vite build` — OK.
 - NIST ACVP KAT: 285 cases — 255 pass, 30 policy-skipped, 0 fail. Coverage-guided fuzz: 8,409 cases, 0 unexpected accepts.
 
+### Round 4 — 22 November 2026
+
+Five more findings closed (branch `fix/audit-2026-11-22-round4`): DP-12 (group replay key from the canonical message form), L1 (strict epoch monotonicity — stale packets ignored), L3 (unknown-version payloads fail closed), L14 (epoch keys validated as 32 bytes), L15 (decrypt input capped at 5 MiB). Verification: `tsc` clean, `vite build` OK, the three affected test files green in isolation (adversarial 33/33, fuzz-dp 22/22, fuzz-w3 14/14). Housekeeping: `tests/dp-chainkey-leak.test.ts` was removed — it imported white-box hooks never present in `main`, so it could not load; its three tests were all skipped. Honest note: the full suite on this VM is flaky (the same unmodified `main` fails a varying number of tests between runs, mostly 5 s timeouts and non-deterministic failures that pass on re-run), so a single full-suite number is not a stable claim; the round-4 files are green and no round-4 change regressed anything.
+
 ### Headline changes
 
 - Replay protection is durable (IndexedDB, 30-day TTL, 10k cap) — H1/H3/M1; history no longer locks after reload.
@@ -432,10 +436,11 @@ No finding is left without an implementation or a documented stop/exception. The
 - HttpOnly cookie sessions + Postgres session store with hourly purge — L9, DP-11.
 - Dependencies: multer 2.5.0, body-parser 1.20.9, axios 1.21.1, uuid 11.1.1 — H5, H6, M12, L13.
 - H4 corrected: late message 49 does decrypt; the real cost is message 50 replaying (H1).
+- Round 4: DP-12, L1, L3, L14, L15 closed (canonical group replay key; strict epoch monotonicity; unknown versions fail closed; 32-byte epoch keys; 5 MiB decrypt cap).
 
 ### Still open
 
-- Stopped (7): DP-12, DP-13, L1, L3, L5, L14, L15 — each pinned by a test asserting the current behaviour; each needs a design decision first.
+- Stopped (2): DP-13, L5 — each pinned by a test asserting the current behaviour; each needs a design decision first (both need a bundle-format version bump decision).
 - Accepted exceptions (3): M13, I6, L4.
 
 ### Still to verify live (after deploy)

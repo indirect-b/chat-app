@@ -500,23 +500,28 @@ before(async () => {
 });
 
 describe('DP deepening-1 — coverage-guided fuzzing (setup)', () => {
-  // -- DP-1 REGRESSION: group replay bypass via non-canonical epoch spelling --
-  it('DP-1 REGRESSION: same group message re-delivered with epoch "01"/"001"/"0001" is ACCEPTED (replay check keys on the raw payload string)', async () => {
+  // -- DP-1 REGRESSION (fixed round 4): group replay via non-canonical epoch spelling --
+  it('DP-1 REGRESSION: same group message re-delivered with epoch "01"/"001"/"0001" is REJECTED as a replay (canonical replay key)', async () => {
     await refreshFixtures();
     await setupGroup('dp1-group', 1);
     const payload = await C.encryptMessageText(SECRET_GROUP, 'group__dp1-group', { groupMembers: ['alice', 'bob'] });
     const opts = { myUsername: 'bob', peerUsername: 'alice', peerPublicKey: aliceBundle, groupMembers: ['alice', 'bob'] };
     const parts = payload.slice('e2ee:gep:v2:'.length).split(':');
     assert.equal(parts[0], '1');
-    let accepted = 0;
-    for (const spelling of ['1', '01', '001', '0001', '00001']) {
+    // The canonical spelling decrypts once.
+    const res = await C.decryptMessageText(payload, 'group__dp1-group', opts);
+    assert.equal(res.text, SECRET_GROUP);
+    // Every non-canonical spelling of the SAME logical message is the
+    // same message (epoch parses to 1) and must be caught as a replay.
+    for (const spelling of ['01', '001', '0001', '00001']) {
       const p = `e2ee:gep:v2:${spelling}:${parts[1]}:${parts[2]}:${parts[3]}`;
-      const res = await C.decryptMessageText(p, 'group__dp1-group', opts);
-      assert.equal(res.text, SECRET_GROUP);
-      accepted++;
+      await assert.rejects(
+        () => C.decryptMessageText(p, 'group__dp1-group', opts),
+        (err: any) => err instanceof C.E2EEError && err.code === 'REPLAY_DETECTED',
+        `epoch spelling "${spelling}" of an already-delivered message must be REPLAY_DETECTED`,
+      );
     }
-    assert.equal(accepted, 5, 'all 5 epoch spellings of the same logical message must decrypt (this IS the finding)');
-    // Control: the canonical spelling a second time IS rejected.
+    // Control: the canonical spelling a second time is also rejected.
     await assert.rejects(
       () => C.decryptMessageText(payload, 'group__dp1-group', opts),
       (err: any) => err instanceof C.E2EEError && err.code === 'REPLAY_DETECTED',

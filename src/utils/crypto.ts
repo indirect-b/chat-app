@@ -52,6 +52,9 @@ const MAX_SENT_PLAINTEXT_CACHE = 500;
 // کران‌های حافظهٔ Replay (راند ۳) — انبار دائم در keystore.ts کران خودش را دارد.
 const MAX_SEEN_RECV_STEPS = 10_000;
 const MAX_GROUP_SEEN_MESSAGE_KEYS = 10_000;
+// Round 4 (L15): upper bound on decrypt input — a message payload is never
+// legitimately this large (files go through decryptFileBytes, not here).
+const MAX_DECRYPT_INPUT_BYTES = 5 * 1024 * 1024;
 const BASE64_REGEX = /^[A-Za-z0-9+/]*={0,2}$/;
 
 export type E2EEErrorCode =
@@ -65,6 +68,8 @@ export type E2EEErrorCode =
   | 'MISSING_KEYS'
   | 'MAX_SKIP_EXCEEDED'
   | 'UNVERIFIED_PEER_KEY'
+  | 'UNSUPPORTED_VERSION' // L3 (round 4): an E2EE payload with an unknown version
+  | 'PAYLOAD_TOO_LARGE' // L15 (round 4): decrypt input exceeds MAX_DECRYPT_INPUT_BYTES
   | 'IDENTITY_LOCKED'; // L8: هویت با رمز عبور محافظت شده و در این نشست باز نشده است
 
 export class E2EEError extends Error {
@@ -1495,11 +1500,25 @@ export async function rotateGroupEpoch(
   }
 
   const state = getGroupEpochState(groupId, members);
+  // L1 (round 4): strict monotonicity — a stale epoch packet (from a
+  // malicious server, or an out-of-order delivery) must never roll the
+  // group back to an older epoch key, which would re-enable a removed
+  // member. A rollback is ignored, not an error: the callers
+  // (ensureGroupEpochPacket, group-join handler) fire-and-forget, so a
+  // throw here would break the room flow. Re-rotating to the SAME epoch
+  // is still allowed (idempotent re-sync).
+  if (state.currentEpoch > 0 && newEpoch < state.currentEpoch) {
+    return state;
+  }
   state.status = 'ROTATING';
 
   try {
     const mHash = computeMembersHash(members);
     const rootKey = base64ToBuf(epochKeyB64);
+    // L14 (round 4): epoch keys are always 32 bytes (see createGroupEpochPacket).
+    if (rootKey.byteLength !== 32) {
+      throw new E2EEError('MALFORMED_PAYLOAD', 'Group epoch key must be exactly 32 bytes');
+    }
 
     state.currentEpoch = newEpoch;
     state.epochs[newEpoch] = {
@@ -1837,6 +1856,18 @@ export async function decryptMessageText(
   if (typeof payload !== 'string') {
     throw new E2EEError('MALFORMED_PAYLOAD', 'Payload must be a string');
   }
+  // L15 (round 4): reject oversized decrypt input before doing any
+  // expensive crypto — a 10 MB ciphertext used to cost ~3.3 s CPU.
+  if (payload.length > MAX_DECRYPT_INPUT_BYTES) {
+    throw new E2EEError('PAYLOAD_TOO_LARGE', 'Decrypt input exceeds maximum size');
+  }
+  // L3 (round 4): an E2EE payload with an unknown version must fail
+  // closed, never pass through as plaintext. Genuine plaintext (no
+  // `e2ee:` prefix) still passes through — that is how old plaintext
+  // history displays.
+  if (payload.startsWith('e2ee:') && !isE2EEPayload(payload)) {
+    throw new E2EEError('UNSUPPORTED_VERSION', 'Unknown E2EE payload version');
+  }
   if (!isE2EEPayload(payload)) {
     return { text: payload || '', isEncrypted: false };
   }
@@ -1994,6 +2025,16 @@ export async function decryptMessageText(
     if (!Number.isSafeInteger(msgEpoch) || msgEpoch < 1) {
       throw new E2EEError('MALFORMED_PAYLOAD', 'Group epoch must be a positive integer');
     }
+    // DP-12 (round 4): the replay key must be computed from the CANONICAL
+    // form of the message, not the raw payload string. The epoch is
+    // re-serialized from the parsed number, so "01", "001" and "1" all
+    // map to the same key and a re-delivered message is caught as a
+    // replay. The sender builds the payload from a numeric epoch, so
+    // this canonical form matches the sender's own-message cache key.
+    const canonicalGroupPayload = isGepV3
+      ? `${E2EE_GROUP_EPOCH_V3_PREFIX}${msgEpoch}:${membersHash}:${ivB64}:${cipherB64}:${senderSigB64}`
+      : `${E2EE_GROUP_EPOCH_PREFIX}${msgEpoch}:${membersHash}:${ivB64}:${cipherB64}`;
+    const replayKey = bufToBase64(sha256(new TextEncoder().encode(canonicalGroupPayload))).slice(0, 24);
     if (!membersHash || membersHash.length > 64) {
       throw new E2EEError('MALFORMED_PAYLOAD', 'Invalid group membersHash');
     }
@@ -2048,7 +2089,7 @@ export async function decryptMessageText(
     const isSelfSent = Boolean(normMy && normSender && normMy === normSender);
 
     if (isSelfSent) {
-      const cached = getSentPlaintextFromMemory(normMy, roomId, payloadHashKey);
+      const cached = getSentPlaintextFromMemory(normMy, roomId, replayKey);
       if (cached !== null) {
         return {
           text: cached,
@@ -2063,8 +2104,8 @@ export async function decryptMessageText(
 
     // جلوگیری از Replay پیام گروهی (M1: هم حافظه RAM و هم انبار دائم IndexedDB)
     const seenSet = epochRec.seenMessageSet || (epochRec.seenMessageSet = new Set(epochRec.seenMessageKeys || []));
-    const isDurableReplay = await isDurableReplaySeen(roomId, `group_msg_${msgEpoch}_${payloadHashKey}`);
-    if (!isSelfSent && (seenSet.has(payloadHashKey) || isDurableReplay)) {
+    const isDurableReplay = await isDurableReplaySeen(roomId, `group_msg_${msgEpoch}_${replayKey}`);
+    if (!isSelfSent && (seenSet.has(replayKey) || isDurableReplay)) {
       throw new E2EEError('REPLAY_DETECTED', 'Replayed group message rejected');
     }
     const rootKeyBytes = epochRec.rootKey;
@@ -2092,9 +2133,9 @@ export async function decryptMessageText(
       );
       const plainText = new TextDecoder('utf-8', { fatal: true }).decode(decryptedBuffer);
       // ثبت پیام به‌عنوان تحویل‌شده پس از رمزگشایی موفق بدون فراموشی خاموش در طول اپوک (M2) و ثبت در انبار دائم (M1)
-      seenSet.add(payloadHashKey);
+      seenSet.add(replayKey);
       if (!epochRec.seenMessageKeys) epochRec.seenMessageKeys = [];
-      epochRec.seenMessageKeys.push(payloadHashKey);
+      epochRec.seenMessageKeys.push(replayKey);
       // کران حافظه (راند ۳): در یک اپوکِ بسیار پرپیام، فقط ۱۰٬۰۰۰ پیام اخیر
       // در RAM نگه داشته می‌شوند؛ قدیمی‌ترها همچنان در انبار دائم (TTL ۳۰
       // روز) بررسی می‌شوند.
@@ -2103,7 +2144,7 @@ export async function decryptMessageText(
         const removedKeys = epochRec.seenMessageKeys.splice(0, excess);
         for (const oldKey of removedKeys) seenSet.delete(oldKey);
       }
-      await recordDurableReplaySeen(roomId, `group_msg_${msgEpoch}_${payloadHashKey}`);
+      await recordDurableReplaySeen(roomId, `group_msg_${msgEpoch}_${replayKey}`);
       return {
         text: plainText,
         isEncrypted: true,
