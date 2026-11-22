@@ -63,20 +63,208 @@
   100% { transform: translate(25px, 20px) scale(0.9); }
 }
 
-/* Glassmorphism Card */
+/* Main Split-Stage Layout */
+.auth-layout-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 48px;
+  max-width: 1040px;
+  width: 100%;
+  position: relative;
+  z-index: 10;
+  padding: 20px;
+}
+
+/* Hero Showcase Section (Right side in RTL) */
+.auth-hero-showcase {
+  flex: 1.1;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  animation: heroShowcaseEnter 360ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes heroShowcaseEnter {
+  from {
+    opacity: 0;
+    transform: translateX(18px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+.showcase-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border-radius: 9999px;
+  background: rgba(6, 182, 212, 0.12);
+  border: 1px solid rgba(6, 182, 212, 0.35);
+  color: var(--accent-cyan-light);
+  font-size: 12.5px;
+  font-weight: 600;
+  width: fit-content;
+}
+
+.showcase-brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.showcase-logo-ring {
+  width: 58px;
+  height: 58px;
+  border-radius: 18px;
+  background: rgba(14, 18, 27, 0.85);
+  border: 1px solid var(--accent-cyan-border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 0 24px rgba(6, 182, 212, 0.25);
+}
+
+.showcase-brand h1 {
+  font-size: 28px;
+  font-weight: 800;
+  color: var(--text-primary);
+  letter-spacing: -0.4px;
+}
+
+.showcase-tagline {
+  font-size: 14.5px;
+  color: var(--text-secondary);
+  line-height: 1.75;
+  margin-bottom: 4px;
+}
+
+.showcase-features {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.showcase-feature-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 12px 16px;
+  border-radius: 16px;
+  background: rgba(14, 18, 27, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  transition: all var(--duration-fast) var(--ease-out-cubic);
+}
+
+.showcase-feature-item:hover {
+  background: rgba(14, 18, 27, 0.85);
+  border-color: rgba(6, 182, 212, 0.25);
+  transform: translateX(-4px);
+}
+
+.feature-icon {
+  font-size: 22px;
+  line-height: 1;
+}
+
+.feature-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.feature-text strong {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.feature-text span {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.showcase-status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border-radius: 9999px;
+  background: rgba(16, 185, 129, 0.1);
+  border: 1px solid rgba(16, 185, 129, 0.3);
+  font-size: 12px;
+  color: #a7f3d0;
+  width: fit-content;
+  margin-top: 4px;
+}
+
+.status-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--status-online);
+  box-shadow: 0 0 8px var(--status-online);
+  animation: badgeDotPulse 2s infinite ease-in-out;
+}
+
+/* Glassmorphism Card (Action Panel) */
 .auth-box {
   width: 100%;
-  max-width: 420px;
+  max-width: 440px;
   padding: 34px 28px 24px;
-  background: rgba(14, 18, 26, 0.78);
+  background: rgba(14, 18, 26, 0.82);
   border: 1px solid rgba(255, 255, 255, 0.09);
   border-radius: 24px;
-  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.7), 0 0 32px rgba(6, 182, 212, 0.08);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.7), 0 0 35px rgba(6, 182, 212, 0.08);
   backdrop-filter: blur(28px);
   -webkit-backdrop-filter: blur(28px);
   position: relative;
   z-index: 10;
   animation: authCardEnter 320ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@media (max-width: 900px) {
+  .auth-layout-container {
+    flex-direction: column;
+    gap: 28px;
+    padding: 16px;
+  }
+  .auth-hero-showcase {
+    text-align: center;
+    align-items: center;
+  }
+  .showcase-brand {
+    justify-content: center;
+  }
+  .showcase-features {
+    display: none;
+  }
+}
+
+.auth-divider {
+  display: flex;
+  align-items: center;
+  margin: 16px 0 12px;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.auth-divider::before,
+.auth-divider::after {
+  content: '';
+  flex: 1;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.auth-divider span {
+  padding: 0 10px;
 }
 
 .auth-box::before {

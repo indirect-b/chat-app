@@ -277,91 +277,132 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
         <div className="ambient-nebula-blob blob-2" />
       </div>
 
-      <div id={`step${step}`} className="auth-box">
-        <header role="banner" aria-label="سربرگ صفحه" className="auth-banner">
-          <a href="/" className="auth-brand">
-            <span className="auth-brand-icon-wrap" aria-hidden="true">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <div className="auth-layout-container">
+        {/* RIGHT/TOP: Hero Showcase */}
+        <section className="auth-hero-showcase" aria-label="معرفی پیام‌رسان">
+          <div className="showcase-badge">
+            <span className="badge-pulse-dot" aria-hidden="true" />
+            <span>پروتکل اختصاصی PQ-MPRBA v6.5</span>
+          </div>
+
+          <div className="showcase-brand">
+            <div className="showcase-logo-ring" aria-hidden="true">
+              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--accent-cyan)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M12 2L4 5v6c0 5.55 3.84 10.74 8 12 4.16-1.26 8-6.45 8-12V5l-8-3z" />
                 <path d="M12 8v4" />
-                <path d="M12 16h.01" />
+                <circle cx="12" cy="16" r="1.25" fill="var(--accent-cyan)" />
               </svg>
-            </span>
-            <span className="auth-brand-name">پیام‌رسان امن</span>
-          </a>
-          <div className="auth-security-badge" aria-label="پروتکل امنیتی PQ-MPRBA">
-            <span className="badge-pulse-dot" aria-hidden="true" />
-            <span>ML-KEM-768</span>
+            </div>
+            <h1>پیام‌رسان امن کوانتومی</h1>
           </div>
-        </header>
 
-        <main id="main-content" tabIndex={-1}>
-          {step === 1 && (
-            <div className="auth-step-anim">
-              <div className="auth-logo">
-                <div className="logo-circle-container">
-                  <div className="logo-halo" aria-hidden="true" />
-                  <div className="logo-circle" aria-hidden="true">
-                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="url(#cyanGrad)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                      <defs>
-                        <linearGradient id="cyanGrad" x1="0" y1="0" x2="24" y2="24" gradientUnits="userSpaceOnUse">
-                          <stop stopColor="#22d3ee" />
-                          <stop stopColor="#06b6d4" />
-                        </linearGradient>
-                      </defs>
-                      <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
-                      <circle cx="9" cy="12" r="1" fill="#22d3ee" />
-                      <circle cx="12" cy="12" r="1" fill="#22d3ee" />
-                      <circle cx="15" cy="12" r="1" fill="#22d3ee" />
-                    </svg>
-                  </div>
-                </div>
-                <h1>پیام‌رسان</h1>
-                <p>ورود با گوگل • مجهز به رمزنگاری پسا-کوانتومی E2EE</p>
-              </div>
+          <p className="showcase-tagline">
+            نخستین پیام‌رسان وب ایرانی مجهز به رمزنگاری پسا-کوانتومی هیبرید. پیام‌ها و فایل‌های شما حتی در برابر قدرتمندترین ابررایانه‌ها مصون هستند.
+          </p>
 
-              <div className="google-btn-container">
-                {googleClientId && googleReady ? (
-                  <div
-                    ref={googleBtnRef}
-                    className="google-btn-wrapper"
-                  />
-                ) : (
-                  <div className="google-btn-loading" role="status">
-                    <span className="spinner-dot" aria-hidden="true" />
-                    <span>در حال اتصال امن به درگاه گوگل...</span>
-                  </div>
-                )}
-              </div>
-
-              <div className="auth-form">
-                <button
-                  type="button"
-                  className="btn-recovery-link"
-                  onClick={() => {
-                    setMsg({ text: '', isOk: false });
-                    setRecoveryError('');
-                    setStep(5);
-                  }}
-                >
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                    <circle cx="7.5" cy="15.5" r="5.5" />
-                    <path d="m21 2-9.6 9.6" />
-                    <path d="m15.5 7.5 3 3L22 7l-3-3" />
-                  </svg>
-                  <span>ورود اضطراری با کد بازیابی (عدم دسترسی به گوگل)</span>
-                </button>
-                <p
-                  id="msg1"
-                  role="status"
-                  aria-live="polite"
-                  className={`auth-msg ${msg.isOk ? 'ok' : ''}`}
-                >
-                  {msg.text}
-                </p>
+          <div className="showcase-features">
+            <div className="showcase-feature-item">
+              <div className="feature-icon" aria-hidden="true">🛡️</div>
+              <div className="feature-text">
+                <strong>رمزنگاری هیبرید NIST FIPS 203/204</strong>
+                <span>ترکیب همزمان ML-KEM-768 و ECDH P-256 در هر پیام</span>
               </div>
             </div>
-          )}
+            <div className="showcase-feature-item">
+              <div className="feature-icon" aria-hidden="true">🔐</div>
+              <div className="feature-text">
+                <strong>حفظ صفر مطلق داده (Zero-Knowledge)</strong>
+                <span>کلید خصوصی هرگز از مرورگر شما خارج یا در سرور ذخیره نمی‌شود</span>
+              </div>
+            </div>
+            <div className="showcase-feature-item">
+              <div className="feature-icon" aria-hidden="true">⚡</div>
+              <div className="feature-text">
+                <strong>بلادرنگ و مستقل</strong>
+                <span>بدون وابستگی به پلتفرم‌های واسط خارجی با احراز هویت امن</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="showcase-status-chip">
+            <span className="status-live-dot" aria-hidden="true" />
+            <span>وضعیت شبکه: رمزنگاری فعال • سرور رندر آماده ارتباط</span>
+          </div>
+        </section>
+
+        {/* LEFT/BOTTOM: Interactive Action Card */}
+        <div id={`step${step}`} className="auth-box auth-card-panel">
+          <header role="banner" aria-label="سربرگ ورود" className="auth-banner">
+            <a href="/" className="auth-brand">
+              <span className="auth-brand-icon-wrap" aria-hidden="true">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 2L4 5v6c0 5.55 3.84 10.74 8 12 4.16-1.26 8-6.45 8-12V5l-8-3z" />
+                  <path d="M12 8v4" />
+                  <circle cx="12" cy="16" r="1" fill="currentColor" />
+                </svg>
+              </span>
+              <span className="auth-brand-name">پیام‌رسان</span>
+            </a>
+            <div className="auth-security-badge" aria-label="رمزنگاری پسا-کوانتومی">
+              <span className="badge-pulse-dot" aria-hidden="true" />
+              <span>ML-KEM-768</span>
+            </div>
+          </header>
+
+          <main id="main-content" tabIndex={-1}>
+            {step === 1 && (
+              <div className="auth-step-anim">
+                <div className="auth-logo">
+                  <h2>ورود به حساب کاربری</h2>
+                  <p>برای ورود به گفت‌وگوهای رمزشده خود با حساب گوگل ادامه دهید.</p>
+                </div>
+
+                <div className="google-btn-container">
+                  {googleClientId && googleReady ? (
+                    <div
+                      ref={googleBtnRef}
+                      className="google-btn-wrapper"
+                    />
+                  ) : (
+                    <div className="google-btn-loading" role="status">
+                      <span className="spinner-dot" aria-hidden="true" />
+                      <span>در حال اتصال امن به درگاه گوگل...</span>
+                    </div>
+                  )}
+                </div>
+
+                <div className="auth-divider">
+                  <span>یا ورود اضطراری</span>
+                </div>
+
+                <div className="auth-form">
+                  <button
+                    type="button"
+                    className="btn-recovery-link"
+                    onClick={() => {
+                      setMsg({ text: '', isOk: false });
+                      setRecoveryError('');
+                      setStep(5);
+                    }}
+                  >
+                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <circle cx="7.5" cy="15.5" r="5.5" />
+                      <path d="m21 2-9.6 9.6" />
+                      <path d="m15.5 7.5 3 3L22 7l-3-3" />
+                    </svg>
+                    <span>ورود با کد بازیابی یک‌بارمصرف</span>
+                  </button>
+                  <p
+                    id="msg1"
+                    role="status"
+                    aria-live="polite"
+                    className={`auth-msg ${msg.isOk ? 'ok' : ''}`}
+                  >
+                    {msg.text}
+                  </p>
+                </div>
+              </div>
+            )}
 
           {step === 4 && (
             <div className="auth-step-anim">
@@ -524,5 +565,6 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
         </footer>
       </div>
     </div>
-  );
+  </div>
+);
 };

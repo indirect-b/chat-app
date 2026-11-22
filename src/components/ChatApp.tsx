@@ -1785,25 +1785,6 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       >
         <div className="sidebar-header">
           <div className="header-top">
-            <button
-              type="button"
-              className="icon-btn"
-              onClick={() => setSearchOpen(prev => !prev)}
-              title="جستجو"
-            >
-              <svg
-                width="21"
-                height="21"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-              >
-                <circle cx="11" cy="11" r="8" />
-                <line x1="21" y1="21" x2="16.65" y2="16.65" />
-              </svg>
-            </button>
-
             <div className="my-story" onClick={() => setProfileModalOpen(true)}>
               <div className="story-avatar" id="myAvatar">
                 {myProfile.avatar ? (
@@ -1812,44 +1793,72 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                   myUsername[0]?.toUpperCase()
                 )}
               </div>
-              <div>
-                <div id="myName" style={{ fontSize: '14px', fontWeight: 600 }}>
-                  <bdi dir="ltr">@{myUsername}</bdi>
+              <div className="my-story-info">
+                <div id="myName" className="my-name-text">
+                  <bdi dir="ltr">@{myUsername.includes('@') ? myUsername.split('@')[0] : myUsername}</bdi>
                 </div>
-                <div id="myStatusLabel" style={{ fontSize: '11px', color: '#9ca3af' }}>
-                  {myProfile.status === 'online'
-                    ? 'آنلاین'
-                    : myProfile.status === 'busy'
-                    ? 'مشغول'
-                    : 'غایب'}
+                <div id="myStatusLabel" className="my-status-pill">
+                  <span className="online-dot" aria-hidden="true" />
+                  <span>
+                    {myProfile.status === 'online'
+                      ? 'آنلاین'
+                      : myProfile.status === 'busy'
+                      ? 'مشغول'
+                      : 'غایب'}
+                  </span>
                 </div>
               </div>
             </div>
 
-            <button
-              type="button"
-              className="icon-btn"
-              onClick={() => {
-                if (activeTab === 'groups') {
-                  setGroupModalOpen(true);
-                } else {
-                  setContactModalOpen(true);
-                }
-              }}
-              title={activeTab === 'groups' ? 'ایجاد گروه جدید' : 'افزودن مخاطب'}
-            >
-              <svg
-                width="21"
-                height="21"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
+            <div className="header-actions">
+              <button
+                type="button"
+                className="header-action-btn"
+                onClick={() => setSearchOpen(prev => !prev)}
+                title="جستجو"
               >
-                <line x1="12" y1="5" x2="12" y2="19" />
-                <line x1="5" y1="12" x2="19" y2="12" />
-              </svg>
-            </button>
+                <svg
+                  width="19"
+                  height="19"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <circle cx="11" cy="11" r="8" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                </svg>
+              </button>
+
+              <button
+                type="button"
+                className="header-action-btn add-btn"
+                onClick={() => {
+                  if (activeTab === 'groups') {
+                    setGroupModalOpen(true);
+                  } else {
+                    setContactModalOpen(true);
+                  }
+                }}
+                title={activeTab === 'groups' ? 'ایجاد گروه جدید' : 'افزودن مخاطب'}
+              >
+                <svg
+                  width="19"
+                  height="19"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <line x1="12" y1="5" x2="12" y2="19" />
+                  <line x1="5" y1="12" x2="19" y2="12" />
+                </svg>
+              </button>
+            </div>
           </div>
 
           {searchOpen && (
@@ -1914,13 +1923,28 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                     className="btn-primary-sm"
                     onClick={() => setGroupModalOpen(true)}
                   >
-                    ساخت گروه جدید
+                    ➕ ساخت گروه جدید
                   </button>
                 </div>
               ) : (
-                <div>
-                  <div className="empty-icon" aria-hidden="true">💬</div>
-                  <p>مخاطبی یافت نشد</p>
+                <div className="empty-contacts-state">
+                  <div className="empty-icon-shield" aria-hidden="true">
+                    <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="var(--accent-cyan)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+                      <circle cx="9" cy="7" r="4" />
+                      <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+                      <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+                    </svg>
+                  </div>
+                  <p className="empty-title">هنوز گفت‌وگویی ندارید</p>
+                  <p className="empty-desc">برای برقراری ارتباط رمزشده با دوستان، آیدی آن‌ها را اضافه کنید.</p>
+                  <button
+                    type="button"
+                    className="btn-primary-sm"
+                    onClick={() => setContactModalOpen(true)}
+                  >
+                    ➕ افزودن مخاطب جدید
+                  </button>
                 </div>
               )}
             </div>
@@ -1956,33 +1980,51 @@ export const ChatApp: React.FC<ChatAppProps> = ({
         </div>
 
         <div className="sidebar-footer">
-          <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
-            <button type="button" className="foot-btn" onClick={onLogout}>
-              <svg
-                width="18"
-                height="18"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-              >
+          <div className="sidebar-footer-user" onClick={() => setProfileModalOpen(true)} title="مشاهده پروفایل و آیدی">
+            <div className="footer-avatar-sm" aria-hidden="true">
+              {myUsername[0]?.toUpperCase()}
+            </div>
+            <div className="footer-user-id">
+              <bdi dir="ltr">@{myUsername.includes('@') ? myUsername.split('@')[0] : myUsername}</bdi>
+            </div>
+          </div>
+
+          <div className="sidebar-footer-actions">
+            <button
+              type="button"
+              className="foot-btn foot-btn-icon"
+              onClick={() => setChangelogModalOpen(true)}
+              title="مشاهده مستندات معماری PQ-MPRBA"
+            >
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10" />
+                <line x1="12" y1="16" x2="12" y2="12" />
+                <line x1="12" y1="8" x2="12.01" y2="8" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              className="foot-btn foot-btn-icon"
+              onClick={() => setSettingsModalOpen(true)}
+              title="تنظیمات سامانه"
+            >
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              className="foot-btn foot-btn-icon foot-btn-danger"
+              onClick={onLogout}
+              title="خروج از حساب کاربری"
+            >
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
                 <polyline points="16 17 21 12 16 7" />
                 <line x1="21" y1="12" x2="9" y2="12" />
               </svg>
-              خروج
             </button>
-            <button
-              type="button"
-              className="foot-btn foot-btn-changelog"
-              onClick={() => setChangelogModalOpen(true)}
-              title="مشاهده تغییرات و معماری اختصاصی PQ-MPRBA v6.0"
-            >
-              <span aria-hidden="true">🚀</span> چنج‌لاگ v6.0
-            </button>
-          </div>
-          <div className="my-id">
-            <bdi dir="ltr">@<span id="myIdDisplay">{myUsername}</span></bdi>
           </div>
         </div>
       </div>
@@ -1994,9 +2036,64 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       >
         {!currentRoom ? (
           <div className="empty-state" id="emptyState">
-            <div className="empty-state-icon" aria-hidden="true">💬</div>
-            <p>گفت‌وگویی انتخاب نشده است</p>
-            <small>یک مخاطب را انتخاب کنید یا گفت‌وگوی جدید آغاز نمایید • مجهز به رمزنگاری سرتاسری PQ-MPRBA</small>
+            <div className="hero-showcase-card">
+              <div className="hero-shield-aura">
+                <div className="shield-ring" />
+                <div className="shield-icon" aria-hidden="true">
+                  <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="var(--accent-cyan)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M12 2L4 5v6c0 5.55 3.84 10.74 8 12 4.16-1.26 8-6.45 8-12V5l-8-3z" />
+                    <path d="M12 8v4" />
+                    <circle cx="12" cy="16" r="1.25" fill="var(--accent-cyan)" />
+                  </svg>
+                </div>
+              </div>
+
+              <h2>پیام‌رسان امن پسا-کوانتومی</h2>
+              <p className="hero-desc">
+                پیام‌ها با ترکیب رمزنگاری پسا-کوانتومی <b>ML-KEM-768</b> و امضای دیجیتال <b>ML-DSA-65</b> به شکل سرتاسری رمزنگاری می‌شوند و هیچ شخص ثالثی توانایی دسترسی به محتوا را ندارد.
+              </p>
+
+              <div className="hero-actions">
+                <button
+                  type="button"
+                  className="hero-action-btn primary"
+                  onClick={() => setContactModalOpen(true)}
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+                    <circle cx="9" cy="7" r="4" />
+                    <line x1="19" y1="8" x2="19" y2="14" />
+                    <line x1="22" y1="11" x2="16" y2="11" />
+                  </svg>
+                  <span>شروع گفت‌وگوی جدید</span>
+                </button>
+                <button
+                  type="button"
+                  className="hero-action-btn secondary"
+                  onClick={() => setGroupModalOpen(true)}
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+                    <circle cx="9" cy="7" r="4" />
+                    <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+                    <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+                  </svg>
+                  <span>ایجاد گروه رمزشده</span>
+                </button>
+              </div>
+
+              <div className="hero-trust-chips">
+                <span className="trust-chip">
+                  <span className="chip-dot" /> بدون ذخیره کلید در سرور
+                </span>
+                <span className="trust-chip">
+                  <span className="chip-dot cyan" /> پسا-کوانتومی PQ-MPRBA
+                </span>
+                <span className="trust-chip">
+                  <span className="chip-dot green" /> مقاومت در برابر جعل پیام
+                </span>
+              </div>
+            </div>
           </div>
         ) : (
           <div id="chatView" className="chat-view">
