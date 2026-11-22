@@ -333,18 +333,22 @@ describe('C. Group epoch handling', () => {
     assert.equal((await decryptMessageText(payload, roomId, { groupMembers: members })).text, 'group-secret');
   });
 
-  it('C5 epoch rollback: rotating to a LOWER epoch is accepted (no monotonicity check)', async () => {
+  it('C5 epoch rollback: rotating to a LOWER epoch is IGNORED (strict monotonicity, round 4)', async () => {
     const roomId = 'group__rollback-team';
     const members = ['alice', 'bob'];
     const bundles = await setupGroup(members);
     const packet = await createGroupEpochPacket(bundles);
     await rotateGroupEpoch('rollback-team', 5, members, packet.epochKeyB64);
-    const rolled = await rotateGroupEpoch('rollback-team', 2, members, packet.epochKeyB64).catch((e: unknown) => e);
-    if (rolled instanceof E2EEError) {
-      assert.fail(`expected rollback rotation to be accepted (finding if rejected differently), got ${rolled.code}`);
-    } else {
-      assert.equal((rolled as { currentEpoch: number }).currentEpoch, 2);
-    }
+    // A stale / malicious epoch packet must not roll the group back:
+    // the rotation is a no-op and the group stays at epoch 5.
+    const rolled = await rotateGroupEpoch('rollback-team', 2, members, packet.epochKeyB64);
+    assert.equal((rolled as { currentEpoch: number }).currentEpoch, 5);
+    assert.equal((rolled as { epochs: Record<number, unknown> }).epochs[2], undefined);
+    // Forward rotation still works, and re-rotating to the same epoch is fine.
+    const fwd = await rotateGroupEpoch('rollback-team', 6, members, packet.epochKeyB64);
+    assert.equal((fwd as { currentEpoch: number }).currentEpoch, 6);
+    const same = await rotateGroupEpoch('rollback-team', 6, members, packet.epochKeyB64);
+    assert.equal((same as { currentEpoch: number }).currentEpoch, 6);
     void roomId;
   });
 
@@ -640,11 +644,17 @@ describe('F. Edge inputs and fail-closed behaviour everywhere', () => {
     assert.equal(empty.text, '');
   });
 
-  it('F2 unknown-version / non-E2EE payloads pass through as plaintext (no warning flag)', async () => {
+  it('F2 unknown-version E2EE payloads fail closed (round 4); genuine plaintext still passes through', async () => {
     const { aliceBundle } = await setupPair();
-    const v3 = await decryptMessageText('e2ee:pq:v3:0:AAAA:BBBB:CCCC:DDDD', ROOM, decOpts(aliceBundle));
-    assert.equal(v3.isEncrypted, false, 'an unknown PQ version must not be silently treated as plaintext');
-    assert.equal(v3.text, 'e2ee:pq:v3:0:AAAA:BBBB:CCCC:DDDD');
+    // An unknown PQ version must throw, never silently become plaintext.
+    await expectE2EE(
+      decryptMessageText('e2ee:pq:v3:0:AAAA:BBBB:CCCC:DDDD', ROOM, decOpts(aliceBundle)),
+      'UNSUPPORTED_VERSION'
+    );
+    await expectE2EE(
+      decryptMessageText('e2ee:gep:v9:1:AAAA:BBBB:CCCC', ROOM, decOpts(aliceBundle)),
+      'UNSUPPORTED_VERSION'
+    );
     const plain = await decryptMessageText('hello, this is not encrypted', ROOM, decOpts(aliceBundle));
     assert.equal(plain.isEncrypted, false);
   });
@@ -674,7 +684,20 @@ describe('F. Edge inputs and fail-closed behaviour everywhere', () => {
     const out = await decryptMessageText(ct, ROOM, decOpts(aliceBundle));
     assert.equal(out.text, big);
     assert.ok(Date.now() - t0 < 30000, '1 MiB round-trip must complete');
-    // No MAX_MESSAGE_BYTES constant exists in crypto.ts (checked by grep in the report).
+    // Round 4 (L15): decrypt input is capped at 5 MiB (MAX_DECRYPT_INPUT_BYTES).
+    // A 1 MiB message is well under the cap, so this round-trip still passes.
+  });
+
+  it('F4b oversized decrypt input is rejected fast (round 4, L15)', async () => {
+    const { aliceBundle } = await setupPair();
+    // A fake 6 MiB payload must be rejected with PAYLOAD_TOO_LARGE before
+    // any expensive parsing/decryption runs (a 10 MB ciphertext used to
+    // cost ~3.3 s CPU). No real encryption is done here — the size check
+    // is the first thing decryptMessageText does.
+    const huge = 'e2ee:pq:v2:0:' + 'A'.repeat(6 * 1024 * 1024);
+    const t0 = Date.now();
+    await expectE2EE(decryptMessageText(huge, ROOM, decOpts(aliceBundle)), 'PAYLOAD_TOO_LARGE');
+    assert.ok(Date.now() - t0 < 5000, 'oversized input must be rejected fast');
   });
 
   it('F5 every failure path throws E2EEError — PBKDF2 wrong secret, missing epoch key, missing peer bundle', async () => {
