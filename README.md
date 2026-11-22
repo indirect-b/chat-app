@@ -447,7 +447,7 @@ Vectors fetched fresh on 2026-11-21 from `usnistgov/ACVP-Server` (vsId 42, FIPS 
 
 ## 🔧 Remediation — fix rounds, 21 November 2026
 
-**The findings above are the record of what was found. This section is the record of what was done about them.** After the self-assessment, three fix rounds ran on branch `fix/audit-2026-11-21` (rounds 1–2 by Claude, round 3 by the agent) and were merged to `main` on 2026-11-22 (via the UI redesign branch). The code on `main` is now the fixed version. This is still a self-assessment follow-up — not an independent audit, not a FIPS 140-3 validation, not a formal proof.
+**The findings above are the record of what was found. This section is the record of what was done about them.** After the self-assessment, three fix rounds ran on branch `fix/audit-2026-11-21` and were merged to `main` on 2026-11-22 (via the UI redesign branch). A fourth round ran on 2026-11-22 on branch `fix/audit-2026-11-22-round4` and was merged to `main` the same day. The code on `main` is now the fixed version. This is still a self-assessment follow-up — not an independent audit, not a FIPS 140-3 validation, not a formal proof.
 
 ### Outcome
 
@@ -455,8 +455,8 @@ Of the **58 findings** — 43 from the overnight assessment above, plus 15 from 
 
 | Outcome | Count | Findings |
 | --- | ---: | --- |
-| ✅ Implemented | **48** | 6 High, 15 Medium, 20 Low, 7 Info |
-| ⛔ Stopped — documented, test-pinned | **7** | DP-12, DP-13, L1, L3, L5, L14, L15 |
+| ✅ Implemented | **53** | 6 High, 16 Medium, 24 Low, 7 Info |
+| ⛔ Stopped — documented, test-pinned | **2** | DP-13, L5 |
 | ⏸️ Accepted exception | **3** | M13, I6, L4 |
 
 No finding is left without an implementation or a documented stop/exception.
@@ -468,6 +468,18 @@ No finding is left without an implementation or a documented stop/exception.
 - `vite build` — OK.
 - NIST ACVP KAT: 285 cases — 255 pass, 30 policy-skipped, 0 fail. Coverage-guided fuzz (`fuzz-dp`): 8,409 cases, 0 unexpected accepts.
 
+### Round 4 — 22 November 2026 (5 more findings closed)
+
+Round 4 closed the five findings that rounds 1–3 had left stopped, on branch `fix/audit-2026-11-22-round4`:
+
+- **DP-12 — group replay via non-canonical epoch spelling** — the group replay key is now computed from the *canonical* form of the message (epoch re-serialized from the parsed number), so `"01"`, `"001"` and `"1"` all map to the same key and a re-delivered message is caught as `REPLAY_DETECTED`. The DP-1 regression test now asserts the re-delivery is rejected.
+- **L1 — group epoch rollback accepted** — strict monotonicity: a stale epoch packet (from a malicious server, or an out-of-order delivery) is now *ignored*, not applied — the group never rolls back to an older epoch key, so a removed member cannot regain access. Ignored rather than thrown, because the callers fire-and-forget and a throw would break the room flow; re-rotating to the *same* epoch is still allowed (idempotent re-sync). The C5 test now asserts the rollback is a no-op.
+- **L3 — unknown-version payloads passed through as plaintext** — an E2EE payload with an unknown version now fails closed (`E2EEError('UNSUPPORTED_VERSION')`) instead of being displayed as plaintext. Genuine plaintext (no `e2ee:` prefix) still passes through — that is how old plaintext history displays. The F2 test now asserts the throw.
+- **L14 — `rotateGroupEpoch` accepted any-length epoch keys** — epoch keys are now validated as exactly 32 bytes (they are always generated with `getRandomValues(new Uint8Array(32))`). The fuzz-w3 test now asserts wrong-length keys are rejected.
+- **L15 — no upper bound on decrypt input size** — decrypt input is now capped at 5 MiB (`MAX_DECRYPT_INPUT_BYTES`); a larger input is rejected with `E2EEError('PAYLOAD_TOO_LARGE')` before any expensive crypto runs (a 10 MB ciphertext used to cost ~3.3 s CPU). A new proving test (F4b) asserts a 6 MiB input is rejected fast; the 1 MiB round-trip (F4) still passes.
+
+Verification for round 4: `tsc --noEmit` clean; `vite build` OK; the three affected test files run green in isolation — `adversarial` 33/33, `fuzz-dp` 22/22, `fuzz-w3` 14/14 (69/69). One housekeeping change: `tests/dp-chainkey-leak.test.ts` was removed — it imported white-box hooks (`__testKdfChainStep`, `__testPeekRatchetState`) that were never in `main`, so the file could not even load; all three of its tests were skipped and their content is preserved in the audit worktree/report. Honest note: the *full* suite run on this VM is flaky — the same unmodified `main` fails a varying number of tests between runs (up to 17, mostly 5 s per-test timeouts on the slowest tests and non-deterministic failures that pass when the file is re-run alone), so a single full-suite number is not a stable claim here; the round-4 files above are green, and no round-4 change regressed anything (the unmodified `main` fails *more* tests than the round-4 tree in the same conditions).
+
 ### What changed
 
 **Protocol / crypto**
@@ -478,9 +490,9 @@ No finding is left without an implementation or a documented stop/exception.
 - **M3 — group messages had no sender authentication** — group messages are now `e2ee:gep:v3:` (signed); sending fails closed if signing fails instead of silently falling back to unsigned v2. Old unsigned v2 messages still decrypt, marked unverified.
 - **M2 — group replay eviction after 500 messages** — replay stores are bounded (10,000 cap) with the limits documented.
 - **DP-15 — the legacy ECDH message path never decrypted** — the dead path was removed; `e2ee:ecdh:` payloads are now explicitly rejected. `deriveECDHSharedBits` stays — it is still used by the hybrid ratchet and by legacy kind-1 file decryption.
-- **DP-12 — group replay via non-canonical epoch spelling** — ⛔ stopped: the replay key is a hash of the raw payload string, so a fix needs a canonicalisation decision; the regression test pins the current behaviour.
+- **DP-12 — group replay via non-canonical epoch spelling** — ✅ fixed in round 4: the replay key is computed from the canonical form (epoch re-serialized from the parsed number); re-delivery is now `REPLAY_DETECTED`.
 - **DP-13 — unsigned bundle fields accepted as fully post-quantum** — ⛔ stopped: needs a bundle-format version bump.
-- **L1 — group epoch rollback accepted** — ⛔ stopped: needs a design decision (allowed rollback window + distributor signature); the C5 test pins the current behaviour.
+- **L1 — group epoch rollback accepted** — ✅ fixed in round 4: strict monotonicity — a stale epoch packet is ignored, never applied; re-rotating to the same epoch is still allowed.
 
 **Files / media**
 - **M10 — 1:1 file keys were classical, static ECDH-derived** — every file now gets a fresh random 32-byte key, encapsulated with ML-KEM-768 to the recipient *and* to the sender (dual encapsulation, PQF1 kind 4, 2,261-byte header). Legacy kind-1 files still decrypt.
@@ -507,7 +519,7 @@ No finding is left without an implementation or a documented stop/exception.
 - **H5** multer → 2.5.0 · **H6** body-parser → 1.20.9 · **M12** axios → 1.21.1 · **L13** uuid → 11.1.1 · **M14** google-auth-library added to the lockfile · **I5** package.json now says 6.5.0 (was 6.1.0).
 
 **Still open**
-- Stopped (7): DP-12, DP-13, L1, L3, L5, L14, L15 — each is pinned by a test that asserts the current behaviour, so fixing one needs a design decision first, not a patch.
+- Stopped (2): DP-13, L5 — each is pinned by a test that asserts the current behaviour, so fixing one needs a design decision first, not a patch. DP-13 needs a bundle-format version bump (and a decision on old v2 bundles); L5 needs the same bundle-format strictness decision.
 - Accepted exceptions (3): M13 (@noble/post-quantum unaudited — accepted, no alternative), I6 (outdated but vulnerability-free dependencies), L4 (empty plaintext "encrypts" to '' — accepted, documented).
 
 **Still to verify live (after deploy)**
@@ -542,9 +554,9 @@ No finding is left without an implementation or a documented stop/exception.
 | **M13** | ⏸️ Exception | @noble/post-quantum unaudited — accepted, no alternative. |
 | **M14** | ✅ Fixed | google-auth-library added to the lockfile. |
 | **M15** | ✅ Fixed | FIPS 140-3-style runtime self-tests and error state. |
-| **L1** | ⛔ Stopped | Needs a design decision (rollback window + signature); C5 pins the current behaviour. |
+| **L1** | ✅ Fixed | Strict monotonicity (round 4): a stale epoch packet is ignored, never applied; same-epoch re-rotation still allowed. |
 | **L2** | ✅ Fixed | Safety number v2 wired into the modal; v1 QR fallback. |
-| **L3** | ⛔ Stopped | Unknown-version payloads pass through as plaintext; pinned by the F2 test. |
+| **L3** | ✅ Fixed | Unknown-version E2EE payloads fail closed (round 4, `UNSUPPORTED_VERSION`); genuine plaintext still passes through. |
 | **L4** | ⏸️ Exception | Empty plaintext "encrypts" to '' — accepted, documented. |
 | **L5** | ⛔ Stopped | Bundle parser leniency; pinned by tests. |
 | **L6** | ✅ Fixed | Legacy ECDH decrypt path removed with DP-15. |
@@ -555,8 +567,8 @@ No finding is left without an implementation or a documented stop/exception.
 | **L11** | ✅ Fixed | E2EE always on; the off toggle is removed. |
 | **L12** | ✅ Fixed | Docs synced (stale Bale-OTP login, version labels). |
 | **L13** | ✅ Fixed | uuid → 11.1.1. |
-| **L14** | ⛔ Stopped | `rotateGroupEpoch` accepts any-length epoch keys; pinned by test. |
-| **L15** | ⛔ Stopped | No upper bound on decrypt input size; pinned by test. |
+| **L14** | ✅ Fixed | Epoch keys validated as exactly 32 bytes (round 4). |
+| **L15** | ✅ Fixed | Decrypt input capped at 5 MiB (round 4, `PAYLOAD_TOO_LARGE`). |
 | **L16** | ✅ Fixed | Documented (error-code oracle, local-only). |
 | **I1** | ✅ Fixed | "Fully post-quantum" labelling removed from code and UI. |
 | **I2** | ✅ Fixed | QR generator test-vector validation. |
@@ -575,7 +587,7 @@ No finding is left without an implementation or a documented stop/exception.
 | **DP-9** | ✅ Fixed | Public-key endpoint validation / versioning. |
 | **DP-10** | ✅ Fixed | Epoch storage cross-check; fallback file handling. |
 | **DP-11** | ✅ Fixed | Postgres sessions + purge; server runtime covered. |
-| **DP-12** | ⛔ Stopped | Replay key is a hash of the raw payload string; needs a canonicalisation decision. |
+| **DP-12** | ✅ Fixed | Group replay key computed from the canonical message form (round 4); re-delivery is `REPLAY_DETECTED`. |
 | **DP-13** | ⛔ Stopped | Unsigned bundle fields; needs a bundle-format version bump. |
 | **DP-14** | ✅ Fixed | Safety-number helpers throw `E2EEError`. |
 | **DP-15** | ✅ Fixed | Legacy ECDH message path removed; `e2ee:ecdh:` explicitly rejected. |
