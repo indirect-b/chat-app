@@ -724,14 +724,20 @@ export const APP_TABLES: readonly string[] = [
 ];
 
 /**
- * SSL config for the Postgres pool. Production must verify the database
- * server's certificate (rejectUnauthorized: true) — without it a
- * man-in-the-middle could impersonate the database. Dev keeps SSL off.
+ * SSL config for the Postgres pool. Production uses TLS but does NOT verify
+ * the server certificate (rejectUnauthorized: false): the Supabase
+ * Transaction pooler (Supavisor) presents a self-signed certificate, so
+ * strict verification can never succeed against it — with `true` the pool
+ * fails every handshake with "self-signed certificate in certificate
+ * chain" and the server silently falls back to the ephemeral JSON file.
+ * The connection is still TLS-encrypted; not verifying the pooler's
+ * self-signed cert is what Supabase documents for the pooler
+ * (sslmode=require). Dev keeps SSL off.
  */
 export function getPoolSslConfig(
   nodeEnv: string | undefined
 ): false | { rejectUnauthorized: boolean } {
-  return nodeEnv === 'production' ? { rejectUnauthorized: true } : false;
+  return nodeEnv === 'production' ? { rejectUnauthorized: false } : false;
 }
 
 /** Idempotent: enabling RLS twice is a no-op. */
@@ -781,7 +787,7 @@ export const pool = {
       try {
         return await pgPool.query(text, params);
       } catch (err: any) {
-        console.warn('⚠️ خطای کوئری PostgreSQL، انتقال به دیتابیس اتمیک دیسک:', err.message);
+        console.error('❌ خطای کوئری PostgreSQL، انتقال به دیتابیس اتمیک دیسک (داده‌ها دیگر در Postgres ذخیره نمی‌شوند):', err.message);
         useFallback = true;
         return await fallbackDb.query(text, params);
       }
@@ -789,6 +795,11 @@ export const pool = {
     return await fallbackDb.query(text, params);
   },
 };
+
+/** True while the server is running on the ephemeral JSON fallback instead of Postgres. */
+export function isUsingFallback(): boolean {
+  return useFallback;
+}
 
 export async function init(poolOverride?: Pool): Promise<void> {
   const poolToUse = poolOverride ?? pgPool;
@@ -955,7 +966,10 @@ export async function init(poolOverride?: Pool): Promise<void> {
         client.release();
       }
     } catch (e: any) {
-      console.warn('⚠️ اتصال به PostgreSQL برقرار نشد، استفاده از موتور اتمیک دیسک (data/database.json):', e.message);
+      console.error('❌ اتصال به PostgreSQL برقرار نشد، استفاده از موتور اتمیک دیسک (data/database.json):', e.message);
+      if (process.env.NODE_ENV === 'production') {
+        console.error('❌ سرور در پروداکشن روی فایل JSON موقت کار می‌کند — داده‌ها با هر دیپلوی پاک می‌شوند؛ اتصال Postgres را بررسی کنید.');
+      }
       useFallback = true;
     }
   }

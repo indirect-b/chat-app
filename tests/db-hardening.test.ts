@@ -32,9 +32,12 @@ const EXPECTED_TABLES = [
 const ROLE_PASSWORD_PLACEHOLDER = '__CHATAPP_ROLE_PASSWORD__';
 
 describe('getPoolSslConfig', () => {
-  it('verifies the DB certificate in production', () => {
+  it('uses TLS without CA verification in production (Supabase pooler cert is self-signed)', () => {
+    // The Supabase Transaction pooler (Supavisor) presents a self-signed
+    // certificate, so strict verification always fails the handshake and
+    // the server would silently fall back to the ephemeral JSON file.
     assert.deepEqual(getPoolSslConfig('production'), {
-      rejectUnauthorized: true,
+      rejectUnauthorized: false,
     });
   });
 

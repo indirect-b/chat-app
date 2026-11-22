@@ -14,7 +14,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { hkdf } from '@noble/hashes/hkdf.js';
 import { config, verifyAdminSecret } from './src/server/config';
 import * as bale from './src/server/bale';
-import { pool, init } from './src/server/db';
+import { pool, init, isUsingFallback } from './src/server/db';
 import { presence } from './src/server/presence';
 import { getRoomId, resolveMediaAccess, canUploadToRoom, isRoomMember } from './src/server/media';
 import { checkRoomReadAccess, checkOwnGroupsAccess, checkOwnUsername } from './src/server/roomAccess';
@@ -456,7 +456,7 @@ app.get('/api/health', async (_req: Request, res: Response) => {
     ok: dbOk,
     version: APP_VERSION,
     uptimeSec: Math.floor(process.uptime()),
-    database: dbOk ? 'ok' : 'degraded',
+    database: !dbOk ? 'degraded' : isUsingFallback() ? 'fallback' : 'ok',
     bale: {
       configured: baleStatus.configured,
       reachable: baleStatus.reachable,
