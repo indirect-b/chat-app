@@ -1917,13 +1917,18 @@ export const ChatApp: React.FC<ChatAppProps> = ({
               {activeTab === 'groups' ? (
                 <div>
                   <div className="empty-icon" aria-hidden="true">👥</div>
-                  <p>هنوز عضوی در گروهی نیستید</p>
+                  <p className="empty-title">هنوز عضوی در گروهی نیستید</p>
+                  <p className="empty-desc">می‌توانید گروهی رمزشده ایجاد کرده و اعضا را اضافه نمایید.</p>
                   <button
                     type="button"
                     className="btn-primary-sm"
                     onClick={() => setGroupModalOpen(true)}
                   >
-                    ➕ ساخت گروه جدید
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="12" y1="5" x2="12" y2="19" />
+                      <line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                    <span>ساخت گروه جدید</span>
                   </button>
                 </div>
               ) : (
@@ -1943,7 +1948,11 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                     className="btn-primary-sm"
                     onClick={() => setContactModalOpen(true)}
                   >
-                    ➕ افزودن مخاطب جدید
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="12" y1="5" x2="12" y2="19" />
+                      <line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                    <span>افزودن مخاطب جدید</span>
                   </button>
                 </div>
               )}
@@ -2005,8 +2014,8 @@ export const ChatApp: React.FC<ChatAppProps> = ({
             <button
               type="button"
               className="foot-btn foot-btn-icon"
-              onClick={() => setSettingsModalOpen(true)}
-              title="تنظیمات سامانه"
+              onClick={() => setProfileModalOpen(true)}
+              title="تنظیمات سامانه و نمایه"
             >
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="12" cy="12" r="3" />

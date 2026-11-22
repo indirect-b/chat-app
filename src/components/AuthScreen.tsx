@@ -16,7 +16,15 @@ declare global {
           }) => void;
           renderButton: (
             parent: HTMLElement,
-            options: { theme?: string; size?: string; width?: number; text?: string }
+            options: {
+              theme?: string;
+              size?: string;
+              width?: number;
+              text?: string;
+              type?: string;
+              shape?: string;
+              logo_alignment?: string;
+            }
           ) => void;
         };
       };
@@ -187,10 +195,13 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
       login_uri: GOOGLE_REDIRECT_LOGIN_URI,
     });
     g.accounts.id.renderButton(el, {
+      type: 'standard',
       theme: 'outline',
       size: 'large',
-      width: 320,
+      shape: 'pill',
       text: 'signin_with',
+      width: 280,
+      logo_alignment: 'left',
     });
     googleRenderedRef.current = true;
   }, [googleClientId, googleReady]);
@@ -302,24 +313,38 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
 
           <div className="showcase-features">
             <div className="showcase-feature-item">
-              <div className="feature-icon" aria-hidden="true">🛡️</div>
+              <div className="feature-icon" aria-hidden="true">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 2L4 5v6c0 5.55 3.84 10.74 8 12 4.16-1.26 8-6.45 8-12V5l-8-3z" />
+                  <path d="m9 12 2 2 4-4" />
+                </svg>
+              </div>
               <div className="feature-text">
                 <strong>رمزنگاری هیبرید NIST FIPS 203/204</strong>
                 <span>ترکیب همزمان ML-KEM-768 و ECDH P-256 در هر پیام</span>
               </div>
             </div>
             <div className="showcase-feature-item">
-              <div className="feature-icon" aria-hidden="true">🔐</div>
+              <div className="feature-icon" aria-hidden="true">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+                  <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                </svg>
+              </div>
               <div className="feature-text">
                 <strong>حفظ صفر مطلق داده (Zero-Knowledge)</strong>
                 <span>کلید خصوصی هرگز از مرورگر شما خارج یا در سرور ذخیره نمی‌شود</span>
               </div>
             </div>
             <div className="showcase-feature-item">
-              <div className="feature-icon" aria-hidden="true">⚡</div>
+              <div className="feature-icon" aria-hidden="true">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+                </svg>
+              </div>
               <div className="feature-text">
                 <strong>بلادرنگ و مستقل</strong>
-                <span>بدون وابستگی به پلتفرم‌های واسط خارجی با احراز هویت امن</span>
+                <span>ارتباط مستقیم سوکت رمزشده بدون وابستگی به سرورهای واسط</span>
               </div>
             </div>
           </div>
