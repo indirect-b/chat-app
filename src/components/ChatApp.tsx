@@ -211,26 +211,61 @@ function SecureMedia(props: {
   }, [props.fileUrl, props.roomId]);
 
   if (failed) {
-    return <div className="media-unavailable">🔒 رسانه در دسترس نیست</div>;
+    return (
+      <div className="media-unavailable-box">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+          <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+        </svg>
+        <span>رسانه در دسترس نیست (کلید منقضی شده)</span>
+      </div>
+    );
   }
   if (!objectUrl) {
-    return <div className="media-loading">⏳ در حال بارگذاری رسانه…</div>;
+    return (
+      <div className="media-loading-card" role="status">
+        <div className="quantum-spinner" aria-hidden="true">
+          <span className="spinner-track" />
+          <span className="spinner-arc" />
+        </div>
+        <div className="media-loading-text">
+          <span>در حال دریافت و رمزگشایی رسانه...</span>
+          <span className="media-algo-chip">ML-KEM-768</span>
+        </div>
+      </div>
+    );
   }
   if (props.fileType === 'image') {
-    return <img src={objectUrl} alt="" />;
+    return <img src={objectUrl} alt="" className="media-image-loaded" />;
   }
   if (props.fileType === 'voice') {
-    return <audio controls src={objectUrl} />;
+    return <audio controls src={objectUrl} className="media-audio-loaded" />;
   }
   if (props.fileType === 'video') {
-    return <video controls src={objectUrl} style={{ maxWidth: '100%' }} />;
+    return <video controls src={objectUrl} className="media-video-loaded" style={{ maxWidth: '100%' }} />;
   }
   return (
-    <div className="file-attach">
-      📁{' '}
-      <a href={objectUrl} download style={{ color: 'inherit' }}>
-        دانلود فایل
-      </a>
+    <div className="file-attach-card">
+      <div className="file-icon-wrap" aria-hidden="true">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+          <polyline points="14 2 14 8 20 8" />
+          <line x1="16" y1="13" x2="8" y2="13" />
+          <line x1="16" y1="17" x2="8" y2="17" />
+          <polyline points="10 9 9 9 8 9" />
+        </svg>
+      </div>
+      <div className="file-details">
+        <span className="file-name-text">فایل رمزنگاری‌شده دریافتی</span>
+        <a href={objectUrl} download className="file-download-action">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+          <span>دانلود امن فایل</span>
+        </a>
+      </div>
     </div>
   );
 }
@@ -266,6 +301,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   const [replyTo, setReplyTo] = useState<{ id: string; text: string } | null>(null);
   const [typingUser, setTypingUser] = useState<string | null>(null);
   const [disappearAfter, setDisappearAfter] = useState<number>(0);
+  const [isUploading, setIsUploading] = useState(false);
 
   // E2EE + Post-Quantum + VOPRF State (Mandatory E2EE - L11)
   const e2eeActive = true;
@@ -1420,6 +1456,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     const file = e.target.files?.[0];
     if (!file || !currentPartner || !currentRoom) return;
     setAttachOpen(false);
+    setIsUploading(true);
 
     try {
       // Media E2EE: بایت‌های فایل پیش از آپلود با کلید پایدار اتاق رمز می‌شوند؛
@@ -1457,8 +1494,10 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       // Fail-Closed: اگر رمزنگاری نشد، فایل اصلاً ارسال نمی‌شود.
       const reason = err instanceof E2EEError ? err.code : 'ENCRYPTION_FAILED';
       showToast(`⛔ خطا در رمزنگاری فایل (${reason}) — فایل ارسال نشد`);
+    } finally {
+      setIsUploading(false);
+      e.target.value = '';
     }
-    e.target.value = '';
   };
 
   const startVoice = async () => {
@@ -2730,6 +2769,16 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                     <span />
                   </div>
                 </div>
+              </div>
+            )}
+
+            {isUploading && (
+              <div className="upload-progress-pill" role="status">
+                <div className="quantum-spinner" aria-hidden="true">
+                  <span className="spinner-track" />
+                  <span className="spinner-arc" />
+                </div>
+                <span>در حال رمزنگاری پسا-کوانتومی و ارسال فایل...</span>
               </div>
             )}
 

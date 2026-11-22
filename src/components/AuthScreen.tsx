@@ -59,6 +59,7 @@ type AuthStep = 1 | 4 | 5;
 
 export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   const [step, setStep] = useState<AuthStep>(1);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   // One-time recovery code (shown once after a new Google registration,
   // or after a recovery login rotates it).
@@ -233,6 +234,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
       return;
     }
     setRecoveryError('');
+    setIsSubmitting(true);
 
     try {
       const response = await fetch('/api/recover', {
@@ -244,6 +246,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
 
       if (!res.ok) {
         setRecoveryError(res.msg || 'ایمیل/آیدی یا کد بازیابی نامعتبر است.');
+        setIsSubmitting(false);
         return;
       }
 
@@ -262,11 +265,14 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
         setRecoveryCopied(false);
         setRecoveryHeading('کد بازیابی جدید (جایگزین کد مصرف‌شده)');
         setRecoveryCodeInput('');
+        setIsSubmitting(false);
         setStep(4);
       } else {
+        setIsSubmitting(false);
         onAuthenticated(res.username);
       }
     } catch {
+      setIsSubmitting(false);
       setRecoveryError('خطا در ارتباط با سرور هنگام بررسی کد بازیابی.');
     }
   };
@@ -390,7 +396,10 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                     />
                   ) : (
                     <div className="google-btn-loading" role="status">
-                      <span className="spinner-dot" aria-hidden="true" />
+                      <div className="quantum-spinner" aria-hidden="true">
+                        <span className="spinner-track" />
+                        <span className="spinner-arc" />
+                      </div>
                       <span>در حال اتصال امن به درگاه گوگل...</span>
                     </div>
                   )}
@@ -555,7 +564,20 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                 >
                   {recoveryError}
                 </p>
-                <button type="submit" className="btn-primary-action">ورود با کد بازیابی</button>
+                <button
+                  type="submit"
+                  className={`btn-primary-action ${isSubmitting ? 'loading' : ''}`}
+                  disabled={isSubmitting}
+                >
+                  {isSubmitting ? (
+                    <span className="btn-loading-content">
+                      <span className="btn-spinner" aria-hidden="true" />
+                      <span>در حال بررسی کلید و ورود امن...</span>
+                    </span>
+                  ) : (
+                    <span>ورود با کد بازیابی</span>
+                  )}
+                </button>
                 <button
                   type="button"
                   className="btn-recovery-link"
