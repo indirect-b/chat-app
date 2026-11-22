@@ -315,7 +315,7 @@ describe('W3 extended fuzz — base64 / bundle / epoch packet parsers', () => {
     assert.equal(mine, packet.epochKeyB64);
   });
 
-  it('rotateGroupEpoch: wrong-length epoch keys are ACCEPTED (no length validation) — recorded as a finding, not a crash', async () => {
+  it('rotateGroupEpoch: wrong-length epoch keys are REJECTED (round 4, L14)', async () => {
     const rng = xorshift(0x55667788);
     const b64 = (len: number) => Buffer.from(rng.bytes(len)).toString('base64');
     // These MUST throw (invalid epoch number / missing key / garbage base64).
@@ -336,12 +336,18 @@ describe('W3 extended fuzz — base64 / bundle / epoch packet parsers', () => {
       (err: unknown) => err instanceof E2EEError,
       'garbage base64 epoch key must throw'
     );
-    // Wrong-length keys: OBSERVED BEHAVIOUR — accepted without validation.
-    // (If this assertion fails, the length check was added and the finding is fixed.)
+    // Wrong-length keys are now rejected: epoch keys are always 32 bytes
+    // (createGroupEpochPacket uses getRandomValues(new Uint8Array(32))).
     for (const len of [1, 16, 31, 33, 64]) {
-      const state = await rotateGroupEpoch('w3-room', 1, ['alice', 'bob'], b64(len));
-      assert.equal(state.epochs[1].rootKey.length, len, `epoch key of ${len} bytes is stored as-is`);
+      await assert.rejects(
+        () => rotateGroupEpoch('w3-room', 1, ['alice', 'bob'], b64(len)),
+        (err: unknown) => err instanceof E2EEError && (err as E2EEError).code === 'MALFORMED_PAYLOAD',
+        `epoch key of ${len} bytes must be rejected`
+      );
     }
+    // A 32-byte key is accepted and stored as-is.
+    const ok = await rotateGroupEpoch('w3-room', 1, ['alice', 'bob'], b64(32));
+    assert.equal(ok.epochs[1].rootKey.length, 32);
   });
 });
 
