@@ -445,6 +445,141 @@ Vectors fetched fresh on 2026-11-21 from `usnistgov/ACVP-Server` (vsId 42, FIPS 
 
 </details>
 
+## 🔧 Remediation — fix rounds, 21 November 2026
+
+**The findings above are the record of what was found. This section is the record of what was done about them.** After the self-assessment, three fix rounds ran on branch `fix/audit-2026-11-21` (rounds 1–2 by Claude, round 3 by the agent) and were merged to `main` on 2026-11-22 (via the UI redesign branch). The code on `main` is now the fixed version. This is still a self-assessment follow-up — not an independent audit, not a FIPS 140-3 validation, not a formal proof.
+
+### Outcome
+
+Of the **58 findings** — 43 from the overnight assessment above, plus 15 from the deepening pass the same day (DP-1–DP-15; their full descriptions are in the deepening report, kept with the project workspace as `audit-2026-11-21/deepening-2026-11-21/REPORT.md`):
+
+| Outcome | Count | Findings |
+| --- | ---: | --- |
+| ✅ Implemented | **48** | 6 High, 15 Medium, 20 Low, 7 Info |
+| ⛔ Stopped — documented, test-pinned | **7** | DP-12, DP-13, L1, L3, L5, L14, L15 |
+| ⏸️ Accepted exception | **3** | M13, I6, L4 |
+
+No finding is left without an implementation or a documented stop/exception.
+
+### Verification — independent re-run on a clean checkout of `main`
+
+- `tsc --noEmit` — clean.
+- Full suite (`tsx --test tests/*.test.ts`): **252 pass, 0 fail, 3 skipped** (255 tests; the 3 skips are the documented dp-chainkey-leak white-box skips). A3 ✔ and C8 ✔ — the two adversarial failures from the assessment — are green.
+- `vite build` — OK.
+- NIST ACVP KAT: 285 cases — 255 pass, 30 policy-skipped, 0 fail. Coverage-guided fuzz (`fuzz-dp`): 8,409 cases, 0 unexpected accepts.
+
+### What changed
+
+**Protocol / crypto**
+- **H1 — replay across the ratchet rotation** — fixed; the consumed-step set survives rotation. A3 green.
+- **H3 + M1 — replay protection was session-lifetime-only / RAM-only** — replay state is now durable in IndexedDB (`replay_protection_v1`, 30-day TTL, 10,000-entry cap), so history no longer locks after a reload. (The live verification below still shows the pre-fix behaviour — it was recorded before the fix.)
+- **H4 — corrected, not just fixed** — the deepening pass showed the original H4 wording was wrong: late message 49 *does* decrypt; the real cost is message 50 replaying, which is H1.
+- **H2 — unauthenticated group epoch packets** — the server now always requires the distributor's ML-DSA-65 signature on epoch packets; an unsigned packet (or a distributor with no ML-DSA key on file) is rejected with 403.
+- **M3 — group messages had no sender authentication** — group messages are now `e2ee:gep:v3:` (signed); sending fails closed if signing fails instead of silently falling back to unsigned v2. Old unsigned v2 messages still decrypt, marked unverified.
+- **M2 — group replay eviction after 500 messages** — replay stores are bounded (10,000 cap) with the limits documented.
+- **DP-15 — the legacy ECDH message path never decrypted** — the dead path was removed; `e2ee:ecdh:` payloads are now explicitly rejected. `deriveECDHSharedBits` stays — it is still used by the hybrid ratchet and by legacy kind-1 file decryption.
+- **DP-12 — group replay via non-canonical epoch spelling** — ⛔ stopped: the replay key is a hash of the raw payload string, so a fix needs a canonicalisation decision; the regression test pins the current behaviour.
+- **DP-13 — unsigned bundle fields accepted as fully post-quantum** — ⛔ stopped: needs a bundle-format version bump.
+- **L1 — group epoch rollback accepted** — ⛔ stopped: needs a design decision (allowed rollback window + distributor signature); the C5 test pins the current behaviour.
+
+**Files / media**
+- **M10 — 1:1 file keys were classical, static ECDH-derived** — every file now gets a fresh random 32-byte key, encapsulated with ML-KEM-768 to the recipient *and* to the sender (dual encapsulation, PQF1 kind 4, 2,261-byte header). Legacy kind-1 files still decrypt.
+- **DP-14 — safety-number helpers threw raw errors** — malformed QR payloads now throw `E2EEError('MALFORMED_PAYLOAD')`; the modal maps it to `SCAN_TECH_ERROR`.
+
+**Safety numbers**
+- **M4 — bundle substitution / TOFU pin could never update** — verifying a rotated key now re-pins it (proving test: pin → rotate → CHANGED → verify → stays VERIFIED).
+- **L2 — ML-KEM-only key change invisible to the safety number** — the modal now shows safety number v2 (includes ML-KEM bytes); v1 QR codes still match via fallback.
+- **M5 — safety-number functions trusted unverified bundles** — strict bundle verification.
+
+**Identity / keystore**
+- **L8 — wrapping key lived next to the wrapped secrets, not password-derived** — optional password protection (default OFF): the root key is wrapped with a passphrase-derived key, stored in a new `password_wrapped_root_v1` IndexedDB store, with full UI (enable / disable / lock / unlock) in the E2EE settings. Forgetting the passphrase means the identity is unrecoverable — the UI says so.
+- **M8 — no logout / device-wipe path** — implemented (round 1).
+- **M9 — room passphrases in plaintext localStorage** — moved to sessionStorage.
+
+**Server / sessions**
+- **M11 — `forward-message` had no membership or ownership check** — confirmed live in the deepening pass, then fixed: the handler now checks membership and ownership.
+- **L9 — sessions in localStorage; in-memory server store** — HttpOnly cookies + Postgres-backed sessions; expired sessions are purged on startup and hourly.
+- **L7 — VOPRF endpoint unauthenticated / unthrottled** — fixed (round 1).
+- **DP-1–DP-11 — server hardening** — epoch-packet size/count caps, Express error middleware (no more HTML stack traces), `toRooms` validation, atomic Google sign-in, rate limits on login endpoints, recovery-code re-issue, public-key endpoint validation, epoch-storage cross-check, Postgres session store.
+- **H2 (server side)** — see above.
+
+**Dependencies**
+- **H5** multer → 2.5.0 · **H6** body-parser → 1.20.9 · **M12** axios → 1.21.1 · **L13** uuid → 11.1.1 · **M14** google-auth-library added to the lockfile · **I5** package.json now says 6.5.0 (was 6.1.0).
+
+**Still open**
+- Stopped (7): DP-12, DP-13, L1, L3, L5, L14, L15 — each is pinned by a test that asserts the current behaviour, so fixing one needs a design decision first, not a patch.
+- Accepted exceptions (3): M13 (@noble/post-quantum unaudited — accepted, no alternative), I6 (outdated but vulnerability-free dependencies), L4 (empty plaintext "encrypts" to '' — accepted, documented).
+
+**Still to verify live (after deploy)**
+- Real two-account E2E test on Render (the live verification below predates the fix).
+- Open a legacy kind-1 file on Render (M10 backward compatibility).
+- The password-protection UI in a real browser (L8 — unit-tested only).
+- One live request against the H2 epoch-packet route (server-side fix verified by code review + tsc only).
+- Live socket adversarial tests (need a captured Socket.IO frame).
+
+### Full per-finding status
+
+| ID | Status | What changed |
+| --- | --- | --- |
+| **H1** | ✅ Fixed | Consumed-step set survives ratchet rotation; A3 green. |
+| **H2** | ✅ Fixed | Server always requires the distributor's ML-DSA-65 signature on epoch packets (403 otherwise). |
+| **H3** | ✅ Fixed | Durable IndexedDB replay store (30-day TTL, 10,000-entry cap). |
+| **H4** | ✅ Corrected | Late message 49 does decrypt; the real cost is message 50 replaying (H1, fixed). |
+| **H5** | ✅ Fixed | multer → 2.5.0. |
+| **H6** | ✅ Fixed | body-parser → 1.20.9. |
+| **M1** | ✅ Fixed | Durable replay store (same as H3). |
+| **M2** | ✅ Fixed | Group replay stores bounded (10,000 cap). |
+| **M3** | ✅ Fixed | Group messages now signed `e2ee:gep:v3:`, fail-closed. |
+| **M4** | ✅ Fixed | Re-pin on explicit verify (pin → rotate → CHANGED → verify → stays VERIFIED). |
+| **M5** | ✅ Fixed | Strict bundle verification for safety numbers. |
+| **M6** | ✅ Fixed | Membership-change rotation distributes the new key atomically; remove-member path exists. |
+| **M7** | ✅ Fixed | Group badge claims PQ only with an epoch key established. |
+| **M8** | ✅ Fixed | Logout / device-wipe path for keystore v4. |
+| **M9** | ✅ Fixed | Room passphrases moved to sessionStorage. |
+| **M10** | ✅ Fixed | Per-file ML-KEM-768 key, PQF1 kind 4 (dual encapsulation). |
+| **M11** | ✅ Fixed | `forward-message` now checks membership and ownership. |
+| **M12** | ✅ Fixed | axios → 1.21.1. |
+| **M13** | ⏸️ Exception | @noble/post-quantum unaudited — accepted, no alternative. |
+| **M14** | ✅ Fixed | google-auth-library added to the lockfile. |
+| **M15** | ✅ Fixed | FIPS 140-3-style runtime self-tests and error state. |
+| **L1** | ⛔ Stopped | Needs a design decision (rollback window + signature); C5 pins the current behaviour. |
+| **L2** | ✅ Fixed | Safety number v2 wired into the modal; v1 QR fallback. |
+| **L3** | ⛔ Stopped | Unknown-version payloads pass through as plaintext; pinned by the F2 test. |
+| **L4** | ⏸️ Exception | Empty plaintext "encrypts" to '' — accepted, documented. |
+| **L5** | ⛔ Stopped | Bundle parser leniency; pinned by tests. |
+| **L6** | ✅ Fixed | Legacy ECDH decrypt path removed with DP-15. |
+| **L7** | ✅ Fixed | VOPRF endpoint authenticated and throttled. |
+| **L8** | ✅ Fixed | Optional password protection, full UI (default OFF). |
+| **L9** | ✅ Fixed | HttpOnly cookies + Postgres sessions, hourly purge. |
+| **L10** | ✅ Fixed | `ensureUserHybridKeyPair` errors no longer swallowed. |
+| **L11** | ✅ Fixed | E2EE always on; the off toggle is removed. |
+| **L12** | ✅ Fixed | Docs synced (stale Bale-OTP login, version labels). |
+| **L13** | ✅ Fixed | uuid → 11.1.1. |
+| **L14** | ⛔ Stopped | `rotateGroupEpoch` accepts any-length epoch keys; pinned by test. |
+| **L15** | ⛔ Stopped | No upper bound on decrypt input size; pinned by test. |
+| **L16** | ✅ Fixed | Documented (error-code oracle, local-only). |
+| **I1** | ✅ Fixed | "Fully post-quantum" labelling removed from code and UI. |
+| **I2** | ✅ Fixed | QR generator test-vector validation. |
+| **I3** | ✅ Fixed | HKDF salt v2 for new sessions. |
+| **I4** | ✅ Fixed | Admin password compared in constant time. |
+| **I5** | ✅ Fixed | package.json now says 6.5.0. |
+| **I6** | ⏸️ Exception | Outdated but vulnerability-free dependencies — accepted. |
+| **DP-1** | ✅ Fixed | Epoch-packet size/count caps. |
+| **DP-2** | ✅ Fixed | Epoch above 2^53 rejected (no silent rounding). |
+| **DP-3** | ✅ Fixed | Express error middleware (no HTML stack traces). |
+| **DP-4** | ✅ Fixed | `forward-message` `toRooms` validated. |
+| **DP-5** | ✅ Fixed | Atomic Google sign-in. |
+| **DP-6** | ✅ Fixed | Rate limits on login endpoints. |
+| **DP-7** | ✅ Fixed | Recovery-code re-issue for existing users. |
+| **DP-8** | ✅ Fixed | `login_uri` from env, not hardcoded. |
+| **DP-9** | ✅ Fixed | Public-key endpoint validation / versioning. |
+| **DP-10** | ✅ Fixed | Epoch storage cross-check; fallback file handling. |
+| **DP-11** | ✅ Fixed | Postgres sessions + purge; server runtime covered. |
+| **DP-12** | ⛔ Stopped | Replay key is a hash of the raw payload string; needs a canonicalisation decision. |
+| **DP-13** | ⛔ Stopped | Unsigned bundle fields; needs a bundle-format version bump. |
+| **DP-14** | ✅ Fixed | Safety-number helpers throw `E2EEError`. |
+| **DP-15** | ✅ Fixed | Legacy ECDH message path removed; `e2ee:ecdh:` explicitly rejected. |
+
 
 ## 🌐 Live verification — 21 November 2026
 
