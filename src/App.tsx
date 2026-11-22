@@ -2,10 +2,8 @@ import React, { useState, useEffect, useCallback, Suspense } from 'react';
 import type { Socket } from 'socket.io-client';
 import { Toaster, toast } from 'sonner';
 import { BlockedInfo } from './types';
+import { AuthScreen } from './components/AuthScreen';
 
-const AuthScreen = React.lazy(() =>
-  import('./components/AuthScreen').then(m => ({ default: m.AuthScreen }))
-);
 const TermsScreen = React.lazy(() =>
   import('./components/TermsScreen').then(m => ({ default: m.TermsScreen }))
 );
@@ -345,38 +343,7 @@ export const App: React.FC = () => {
     <>
       {skipLink}
       {!username || pathname === '/login' ? (
-        <Suspense
-          fallback={
-            <div className="auth-screen">
-              <div className="auth-box">
-                <header role="banner" aria-label="سربرگ صفحه" className="auth-banner">
-                  <a href="/" className="auth-brand">
-                    <span className="auth-brand-icon" aria-hidden="true">
-                      💬
-                    </span>
-                    <span className="auth-brand-name">سامانه پیام‌رسان</span>
-                  </a>
-                </header>
-                <main id="main-content" tabIndex={-1} aria-busy="true">
-                  <h1>پیام‌رسان</h1>
-                </main>
-                <footer role="contentinfo" aria-label="پاصفحه" className="auth-footer">
-                  <nav aria-label="پیوندهای پاصفحه" className="auth-footer-nav">
-                    <a href="/terms" className="link-btn">
-                      قوانین پیام‌رسان
-                    </a>
-                  </nav>
-                  <span className="footer-sep" role="separator" aria-hidden="true">
-                    |
-                  </span>
-                  <span className="footer-badge">🔒 رمزنگاری سرتاسری</span>
-                </footer>
-              </div>
-            </div>
-          }
-        >
-          <AuthScreen onAuthenticated={handleAuthenticated} />
-        </Suspense>
+        <AuthScreen onAuthenticated={handleAuthenticated} />
       ) : socket ? (
         <Suspense
           fallback={
