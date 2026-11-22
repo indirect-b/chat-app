@@ -399,3 +399,45 @@ Vectors fetched fresh on 2026-11-21 from `usnistgov/ACVP-Server` (vsId 42, FIPS 
 
 </details>
 
+## 5. Remediation — fix rounds, 21 November 2026
+
+**The findings in §4 are the record of what was found. This section is the record of what was done about them.** Three fix rounds ran on branch `fix/audit-2026-11-21` and were merged to `main` on 2026-11-22 (via the UI redesign branch). The code on `main` is now the fixed version. This is still a self-assessment follow-up — not an independent audit.
+
+### Outcome
+
+Of the **58 findings** (43 from §4 + 15 from the deepening pass, DP-1–DP-15):
+
+| Outcome | Count | Findings |
+| --- | ---: | --- |
+| ✅ Implemented | **48** | 6 High, 15 Medium, 20 Low, 7 Info |
+| ⛔ Stopped — documented, test-pinned | **7** | DP-12, DP-13, L1, L3, L5, L14, L15 |
+| ⏸️ Accepted exception | **3** | M13, I6, L4 |
+
+No finding is left without an implementation or a documented stop/exception. The full per-finding status table (all 58, with what changed for each) is in the README's remediation section.
+
+### Verification — independent re-run on a clean checkout of `main`
+
+- `tsc --noEmit` — clean.
+- Full suite: **252 pass, 0 fail, 3 skipped** (255 tests). A3 ✔, C8 ✔.
+- `vite build` — OK.
+- NIST ACVP KAT: 285 cases — 255 pass, 30 policy-skipped, 0 fail. Coverage-guided fuzz: 8,409 cases, 0 unexpected accepts.
+
+### Headline changes
+
+- Replay protection is durable (IndexedDB, 30-day TTL, 10k cap) — H1/H3/M1; history no longer locks after reload.
+- Group messages are signed (`e2ee:gep:v3:`), fail-closed — M3; the server always requires the distributor's ML-DSA signature on epoch packets — H2.
+- Per-file ML-KEM-768 keys (PQF1 kind 4, dual encapsulation) — M10; legacy ECDH message path removed — DP-15.
+- Safety number v2 wired into the UI; TOFU re-pin on verify — L2, M4.
+- Optional password protection for the identity key, full UI — L8.
+- HttpOnly cookie sessions + Postgres session store with hourly purge — L9, DP-11.
+- Dependencies: multer 2.5.0, body-parser 1.20.9, axios 1.21.1, uuid 11.1.1 — H5, H6, M12, L13.
+- H4 corrected: late message 49 does decrypt; the real cost is message 50 replaying (H1).
+
+### Still open
+
+- Stopped (7): DP-12, DP-13, L1, L3, L5, L14, L15 — each pinned by a test asserting the current behaviour; each needs a design decision first.
+- Accepted exceptions (3): M13, I6, L4.
+
+### Still to verify live (after deploy)
+
+Real two-account E2E on Render; a legacy kind-1 file on Render (M10); the password-protection UI in a real browser (L8); one live request against the H2 epoch-packet route; live socket adversarial tests (need a captured Socket.IO frame).
