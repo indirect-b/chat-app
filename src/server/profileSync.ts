@@ -38,6 +38,25 @@ export interface StoredProfile {
 export const GOOGLE_PHOTO_HOST = 'lh3.googleusercontent.com';
 
 /**
+ * Avatar URL allowlist (round 5, L7(a)): an avatar is accepted ONLY as a
+ * Google profile photo or as a media blob served through /api/media/.
+ * Anything else (arbitrary hosts, tracking URLs, /api/media/<other-room>
+ * storage) is dropped — treated as "not submitted", so the stored avatar
+ * is kept. A stored avatar is never cleared by a rejected value.
+ */
+export const ALLOWED_AVATAR_PREFIXES: readonly string[] = [
+  'https://lh3.googleusercontent.com/',
+  '/api/media/',
+];
+
+export function isAllowedAvatarUrl(value: unknown): boolean {
+  return (
+    typeof value === 'string' &&
+    ALLOWED_AVATAR_PREFIXES.some((prefix) => value.startsWith(prefix))
+  );
+}
+
+/**
  * Normalize a Google display name: strip control characters, trim,
  * cap at 100 characters. Empty / non-string → null (absent, not an error).
  */
@@ -130,8 +149,13 @@ export function resolveProfileUpdate(
   let avatarCustom = Number(stored.avatar_custom) || 0;
   if (input.avatar !== undefined) {
     const submitted = input.avatar || null;
-    if (submitted !== storedAvatar) avatarCustom = 1;
-    nextAvatar = submitted;
+    if (submitted && !isAllowedAvatarUrl(submitted)) {
+      // Rejected avatar URL: drop it — keep the stored avatar and do not
+      // raise the custom flag (the submission changes nothing).
+    } else {
+      if (submitted !== storedAvatar) avatarCustom = 1;
+      nextAvatar = submitted;
+    }
   }
 
   return {

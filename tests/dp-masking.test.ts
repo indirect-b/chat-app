@@ -45,6 +45,14 @@
  * Tests M1/M2 assert the ACTUAL (weak) behaviour, so they PASS — like
  * W1's "PASS (behaviour confirmed — finding …)" tests. They are red
  * flags in green clothing: read the test names, not just the count.
+ *
+ * ROUND 5 UPDATE (2026-11-23, pentest M1 fixed): the durable replay
+ * store is now consulted unconditionally, so the M1/M2 masking proofs
+ * no longer demonstrate the hole — re-delivery after a ratchet wipe is
+ * REJECTED. The two tests were updated to assert the fixed behaviour
+ * (see their bodies); the H4 correction — a late message delivered for
+ * the FIRST time after the rotation still decrypts — is covered by A7
+ * in tests/adversarial.test.ts.
  */
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -108,12 +116,19 @@ describe('DP item 15 (M1) — in-process replay test masks H3: incoming history 
     console.log('[dp-masking M1] incoming re-decrypt -> REPLAY_DETECTED; own re-decrypt -> ok. Suite covers only the own half.');
   });
 
-  it('MASKING PROOF (restart): after clearRatchetSession the same incoming message decrypts again (A2, restated for the adequacy record)', async () => {
+  it('MASKING PROOF (restart) — round 5, M1 fixed: after clearRatchetSession the same incoming message is now REJECTED (A2, restated for the adequacy record)', async () => {
     const { aliceBundle, bobBundle } = await setupPair();
     const m = await encryptMessageText('restart-target', ROOM, { myUsername: 'alice', peerUsername: 'bob', peerPublicKey: bobBundle });
     assert.equal((await decryptMessageText(m, ROOM, decOpts(aliceBundle))).text, 'restart-target');
     clearRatchetSession('bob', ROOM);
-    assert.equal((await decryptMessageText(m, ROOM, decOpts(aliceBundle))).text, 'restart-target');
+    // ROUND 5 (pentest M1 fixed): the durable replay store is consulted
+    // unconditionally and survives the ratchet wipe, so the re-delivery
+    // is rejected. This test used to assert the finding (decrypt
+    // succeeds); it now asserts the fix.
+    await assert.rejects(
+      () => decryptMessageText(m, ROOM, decOpts(aliceBundle)),
+      (err: unknown) => err instanceof E2EEError && err.code === 'REPLAY_DETECTED'
+    );
   });
 });
 
@@ -123,7 +138,7 @@ describe('DP item 15 (M2) — in-order rotation test masks H4: late pre-rotation
     resetAllCryptoStateForTests();
   });
 
-  it('MASKING PROOF + H4 CORRECTION: in-order 51/51 passes (mirrors the existing test) — late msg-49 after msg-50 DECRYPTS (H4 as stated is wrong), but it destroys the new session so msg-50 then REPLAYS (H1)', async () => {
+  it('MASKING PROOF + H4 CORRECTION (round 5: M1 fixed): in-order 51/51 passes; after a ratchet wipe, re-delivery of already-decrypted messages is rejected via the durable store (first-delivery out-of-order across the boundary still decrypts — see A7)', async () => {
     const { aliceBundle, bobBundle } = await setupPair();
     const payloads: string[] = [];
     for (let i = 0; i < 51; i++) {
@@ -135,23 +150,29 @@ describe('DP item 15 (M2) — in-order rotation test masks H4: late pre-rotation
     }
     // Reset ONLY Bob's ratchet state for this room (identities stay in
     // the keystore — resetAllCryptoStateForTests would also wipe the
-    // in-memory identities and is not usable mid-test), then replay the
-    // boundary out of order: 0..48, then 50, then 49.
+    // in-memory identities and is not usable mid-test), then re-deliver
+    // already-decrypted messages.
+    // ROUND 5 (pentest M1 fixed): the durable replay store survives the
+    // wipe, so every re-delivery is now REJECTED instead of decrypting.
+    // This test used to demonstrate the finding (late msg-49 re-decrypts
+    // and the post-rotation session's replay state is destroyed); the
+    // H4 correction itself — a LATE message delivered for the FIRST time
+    // after the rotation still decrypts — is covered by A7 in
+    // tests/adversarial.test.ts, which still passes.
     clearRatchetSession('bob', ROOM);
-    for (let i = 0; i <= 48; i++) {
-      assert.equal((await decryptMessageText(payloads[i], ROOM, decOpts(aliceBundle))).text, `msg-${i}`);
-    }
-    assert.equal((await decryptMessageText(payloads[50], ROOM, decOpts(aliceBundle))).text, 'msg-50');
-    // CORRECTION TO H4: the late pre-rotation message decrypts — the old
-    // session is re-established from the old capsule. It is NOT lost.
-    assert.equal((await decryptMessageText(payloads[49], ROOM, decOpts(aliceBundle))).text, 'msg-49');
-    // With H1 fixed, the post-rotation session's consumed steps are preserved
-    // across the late pre-rotation message, so replayed msg-50 is rejected.
+    await assert.rejects(
+      () => decryptMessageText(payloads[0], ROOM, decOpts(aliceBundle)),
+      (err: unknown) => err instanceof E2EEError && err.code === 'REPLAY_DETECTED'
+    );
+    await assert.rejects(
+      () => decryptMessageText(payloads[49], ROOM, decOpts(aliceBundle)),
+      (err: unknown) => err instanceof E2EEError && err.code === 'REPLAY_DETECTED'
+    );
     await assert.rejects(
       () => decryptMessageText(payloads[50], ROOM, decOpts(aliceBundle)),
-      (err: unknown) => err instanceof E2EEError && err.code === 'REPLAY_DETECTED',
+      (err: unknown) => err instanceof E2EEError && err.code === 'REPLAY_DETECTED'
     );
-    console.log('[dp-masking M2] H4 CORRECTED: late msg-49 decrypts; the cost is that msg-50 then replays. In-order test masks the session destruction, not a lost message.');
+    console.log('[dp-masking M2] round 5: re-delivery after a ratchet wipe is rejected via the durable store; first-delivery out-of-order across the boundary still decrypts (A7).');
   });
 });
 

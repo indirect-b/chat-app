@@ -10,6 +10,7 @@ import {
   decapsulateGroupEpochKey,
   encryptMessageText,
   decryptMessageText,
+  decryptMessageTextWithHistoryCache,
   encryptFileBytes,
   decryptFileBytes,
   isEncryptedFileBytes,
@@ -394,6 +395,13 @@ export const ChatApp: React.FC<ChatAppProps> = ({
           },
           body: JSON.stringify({ username: myUsername, publicKey: pubKey }),
         }).catch(() => {});
+      }
+      // هویت باز شد و کلید پوششی نشست در دسترس است — تاریخچهٔ اتاق فعال
+      // را دوباره بخوان تا پیام‌هایی که در کش رمزنگاری‌شدهٔ تاریخچه
+      // ذخیره شده‌اند، به‌جای جای‌نمای قفل‌شده نمایش داده شوند.
+      const activeRoom = currentRoomRef.current;
+      if (activeRoom) {
+        void loadMessagesForRoom(activeRoom);
       }
     } catch (err: any) {
       setUnlockMsg({
@@ -814,7 +822,10 @@ export const ChatApp: React.FC<ChatAppProps> = ({
 
       let dec: Awaited<ReturnType<typeof decryptMessageText>>;
       try {
-        dec = await decryptMessageText(msg.text || '', roomId, {
+        // رمزگشایی با کش رمزنگاری‌شدهٔ تاریخچه: پیامِ از قبل تحویل‌شده پس
+        // از رفرش از کش خوانده می‌شود، نه با رمزگشایی دوباره (که با
+        // REPLAY_DETECTED رد می‌شد و جای‌نمای قفل‌شده نشان می‌داد).
+        dec = await decryptMessageTextWithHistoryCache(msg.text || '', roomId, {
           myUsername,
           peerPublicKey,
           peerUsername: partner,
@@ -835,7 +846,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       let decReply = msg.reply_to_text;
       if (msg.reply_to_text && isE2EEPayload(msg.reply_to_text)) {
         try {
-          const rDec = await decryptMessageText(msg.reply_to_text, roomId, {
+          const rDec = await decryptMessageTextWithHistoryCache(msg.reply_to_text, roomId, {
             myUsername,
             peerPublicKey,
             peerUsername: partner,
@@ -860,6 +871,29 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       };
     },
     [myUsername, getPeerKeyForRoom, syncPeerPublicKeyAndObserve]
+  );
+
+  // بارگذاری پیام‌های یک اتاق از سرور + رمزگشایی (با کش تاریخچه) — همان
+  // جریانی که handleOpenChat استفاده می‌کند؛ پس از باز شدن هویت (L8) هم
+  // همین تابع دوباره صدا زده می‌شود تا پیام‌های ذخیره‌شده در کش خوانا شوند.
+  const loadMessagesForRoom = useCallback(
+    async (roomId: string) => {
+      const sessionToken = getSessionToken();
+      const res = await fetch('/api/messages/' + encodeURIComponent(roomId), {
+        headers: sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {},
+      }).then(r => r.json());
+      if (res.ok && Array.isArray(res.messages)) {
+        const decryptedList: DecryptedChatMessage[] = [];
+        for (const m of res.messages as ChatMessage[]) {
+          decryptedList.push(await processDecryption(m, roomId));
+        }
+        setMessages(decryptedList);
+        const pinned = decryptedList.find(m => m.is_pinned) || null;
+        setPinnedMessage(pinned);
+        scrollBottom();
+      }
+    },
+    [processDecryption, scrollBottom]
   );
 
   const loadRoomList = useCallback(
@@ -1033,7 +1067,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
       if (roomId !== currentRoomRef.current) return;
       let dec: Awaited<ReturnType<typeof decryptMessageText>>;
       try {
-        dec = await decryptMessageText(newText, roomId, {
+        dec = await decryptMessageTextWithHistoryCache(newText, roomId, {
           myUsername,
           peerPublicKey: getPeerKeyForRoom(roomId),
         });
@@ -1349,20 +1383,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
     setCustomSecretInput(getRoomSecret(roomId));
     if (isMobile) setMobileChatOpen(true);
 
-    const sessionToken = getSessionToken();
-    const res = await fetch('/api/messages/' + encodeURIComponent(roomId), {
-      headers: sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {},
-    }).then(r => r.json());
-    if (res.ok && Array.isArray(res.messages)) {
-      const decryptedList: DecryptedChatMessage[] = [];
-      for (const m of res.messages as ChatMessage[]) {
-        decryptedList.push(await processDecryption(m, roomId));
-      }
-      setMessages(decryptedList);
-      const pinned = decryptedList.find(m => m.is_pinned) || null;
-      setPinnedMessage(pinned);
-      scrollBottom();
-    }
+    await loadMessagesForRoom(roomId);
   };
 
   const executeSendMessage = async () => {
@@ -1794,7 +1815,7 @@ export const ChatApp: React.FC<ChatAppProps> = ({
   const handleSubmitReport = async () => {
     await fetch('/api/report', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${getSessionToken()}` },
       body: JSON.stringify({
         reporter: myUsername,
         reportedUser: ctxMenu.sender,
@@ -2744,6 +2765,22 @@ export const ChatApp: React.FC<ChatAppProps> = ({
                               : '🔒'}
                           </span>
                         )}
+                        {/* L4 (round 5): a group message whose ML-DSA-65 signature
+                            was NOT verified (unsigned v2 / stripped v3 signature)
+                            is still shown — v2 history must keep decrypting —
+                            but the user is warned visibly. Only GROUP-EPOCH-FSM:
+                            PBKDF2 rooms have no signature by design, and DM
+                            ratchet messages always verify or throw. */}
+                        {msg.isE2EE &&
+                          msg.e2eeMode === 'GROUP-EPOCH-FSM' &&
+                          msg.mldsaVerified === false && (
+                            <span
+                              title="این پیام گروهی امضای پساکوانتومی ML-DSA-65 ندارد یا امضایش تأیید نشد — ممکن است دستکاری شده باشد"
+                              style={{ fontSize: '10px', color: '#f59e0b', fontWeight: 700 }}
+                            >
+                              ⚠️ امضا تأیید نشد
+                            </span>
+                          )}
                         <span className="msg-time">{formatMessageTime(msg)}</span>
                         {isOut && (
                           <span

@@ -8,6 +8,13 @@
  * workstream-1.md before being claimed.
  *
  * Harness mirrors tests/pq-mprba.test.ts (MemoryStorage localStorage mock).
+ *
+ * ROUND 5 NOTE (2026-11-23, pentest M1 fixed): tests A2/A3 used to
+ * assert the replay-after-restart / replay-across-rotation findings
+ * (the attacks SUCCEEDED, so the tests passed as findings). The M1 fix
+ * (durable replay store consulted unconditionally) blocks those
+ * replays, so A2/A3 now assert REPLAY_DETECTED instead. Legitimate
+ * first-delivery out-of-order messages still decrypt (A7, unchanged).
  */
 
 import { describe, it, beforeEach } from 'node:test';
@@ -116,13 +123,12 @@ describe('A. Replay — within session, across restart, across ratchet rotation'
     const m = await sendAlice('restart-replay-target', bobBundle);
     assert.equal((await decryptMessageText(m, ROOM, decOpts(aliceBundle))).text, 'restart-replay-target');
     clearRatchetSession('bob', ROOM);
-    // ATTACK: same ciphertext delivered again after the restart.
-    const again = await decryptMessageText(m, ROOM, decOpts(aliceBundle)).catch((e: unknown) => e);
-    if (again instanceof E2EEError) {
-      assert.fail(`expected replay-after-restart to decrypt (finding), but it threw ${again.code}`);
-    } else {
-      assert.equal((again as { text: string }).text, 'restart-replay-target');
-    }
+    // ROUND 5 (pentest M1 fixed): the durable replay store is now
+    // consulted unconditionally, so the same ciphertext delivered again
+    // after the restart is REJECTED — it no longer decrypts. This test
+    // used to assert the finding (decrypt succeeds); it now asserts
+    // the fix.
+    await expectE2EE(decryptMessageText(m, ROOM, decOpts(aliceBundle)), 'REPLAY_DETECTED');
   });
 
   it('A3 replay ACROSS the 50-message ratchet rotation via capsule alternation', async () => {
@@ -135,10 +141,15 @@ describe('A. Replay — within session, across restart, across ratchet rotation'
     for (let i = 0; i < 51; i++) {
       assert.equal((await decryptMessageText(payloads[i], ROOM, decOpts(aliceBundle))).text, `msg-${i}`);
     }
-    // Re-deliver the last pre-rotation message (old capsule): in-flight
-    // tolerance re-establishes the OLD session and wipes the new one.
+    // Re-deliver the last pre-rotation message (old capsule): it was
+    // already decrypted in the in-order loop, so the durable replay
+    // store now rejects it (ROUND 5, pentest M1 fixed) instead of
+    // letting the re-delivery re-establish the old session.
     const oldAgain = await decryptMessageText(payloads[49], ROOM, decOpts(aliceBundle)).catch((e: unknown) => e);
-    assert.ok(!(oldAgain instanceof Error), `pre-rotation message should still decrypt, got ${oldAgain instanceof Error ? oldAgain.message : ''}`);
+    assert.ok(
+      oldAgain instanceof E2EEError && oldAgain.code === 'REPLAY_DETECTED',
+      `pre-rotation re-delivery should be rejected as a replay, got ${oldAgain instanceof Error ? oldAgain.message : 'plaintext'}`
+    );
     // Now re-deliver the post-rotation message: its session's seen-steps
     // were wiped by the re-establishment above, so replay must be blocked
     // if replay protection survived the rotation.

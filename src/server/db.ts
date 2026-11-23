@@ -229,6 +229,15 @@ export class PersistentFallbackDatabase {
       const item = this.mediaBlobs.get(params[0]);
       return { rows: item ? [item] : [] };
     }
+    if (lower.startsWith('select * from media_blobs where uploaded_by = $1')) {
+      const list = Array.from(this.mediaBlobs.values()).filter(b => b.uploaded_by === params[0]);
+      return { rows: list.map(b => ({ ...b })) };
+    }
+    if (lower.startsWith('delete from media_blobs where id = $1')) {
+      this.mediaBlobs.delete(params[0]);
+      this.scheduleSave();
+      return { rows: [] };
+    }
 
     // 0.5 SESSIONS (DP-11)
     if (lower.startsWith('insert into sessions')) {
@@ -273,6 +282,14 @@ export class PersistentFallbackDatabase {
         if (s.expires_at && new Date(s.expires_at).getTime() < now) {
           this.sessions.delete(t);
         }
+      }
+      this.scheduleSave();
+      return { rows: [] };
+    }
+    if (lower.startsWith('delete from sessions where username = $1 and token')) {
+      // Round 5 (M2): revoke every session of a user except the kept one.
+      for (const [t, s] of Array.from(this.sessions.entries())) {
+        if (s.username === params[0] && t !== params[1]) this.sessions.delete(t);
       }
       this.scheduleSave();
       return { rows: [] };
@@ -443,6 +460,13 @@ export class PersistentFallbackDatabase {
         .map(u => ({ bale_chat_id: u.bale_chat_id }));
       return { rows: list };
     }
+    if (lower.startsWith('delete from users where username = $1')) {
+      // Round 5 (H1(d)): account delete. (Previously unhandled in the
+      // fallback — the row silently survived in local dev.)
+      this.users.delete(params[0]);
+      this.scheduleSave();
+      return { rows: [] };
+    }
 
     // 3. CONTACTS
     if (lower.startsWith('insert into contacts')) {
@@ -479,6 +503,12 @@ export class PersistentFallbackDatabase {
       const [username, contact] = params;
       const found = this.contacts.some(c => c.username === username && c.contact === contact);
       return { rows: found ? [{ '?column?': 1 }] : [] };
+    }
+    if (lower.startsWith('delete from contacts where username = $1 or contact = $1')) {
+      // Round 5 (H1(d)): account delete removes both sides of a contact row.
+      this.contacts = this.contacts.filter(c => c.username !== params[0] && c.contact !== params[0]);
+      this.scheduleSave();
+      return { rows: [] };
     }
 
     // 4. MESSAGES
@@ -525,6 +555,21 @@ export class PersistentFallbackDatabase {
     if (lower.includes('select room_id, is_deleted from messages where file_url = $1')) {
       const m = this.messages.find(msg => msg.file_url === params[0]);
       return { rows: m ? [{ room_id: m.room_id, is_deleted: m.is_deleted ? 1 : 0 }] : [] };
+    }
+    if (lower.includes('select * from messages where file_url = $1 and is_deleted = 0')) {
+      // Round 5 (H1(d)): is any non-deleted message still referencing this file?
+      const list = this.messages.filter(msg => msg.file_url === params[0] && !msg.is_deleted);
+      return { rows: list.map(m => ({ ...m })) };
+    }
+    if (lower.includes('select file_url from messages where sender = $1')) {
+      // Round 5 (H1(d)): file urls of one user's messages (account delete).
+      const list = this.messages.filter(msg => msg.sender === params[0] && msg.file_url);
+      return { rows: list.map(m => ({ file_url: m.file_url })) };
+    }
+    if (lower.startsWith('delete from messages where sender = $1')) {
+      this.messages = this.messages.filter(msg => msg.sender !== params[0]);
+      this.scheduleSave();
+      return { rows: [] };
     }
     if (lower.includes('from messages where room_id = $1 and is_deleted = 0 order by timestamp asc')) {
       const roomId = params[0];
@@ -686,6 +731,14 @@ export class PersistentFallbackDatabase {
       }
       return { rows: [] };
     }
+    if (lower.startsWith('delete from reports where reporter = $1 or reported_user = $1')) {
+      // Round 5 (H1(d)): account delete removes the user's reports both ways.
+      this.reports = this.reports.filter(
+        rep => rep.reporter !== params[0] && rep.reported_user !== params[0]
+      );
+      this.scheduleSave();
+      return { rows: [] };
+    }
 
     // 7. STATS
     if (lower.includes('select count(*) as c from users')) {
@@ -760,8 +813,14 @@ END $$;`;
 const rawDbUrl = process.env.DATABASE_URL || '';
 const isPlaceholderUrl = !rawDbUrl || rawDbUrl.includes('user:password@host:5432');
 
+// Round 5 (M6): the ephemeral JSON fallback is OFF by default. It only
+// engages when the operator opts in with ALLOW_JSON_FALLBACK=1 — a
+// transient Postgres error must never silently downgrade the live server
+// to a local file that is wiped on redeploy.
+const jsonFallbackAllowed = process.env.ALLOW_JSON_FALLBACK === '1';
+
 let pgPool: Pool | null = null;
-let useFallback = isPlaceholderUrl;
+let useFallback = isPlaceholderUrl && jsonFallbackAllowed;
 const fallbackDb = new PersistentFallbackDatabase();
 
 if (!isPlaceholderUrl) {
@@ -787,18 +846,36 @@ export const pool = {
       try {
         return await pgPool.query(text, params);
       } catch (err: any) {
-        console.error('❌ خطای کوئری PostgreSQL، انتقال به دیتابیس اتمیک دیسک (داده‌ها دیگر در Postgres ذخیره نمی‌شوند):', err.message);
-        useFallback = true;
-        return await fallbackDb.query(text, params);
+        // Round 5 (M6): fail closed by default. Only with the explicit
+        // ALLOW_JSON_FALLBACK=1 opt-in do we downgrade to the ephemeral
+        // JSON file; otherwise the error is re-thrown and the route fails
+        // instead of silently serving/writing ephemeral data.
+        if (jsonFallbackAllowed) {
+          console.error('❌ خطای کوئری PostgreSQL، انتقال به دیتابیس اتمیک دیسک (داده‌ها دیگر در Postgres ذخیره نمی‌شوند):', err.message);
+          useFallback = true;
+          return await fallbackDb.query(text, params);
+        }
+        console.error('❌ خطای کوئری PostgreSQL (JSON fallback غیرفعال است — درخواست fail-closed رد می‌شود):', err.message);
+        throw err;
       }
     }
-    return await fallbackDb.query(text, params);
+    if (useFallback) {
+      return await fallbackDb.query(text, params);
+    }
+    // No Postgres pool (placeholder DATABASE_URL) and no opt-in fallback:
+    // fail closed rather than silently using the ephemeral JSON file.
+    throw new Error('PostgreSQL در دسترس نیست و JSON fallback غیرفعال است (ALLOW_JSON_FALLBACK=1)');
   },
 };
 
 /** True while the server is running on the ephemeral JSON fallback instead of Postgres. */
 export function isUsingFallback(): boolean {
   return useFallback;
+}
+
+/** Which database engine is active — logged loudly at startup (round 5, M6). */
+export function getDbEngine(): 'postgres' | 'json-fallback' {
+  return useFallback ? 'json-fallback' : 'postgres';
 }
 
 export async function init(poolOverride?: Pool): Promise<void> {
@@ -970,8 +1047,17 @@ export async function init(poolOverride?: Pool): Promise<void> {
       if (process.env.NODE_ENV === 'production') {
         console.error('❌ سرور در پروداکشن روی فایل JSON موقت کار می‌کند — داده‌ها با هر دیپلوی پاک می‌شوند؛ اتصال Postgres را بررسی کنید.');
       }
-      useFallback = true;
+      // Round 5 (M6): only fall back when the operator opted in.
+      if (jsonFallbackAllowed) {
+        useFallback = true;
+      } else {
+        console.error('❌ JSON fallback غیرفعال است (ALLOW_JSON_FALLBACK=1) — دیتابیس در دسترس نیست؛ درخواست‌های دیتابیس خطا می‌دهند.');
+      }
     }
   }
-  console.log('✅ موتور دیتابیس اتمیک دیسک (Debounced Atomic Fallback - data/database.json) آماده است');
+  if (useFallback) {
+    console.log('✅ موتور دیتابیس اتمیک دیسک (Debounced Atomic Fallback - data/database.json) آماده است');
+  } else {
+    console.error('❌ هیچ دیتابیسی در دسترس نیست و JSON fallback غیرفعال است (ALLOW_JSON_FALLBACK=1) — درخواست‌های دیتابیس خطا می‌دهند.');
+  }
 }

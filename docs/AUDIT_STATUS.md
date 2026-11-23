@@ -401,7 +401,7 @@ Vectors fetched fresh on 2026-11-21 from `usnistgov/ACVP-Server` (vsId 42, FIPS 
 
 ## 5. Remediation — fix rounds, 21 November 2026
 
-**The findings in §4 are the record of what was found. This section is the record of what was done about them.** Three fix rounds ran on branch `fix/audit-2026-11-21` and were merged to `main` on 2026-11-22 (via the UI redesign branch). A fourth round ran on 2026-11-22 on branch `fix/audit-2026-11-22-round4` and was merged to `main` the same day. The code on `main` is now the fixed version. This is still a self-assessment follow-up — not an independent audit.
+**The findings in §4 are the record of what was found. This section is the record of what was done about them.** Three fix rounds ran on branch `fix/audit-2026-11-21` and were merged to `main` on 2026-11-22 (via the UI redesign branch). A fourth round ran on 2026-11-22 on branch `fix/audit-2026-11-22-round4` and was merged to `main` the same day. A fifth round ran on 2026-11-23, fixing all 18 findings from a live pentest of the deployed app (see Round 5 below). The code on `main` is now the fixed version. This is still a self-assessment follow-up — not an independent audit.
 
 ### Outcome
 
@@ -446,3 +446,22 @@ Five more findings closed (branch `fix/audit-2026-11-22-round4`): DP-12 (group r
 ### Still to verify live (after deploy)
 
 Real two-account E2E on Render; a legacy kind-1 file on Render (M10); the password-protection UI in a real browser (L8); one live request against the H2 epoch-packet route; live socket adversarial tests (need a captured Socket.IO frame).
+
+### Round 5 — live pentest, 23 November 2026
+
+On 2026-11-23 the deployed app (v6.5.0) was pentested live — every known attack class, including destructive ones, on the author's own service and accounts, with a full database backup taken first (8 tables, 29 rows). The app stayed up: no outage, no data damage. 18 findings (4 High, 7 Medium, 7 Low), all fixed in the same tree as the history-cache fix (decrypt-once + encrypted durable plaintext cache — see the README remediation section):
+
+- **PT-H1** stored XSS via public `/uploads/` (no file-type allowlist) → session theft: uploads moved out of `public/`, file-type allowlist verified by magic bytes, `/api/media` serves the verified mime with `Content-Disposition: attachment`.
+- **PT-H2** socket handlers without membership checks (`read` needed no auth): `canActOnMessage` check in every handler.
+- **PT-H3** admin block not revoking sessions / not enforced on REST: live block check in `getSessionUsername` (fail-closed) + revoke-all on block.
+- **PT-H4** admin login without rate limit/lockout, password reused as bearer token: 30-minute admin session tokens, 5-in-15-min IP lockout growing to 2 h.
+- **PT-M1** DM replay after ratchet-state loss: durable replay store consulted unconditionally, fails closed.
+- **PT-M2** session hygiene: `POST /api/logout`, revoke-all on recover, revoke-others on reissue, cookie `secure` on HTTPS.
+- **PT-M3** spoofable settings header + enumeration oracles: session required, identical responses, `/api/user` rate-limited.
+- **PT-M4** unauthenticated `/api/report`: session required, reporter forced, caps, per-user limit.
+- **PT-M5** global `io.emit`: room-only emits; deleted originals cannot be forwarded.
+- **PT-M6** silent JSON fallback: opt-in only (`ALLOW_JSON_FALLBACK=1`, never on Render); RLS untouched.
+- **PT-M7** no rate limits on GETs: global + per-route + per-socket limits, caps, member checks, `disappearAfter` clamped to 7 days.
+- **PT-L1–L7**: `Permissions-Policy` header; trimmed `/api/health` for unauthenticated callers; v3 signature fail-closed; v2 downgrade now shows a UI warning; manual secret no longer downgrades PQ; sender bound to the verified bundle; avatar allowlist, complete account delete, VOPRF warning, canonical host, guarded `JSON.parse`, validated admin `set-mode`/`block`.
+
+Verification: `tsc` clean, **326 pass, 0 fail, 0 skipped** (71 suites), `vite build` OK. Honest limit: no authenticated/state-changing attack could be executed live from the test environment — Highs confirmed by code reading, crypto findings by local execution; 10 live confirmations still pending after deploy (see README). Deferred: token out of localStorage/JSON + Google redirect URL (bigger client-auth refactor); RLS untouched; `VOPRF_SEED` must be set in Render env.

@@ -143,3 +143,40 @@ export async function canUploadToRoom(
   if (!username || !roomId) return false;
   return isRoomMember(username, roomId, query);
 }
+
+/** Extract the media id from a stored file_url (`/api/media/<id>` or legacy `/uploads/<id>`). */
+export function extractMediaId(fileUrl: string | null | undefined): string | null {
+  if (!fileUrl || typeof fileUrl !== 'string') return null;
+  const m = fileUrl.match(/^\/(?:api\/media|uploads)\/([^/?#]+)$/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Delete a media blob (DB row + disk file) — but ONLY when no remaining
+ * non-deleted message references it. Forwarded messages copy file_url, so
+ * deleting on the first message delete would break the forward. Returns
+ * whether the blob was deleted and whether it is still referenced.
+ */
+export async function deleteMediaIfUnreferenced(
+  mediaId: string,
+  query: DbQuery,
+  unlinkFile?: (mediaId: string) => Promise<void>
+): Promise<{ deleted: boolean; referenced: boolean }> {
+  if (!mediaId) return { deleted: false, referenced: false };
+  for (const form of [`/api/media/${mediaId}`, `/uploads/${mediaId}`]) {
+    const { rows } = await query(
+      'SELECT * FROM messages WHERE file_url = $1 AND is_deleted = 0',
+      [form]
+    );
+    if (rows.length) return { deleted: false, referenced: true };
+  }
+  await query('DELETE FROM media_blobs WHERE id = $1', [mediaId]);
+  if (unlinkFile) {
+    try {
+      await unlinkFile(mediaId);
+    } catch {
+      // Disk already gone (or ephemeral) — the DB row is the record.
+    }
+  }
+  return { deleted: true, referenced: false };
+}

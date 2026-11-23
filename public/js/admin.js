@@ -32,6 +32,8 @@
     if (sec === 'rules') loadRules();
   }
 
+  // H4 (round 5): login returns a short-lived admin SESSION token; the
+  // password is never stored in JS and never sent as x-admin-token again.
   function doLogin() {
     var passEl = document.getElementById('adminPass');
     var p = passEl ? passEl.value : '';
@@ -40,10 +42,17 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ password: p }),
     })
-      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        if (r.status === 429) {
+          document.getElementById('loginErr').textContent = 'تلاش‌های ناموفق زیاد است؛ چند دقیقه دیگر تلاش کنید';
+          return null;
+        }
+        return r.json();
+      })
       .then(function (d) {
-        if (d.ok) {
-          token = p;
+        if (!d) return;
+        if (d.ok && d.adminToken) {
+          token = d.adminToken;
           document.getElementById('loginWrap').classList.add('hidden');
           document.getElementById('panel').classList.remove('hidden');
           loadStats();

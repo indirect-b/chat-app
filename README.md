@@ -447,7 +447,7 @@ Vectors fetched fresh on 2026-11-21 from `usnistgov/ACVP-Server` (vsId 42, FIPS 
 
 ## 🔧 Remediation — fix rounds, 21 November 2026
 
-**The findings above are the record of what was found. This section is the record of what was done about them.** After the self-assessment, three fix rounds ran on branch `fix/audit-2026-11-21` and were merged to `main` on 2026-11-22 (via the UI redesign branch). A fourth round ran on 2026-11-22 on branch `fix/audit-2026-11-22-round4` and was merged to `main` the same day. The code on `main` is now the fixed version. This is still a self-assessment follow-up — not an independent audit, not a FIPS 140-3 validation, not a formal proof.
+**The findings above are the record of what was found. This section is the record of what was done about them.** After the self-assessment, three fix rounds ran on branch `fix/audit-2026-11-21` and were merged to `main` on 2026-11-22 (via the UI redesign branch). A fourth round ran on 2026-11-22 on branch `fix/audit-2026-11-22-round4` and was merged to `main` the same day. A fifth round ran on 2026-11-23, fixing all 18 findings from a live pentest of the deployed app (see Round 5 below). The code on `main` is now the fixed version. This is still a self-assessment follow-up — not an independent audit, not a FIPS 140-3 validation, not a formal proof.
 
 ### Outcome
 
@@ -528,6 +528,39 @@ Verification for round 4: `tsc --noEmit` clean; `vite build` OK; the three affec
 - The password-protection UI in a real browser (L8 — unit-tested only).
 - One live request against the H2 epoch-packet route (server-side fix verified by code review + tsc only).
 - Live socket adversarial tests (need a captured Socket.IO frame).
+
+### Round 5 — live pentest, 23 November 2026 (18 new findings, all fixed)
+
+On 2026-11-23 the deployed app (Render + Supabase, v6.5.0) was pentested live — every known attack class against the online version, including destructive ones, on the author's own service and accounts. A full database backup was taken first (8 tables, 29 rows) and the app stayed up throughout: no outage, no data damage, nothing had to be restored. The findings below use `PT-` IDs to distinguish them from the §4 audit findings, which reuse the H/M/L numbers.
+
+| ID | Severity | Finding | Fix |
+| --- | --- | --- | --- |
+| PT-H1 | High | Uploaded media served publicly under `/uploads/` with no file-type allowlist — stored HTML/SVG XSS, session-token theft, full account takeover. | `uploadsDir` moved out of `public/` (`data/uploads`); file-type allowlist (images/audio/video, verified by magic bytes, PQF1 pass-through); `/api/media` serves the server-verified mime with `Content-Disposition: attachment`; media deleted when unreferenced. |
+| PT-H2 | High | Socket.IO `pin` / `react` / `read` / `typing` and group `send-message` had no membership check; `read` needed no auth at all. | `canActOnMessage` membership check in every socket handler; `read` now requires an authenticated session. |
+| PT-H3 | High | Admin block did not revoke sessions and was not enforced on REST routes. | `getSessionUsername` now checks the block live (fail-closed) and `/api/admin/block` revokes all of the user's sessions. |
+| PT-H4 | High | No rate limit or lockout on admin login; the password was reused as the bearer token. | 30-minute admin session tokens (the password no longer works as a bearer token); 5 failures in 15 min lock the IP, lockout growing exponentially to 2 h; failed attempts logged. |
+| PT-M1 | Medium | DM replay succeeded after ratchet-state loss in runtimes without IndexedDB; the durable check failed open. | The durable replay store is consulted unconditionally and fails closed on store errors (`REPLAY_CHECK_FAILED`). |
+| PT-M2 | Medium | Session hygiene: token in URL + localStorage, no logout, no revocation on recover/reissue. | `POST /api/logout`; all sessions revoked on recover; other sessions revoked on recovery-code reissue; cookie `secure` set on HTTPS. (Removing the token from the JSON body / localStorage is deferred — it needs a bigger client-auth refactor.) |
+| PT-M3 | Medium | `GET /api/settings/mode` trusted a spoofable header; enumeration oracles. | Session required; identical responses for existent/non-existent users; `/api/user/:username` rate-limited. |
+| PT-M4 | Medium | Unauthenticated, unvalidated, unthrottled `POST /api/report`. | Session required, reporter forced to the session user, field lengths capped, per-user rate limit. |
+| PT-M5 | Medium | Global `io.emit` broadcast ciphertext + metadata to every connected socket. | Emits go to room members only (`emitToRoom`); deleted originals can no longer be forwarded. |
+| PT-M6 | Medium | Silent fallback to an ephemeral JSON DB on any Postgres error; permissive RLS. | Fallback is now opt-in only (`ALLOW_JSON_FALLBACK=1`, never on Render); otherwise the server fails closed and logs loudly. RLS policies unchanged. |
+| PT-M7 | Medium | No rate limiting on GET routes and most write paths; unbounded inputs. | Global 300 req/min/IP on `/api/*`, tighter limits on user/health/upload/report, per-socket event throttle, length caps, group member caps + existence checks, `disappearAfter` clamped to 7 days. |
+| PT-L1 | Low | Missing `Permissions-Policy` header. | Header added (`camera=(), microphone=(), geolocation=(), payment=()`). |
+| PT-L2 | Low | `/api/health` publicly exposed version, DB status and Bale telemetry. | Unauthenticated callers get a trimmed `{ok:true/false}`; the detailed shape is admin-only. |
+| PT-L3 | Low | Group v3 signature silently skipped when sender/bundle omitted. | v3 decrypt fails closed without sender + verified bundle (self-sent messages exempt — ownership is proven by the sent-plaintext cache). |
+| PT-L4 | Low | Group v3→v2 signature stripping accepted (downgrade). | v2 payloads still decrypt (old group history), but the UI now warns `⚠️ امضا تأیید نشد` on any group message with `mldsaVerified:false`. |
+| PT-L5 | Low | A set manual room secret silently downgraded PQ encrypt to PBKDF2. | The PQ path now wins whenever a peer PQ bundle exists; the manual secret is only the fallback when no PQ bundle exists. |
+| PT-L6 | Low | Sender not bound to the verified bundle (identity spoofing at the crypto layer). | Envelope sender must equal the verified bundle username, else `INVALID_SIGNATURE`. |
+| PT-L7 | Low | Miscellaneous: avatar URL arbitrary, incomplete account delete, VOPRF seed fallback, host-header reflection, unguarded `JSON.parse`, unvalidated admin `set-mode` / `block`. | Avatar allowlist (`lh3.googleusercontent.com` or `/api/media/`); account delete also removes media, group memberships and reports; loud startup warning when `VOPRF_SEED` is unset (set it in Render env); fixed canonical host for robots/sitemap; all `JSON.parse` sites guarded; `mode` / `blockUntil` validated. |
+
+Verification — independent re-run on the fixed tree: `tsc --noEmit` clean; full suite **326 pass, 0 fail, 0 skipped** (71 suites — 262 baseline including the 9 history-cache tests, + 11 new crypto tests + 53 new server tests); `vite build` OK. Three pinned tests were updated because they asserted the old vulnerable behaviour (adversarial A2/A3 and two dp-masking proofs now assert `REPLAY_DETECTED`; room/profile-auth tests updated for the now-async session lookup) — the gate behaviour is unchanged.
+
+Honest limits: no authenticated or state-changing attack could be executed against the live app from the test environment (it cannot issue POSTs or Authorization headers), so the High findings were confirmed by exact code reading and the crypto findings by local execution against the real protocol code — not by a live exploit. Still to confirm live after deploy: an `.html` upload now 400s; admin lockout after 5 wrong passwords; a blocked user's old REST token now 401s; room-only socket emits; the unverified-group warning in a real browser; whether the live `DATABASE_URL` uses the least-privilege `chatapp` role. The live crypto attacks (replay, forged signatures, tampering, downgrade) were all blocked locally.
+
+#### Message history after refresh — fixed in the same push
+
+Refreshing the page locked all received history (the durable replay store rejected any already-decrypted message on re-decrypt) and all own sent messages (they lived only in an in-memory cache). Fixed Signal-style: decrypt-once + an encrypted durable plaintext cache — a new IndexedDB store `decrypted_history_v1`, AES-GCM under the device wrapping key, 10,000 entries per user, 30-day TTL, wiped on identity delete, re-wrapped on password-protection key rotation, unreadable while locked. Replay protection, the ratchet and ML-DSA verification are untouched. Messages that were never successfully decrypted before the fix stay locked — they were never cached.
 
 ### Full per-finding status
 

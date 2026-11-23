@@ -65,7 +65,7 @@ describe('route wiring (server.ts source — server never started in tests)', ()
   );
 
   it("POST /api/user/update gates on the body's username and denies non-ok with 403", () => {
-    assert.ok(userUpdateHandler.includes('checkOwnUsername(getSessionUsername(req)'));
+    assert.ok(userUpdateHandler.includes('checkOwnUsername(await getSessionUsername(req)'));
     assert.ok(userUpdateHandler.includes("res.status(403)"));
     // The UPDATE must come after the gate.
     const gateAt = userUpdateHandler.indexOf("if (access !== 'ok')");
@@ -74,7 +74,7 @@ describe('route wiring (server.ts source — server never started in tests)', ()
   });
 
   it("POST /api/add-contact gates on the body's myUsername and denies non-ok with 403", () => {
-    assert.ok(addContactHandler.includes('checkOwnUsername(getSessionUsername(req)'));
+    assert.ok(addContactHandler.includes('checkOwnUsername(await getSessionUsername(req)'));
     assert.ok(addContactHandler.includes("res.status(403)"));
     // The INSERT must come after the gate.
     const gateAt = addContactHandler.indexOf("if (access !== 'ok')");
@@ -83,7 +83,7 @@ describe('route wiring (server.ts source — server never started in tests)', ()
   });
 
   it('GET /api/contacts/:username gates on the URL username and denies non-ok with 403', () => {
-    assert.ok(contactsHandler.includes('checkOwnUsername(getSessionUsername(req)'));
+    assert.ok(contactsHandler.includes('checkOwnUsername(await getSessionUsername(req)'));
     assert.ok(contactsHandler.includes("res.status(403)"));
     // The SELECT must come after the gate.
     const gateAt = contactsHandler.indexOf("if (access !== 'ok')");

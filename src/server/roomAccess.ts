@@ -60,3 +60,21 @@ export function checkOwnGroupsAccess(
 ): RoomReadAccess {
   return checkOwnUsername(sessionUsername, urlUsername);
 }
+
+/**
+ * May `username` act on message `msgId` inside `roomId` (pin / react /
+ * read / …)? The message must exist, must belong to that room, and the
+ * user must be a member of the room. Fails closed on every miss.
+ */
+export async function canActOnMessage(
+  username: string | null,
+  msgId: string,
+  roomId: string,
+  query: DbQuery
+): Promise<boolean> {
+  if (!username || !msgId || !roomId) return false;
+  const { rows } = await query('SELECT * FROM messages WHERE id=$1', [msgId]);
+  if (!rows.length) return false;
+  if (String(rows[0].room_id) !== roomId) return false;
+  return isRoomMember(username, roomId, query);
+}

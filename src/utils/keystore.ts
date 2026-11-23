@@ -36,7 +36,9 @@ const IDB_STORE = 'identity_keys';
 const IDB_REPLAY_STORE = 'replay_protection_v1';
 const IDB_PASSWORD_ROOT_STORE = 'password_wrapped_root_v1';
 export const IDB_TOFU_STORE = 'tofu_pinned_keys_v1';
-const IDB_VERSION = 4;
+/** کش رمزنگاری‌شدهٔ تاریخچهٔ رمزگشایی‌شده (رفع باگ قفل‌شدن پیام‌ها پس از رفرش). */
+export const IDB_HISTORY_STORE = 'decrypted_history_v1';
+const IDB_VERSION = 5;
 
 const LEGACY_STORAGE_PREFIXES = [
   'chat_ecdh_kp_',
@@ -171,6 +173,9 @@ function openKeyStoreDB(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(IDB_PASSWORD_ROOT_STORE)) {
         db.createObjectStore(IDB_PASSWORD_ROOT_STORE, { keyPath: 'username' });
+      }
+      if (!db.objectStoreNames.contains(IDB_HISTORY_STORE)) {
+        db.createObjectStore(IDB_HISTORY_STORE, { keyPath: 'key' });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -375,15 +380,21 @@ export async function isDurableReplaySeen(roomId: string, token: string): Promis
   try {
     const db = await openKeyStoreDB();
     if (!db.objectStoreNames.contains(IDB_REPLAY_STORE)) return false;
-    return new Promise(resolve => {
+    return new Promise<boolean>((resolve, reject) => {
       const tx = db.transaction(IDB_REPLAY_STORE, 'readonly');
       const store = tx.objectStore(IDB_REPLAY_STORE);
       const req = store.get(key);
       req.onsuccess = () => resolve(Boolean(req.result));
-      req.onerror = () => resolve(false);
+      // M1 (round 5): fail CLOSED on a real IndexedDB error — "unknown"
+      // must never be treated as "not seen", or a replay could slip
+      // through whenever the durable store is unreadable. The only
+      // fail-open case kept is a missing store (no store = no recorded
+      // tokens = legitimately not seen).
+      req.onerror = () => reject(new Error(`DURABLE_REPLAY_CHECK_FAILED: IndexedDB replay lookup failed (${req.error?.message || 'unknown error'})`));
     });
-  } catch {
-    return false;
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith('DURABLE_REPLAY_CHECK_FAILED')) throw err;
+    throw new Error(`DURABLE_REPLAY_CHECK_FAILED: ${err instanceof Error ? err.message : 'IndexedDB replay check failed'}`);
   }
 }
 
@@ -475,6 +486,442 @@ export async function pruneDurableReplaySeen(nowMs: number = Date.now()): Promis
     });
   } catch {
     // ignore
+  }
+}
+
+/**
+ * ============================================================================
+ * کش رمزنگاری‌شدهٔ تاریخچهٔ رمزگشایی‌شده (Decrypted History Cache)
+ * ============================================================================
+ *
+ * چرا این کش لازم است: نشست راتچت PQ فقط در حافظهٔ RAM نگه داشته می‌شود و
+ * انبار دائم Replay هر پیام تحویل‌شده را تا ۳۰ روز به‌خاطر می‌سپارد. پس از هر
+ * رفرش، رمزگشایی دوبارهٔ تاریخچه با REPLAY_DETECTED رد می‌شود و پیام‌های
+ * ارسالی خود کاربر هم — چون متن آن‌ها فقط در کش حافظه‌ای
+ * sentPlaintextMemoryCache بود — دیگر قابل بازیابی نیستند. نتیجه: همهٔ
+ * پیام‌های قبلی قفل‌شده نمایش داده می‌شوند.
+ *
+ * راه‌حل (همان رویکرد Signal): پس از هر رمزگشایی موفق، متن سادهٔ پیام با
+ * AES-GCM زیر همان کلید پوششی دستگاه که رازهای ML-KEM/ML-DSA را می‌پوشاند،
+ * در IndexedDB ذخیره می‌شود و رمزگشایی تاریخچه پیش از رمزگشایی دوباره،
+ * اول این کش را می‌خواند. این کار هیچ‌یک از محافظت‌ها را تغییر نمی‌دهد:
+ * بررسی Replay، راتچت، seenRecvSteps و اعتبارسنجی امضا دست‌نخورده‌اند؛
+ * متن ساده هرگز به سرور نمی‌رود و هرگز بدون رمز در دیسک نمی‌نشیند.
+ *
+ * کلید کش: `<username>::<roomId>::<payloadHash24>` — دقیقاً همان طرحی که
+ * کش حافظه‌ای پیام‌های ارسالی استفاده می‌کند، تا ارسال و دریافت کلید
+ * مشترک داشته باشند.
+ */
+export const DECRYPTED_HISTORY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const DECRYPTED_HISTORY_MAX_ENTRIES = 10_000;
+const DECRYPTED_HISTORY_PRUNE_SAMPLE_RATE = 0.05;
+
+export interface DecryptedHistoryEntry {
+  text: string;
+  mode?: 'PQ-MLKEM-RATCHET' | 'GROUP-EPOCH-FSM' | 'PBKDF2';
+  ratchetStep?: number;
+  epoch?: number;
+  mldsaVerified: boolean;
+  timestamp: number;
+}
+
+interface StoredDecryptedHistoryRecord {
+  key: string;
+  username: string;
+  roomId: string;
+  payloadHash: string;
+  iv: Uint8Array;
+  ciphertext: Uint8Array;
+  timestamp: number;
+}
+
+// In-memory IndexedDB fallback used ONLY when globalThis.indexedDB is absent (e.g. Node.js tests)
+const nodeMemoryHistoryStore = new Map<string, StoredDecryptedHistoryRecord>();
+
+function historyCacheKey(username: string, roomId: string, payloadHashKey: string): string {
+  return `${normalizeKeystoreUsername(username)}::${roomId}::${payloadHashKey}`;
+}
+
+/**
+ * کلید پوششی لازم برای کش تاریخچه: برای هویت معمولی، کلید ذخیره‌شده در
+ * رکورد؛ برای هویت محافظت‌شده با رمز عبور (L8)، فقط کلید بازشدهٔ نشست —
+ * در حالت قفل، null برمی‌گردد و کش خوانده/نوشته نمی‌شود (رفتار درست L8:
+ * تاریخچه تا باز شدن هویت قفل می‌ماند).
+ */
+async function getHistoryWrappingKey(username: string): Promise<CryptoKey | null> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm) return null;
+  const sessionKey = getSessionWrappingKey(norm);
+  if (sessionKey) return sessionKey;
+  let record: StoredIdentityRecordV4 | null = null;
+  try {
+    record = await loadIdentityRecordV4(norm);
+  } catch {
+    return null;
+  }
+  if (!record || record.passwordProtected) return null;
+  return record.wrappingKey ?? null;
+}
+
+const HISTORY_AAD_LABEL = 'PQ-MPRBA:HISTORY-V1';
+
+function historyAad(username: string, roomId: string, payloadHashKey: string): Uint8Array {
+  return new TextEncoder().encode(
+    `${HISTORY_AAD_LABEL}:${normalizeKeystoreUsername(username)}:${roomId}:${payloadHashKey}`
+  );
+}
+
+async function encryptDecryptedHistoryEntry(
+  wrappingKey: CryptoKey,
+  username: string,
+  roomId: string,
+  payloadHashKey: string,
+  entry: Omit<DecryptedHistoryEntry, 'timestamp'>
+): Promise<WrappedSecretBlob> {
+  const webCrypto = getWebCrypto();
+  const iv = webCrypto.getRandomValues(new Uint8Array(12));
+  const plain = new TextEncoder().encode(
+    JSON.stringify({
+      text: entry.text,
+      mode: entry.mode,
+      ratchetStep: entry.ratchetStep,
+      epoch: entry.epoch,
+      mldsaVerified: entry.mldsaVerified,
+    })
+  );
+  const ctBuf = await webCrypto.subtle.encrypt(
+    {
+      name: 'AES-GCM',
+      iv: iv as unknown as BufferSource,
+      additionalData: historyAad(username, roomId, payloadHashKey) as unknown as BufferSource,
+    },
+    wrappingKey,
+    plain as unknown as BufferSource
+  );
+  return { iv, ciphertext: new Uint8Array(ctBuf) };
+}
+
+async function decryptDecryptedHistoryEntry(
+  wrappingKey: CryptoKey,
+  username: string,
+  roomId: string,
+  payloadHashKey: string,
+  wrapped: WrappedSecretBlob
+): Promise<Omit<DecryptedHistoryEntry, 'timestamp'>> {
+  const webCrypto = getWebCrypto();
+  const plainBuf = await webCrypto.subtle.decrypt(
+    {
+      name: 'AES-GCM',
+      iv: wrapped.iv as unknown as BufferSource,
+      additionalData: historyAad(username, roomId, payloadHashKey) as unknown as BufferSource,
+    },
+    wrappingKey,
+    wrapped.ciphertext as unknown as BufferSource
+  );
+  const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(plainBuf));
+  if (typeof parsed !== 'object' || parsed === null || typeof parsed.text !== 'string') {
+    throw new Error('Decrypted history entry has an unexpected shape');
+  }
+  return {
+    text: parsed.text,
+    mode: parsed.mode,
+    ratchetStep: parsed.ratchetStep,
+    epoch: parsed.epoch,
+    mldsaVerified: Boolean(parsed.mldsaVerified),
+  };
+}
+
+/**
+ * ذخیرهٔ یک پیام رمزگشایی‌شده در کش تاریخچه (best-effort: بدون کلید یا
+ * با خطا، false برمی‌گردد و هرگز throw نمی‌کند تا مسیر پیام خراب نشود).
+ */
+export async function storeDecryptedHistoryEntry(
+  username: string,
+  roomId: string,
+  payloadHashKey: string,
+  entry: Omit<DecryptedHistoryEntry, 'timestamp'>
+): Promise<boolean> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm || !roomId || !payloadHashKey) return false;
+  try {
+    const wrappingKey = await getHistoryWrappingKey(norm);
+    if (!wrappingKey) return false;
+    const wrapped = await encryptDecryptedHistoryEntry(wrappingKey, norm, roomId, payloadHashKey, entry);
+    const record: StoredDecryptedHistoryRecord = {
+      key: historyCacheKey(norm, roomId, payloadHashKey),
+      username: norm,
+      roomId,
+      payloadHash: payloadHashKey,
+      iv: wrapped.iv,
+      ciphertext: wrapped.ciphertext,
+      timestamp: Date.now(),
+    };
+    if (!hasBrowserIndexedDB()) {
+      nodeMemoryHistoryStore.set(record.key, record);
+      if (nodeMemoryHistoryStore.size > DECRYPTED_HISTORY_MAX_ENTRIES) {
+        void pruneDecryptedHistory();
+      }
+      return true;
+    }
+    const db = await openKeyStoreDB();
+    if (!db.objectStoreNames.contains(IDB_HISTORY_STORE)) return false;
+    await new Promise<void>(resolve => {
+      const tx = db.transaction(IDB_HISTORY_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_HISTORY_STORE);
+      store.put(record);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+    db.close();
+    // هرس نمونه‌ای (۵٪) — همان الگوی انبار Replay.
+    if (Math.random() < DECRYPTED_HISTORY_PRUNE_SAMPLE_RATE) {
+      void pruneDecryptedHistory();
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * خواندن یک پیام از کش تاریخچه. نبود ورودی، انقضای TTL، قفل‌بودن هویت
+ * (L8) یا هر خطای رمزگشایی → null (مسیر عادی رمزگشایی ادامه پیدا می‌کند).
+ */
+export async function getDecryptedHistoryEntry(
+  username: string,
+  roomId: string,
+  payloadHashKey: string
+): Promise<DecryptedHistoryEntry | null> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm || !roomId || !payloadHashKey) return null;
+  try {
+    const key = historyCacheKey(norm, roomId, payloadHashKey);
+    let stored: StoredDecryptedHistoryRecord | undefined;
+    if (!hasBrowserIndexedDB()) {
+      stored = nodeMemoryHistoryStore.get(key);
+    } else {
+      const db = await openKeyStoreDB();
+      if (!db.objectStoreNames.contains(IDB_HISTORY_STORE)) return null;
+      stored = await new Promise<StoredDecryptedHistoryRecord | undefined>(resolve => {
+        const tx = db.transaction(IDB_HISTORY_STORE, 'readonly');
+        const store = tx.objectStore(IDB_HISTORY_STORE);
+        const req = store.get(key);
+        req.onsuccess = () => resolve((req.result as StoredDecryptedHistoryRecord) || undefined);
+        req.onerror = () => resolve(undefined);
+      });
+      db.close();
+    }
+    if (!stored) return null;
+    if (Date.now() - (stored.timestamp || 0) > DECRYPTED_HISTORY_TTL_MS) {
+      void deleteDecryptedHistoryEntry(norm, roomId, payloadHashKey);
+      return null;
+    }
+    const wrappingKey = await getHistoryWrappingKey(norm);
+    if (!wrappingKey) return null;
+    const entry = await decryptDecryptedHistoryEntry(
+      wrappingKey,
+      norm,
+      roomId,
+      payloadHashKey,
+      { iv: stored.iv, ciphertext: stored.ciphertext }
+    );
+    return { ...entry, timestamp: stored.timestamp };
+  } catch {
+    return null;
+  }
+}
+
+async function deleteDecryptedHistoryEntry(
+  username: string,
+  roomId: string,
+  payloadHashKey: string
+): Promise<void> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm) return;
+  const key = historyCacheKey(norm, roomId, payloadHashKey);
+  try {
+    if (!hasBrowserIndexedDB()) {
+      nodeMemoryHistoryStore.delete(key);
+      return;
+    }
+    const db = await openKeyStoreDB();
+    if (!db.objectStoreNames.contains(IDB_HISTORY_STORE)) return;
+    await new Promise<void>(resolve => {
+      const tx = db.transaction(IDB_HISTORY_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_HISTORY_STORE);
+      store.delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+    db.close();
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * حذف همهٔ ورودی‌های کش تاریخچهٔ یک کاربر — هنگام حذف هویت (deleteIdentityRecordV4)
+ * فراخوانی می‌شود تا هیچ متن رمزنگاری‌شده‌ای از هویت حذف‌شده باقی نماند.
+ */
+export async function deleteDecryptedHistoryForUser(username: string): Promise<void> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm) return;
+  try {
+    if (!hasBrowserIndexedDB()) {
+      for (const key of Array.from(nodeMemoryHistoryStore.keys())) {
+        if (key.startsWith(`${norm}::`)) nodeMemoryHistoryStore.delete(key);
+      }
+      return;
+    }
+    const db = await openKeyStoreDB();
+    if (!db.objectStoreNames.contains(IDB_HISTORY_STORE)) return;
+    const entries = await new Promise<Array<StoredDecryptedHistoryRecord>>(resolve => {
+      const tx = db.transaction(IDB_HISTORY_STORE, 'readonly');
+      const store = tx.objectStore(IDB_HISTORY_STORE);
+      const req = store.getAll();
+      req.onsuccess = () => resolve((req.result as Array<StoredDecryptedHistoryRecord>) || []);
+      req.onerror = () => resolve([]);
+    });
+    const ownKeys = entries.filter(e => e.username === norm).map(e => e.key);
+    if (ownKeys.length === 0) return;
+    await new Promise<void>(resolve => {
+      const tx = db.transaction(IDB_HISTORY_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_HISTORY_STORE);
+      for (const key of ownKeys) store.delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+    db.close();
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * هرس کش تاریخچه: ورودی‌های قدیمی‌تر از TTL و — برای هر کاربر جداگانه —
+ * قدیمی‌ترین ورودی‌های مازاد بر سقف حذف می‌شوند. Best-effort.
+ */
+export async function pruneDecryptedHistory(nowMs: number = Date.now()): Promise<void> {
+  try {
+    if (!hasBrowserIndexedDB()) {
+      const byUser = new Map<string, Array<{ key: string; timestamp: number }>>();
+      for (const [key, rec] of nodeMemoryHistoryStore) {
+        const list = byUser.get(rec.username) || [];
+        list.push({ key, timestamp: rec.timestamp || 0 });
+        byUser.set(rec.username, list);
+      }
+      const cutoff = nowMs - DECRYPTED_HISTORY_TTL_MS;
+      for (const list of byUser.values()) {
+        const stale = list.filter(e => e.timestamp < cutoff).map(e => e.key);
+        let toDelete = stale;
+        const fresh = list
+          .filter(e => e.timestamp >= cutoff)
+          .sort((a, b) => a.timestamp - b.timestamp);
+        if (fresh.length > DECRYPTED_HISTORY_MAX_ENTRIES) {
+          toDelete = [...stale, ...fresh.slice(0, fresh.length - DECRYPTED_HISTORY_MAX_ENTRIES).map(e => e.key)];
+        }
+        for (const key of toDelete) nodeMemoryHistoryStore.delete(key);
+      }
+      return;
+    }
+    const db = await openKeyStoreDB();
+    if (!db.objectStoreNames.contains(IDB_HISTORY_STORE)) return;
+    const entries = await new Promise<Array<StoredDecryptedHistoryRecord>>(resolve => {
+      const tx = db.transaction(IDB_HISTORY_STORE, 'readonly');
+      const store = tx.objectStore(IDB_HISTORY_STORE);
+      const req = store.getAll();
+      req.onsuccess = () => resolve((req.result as Array<StoredDecryptedHistoryRecord>) || []);
+      req.onerror = () => resolve([]);
+    });
+    const cutoff = nowMs - DECRYPTED_HISTORY_TTL_MS;
+    const byUser = new Map<string, Array<StoredDecryptedHistoryRecord>>();
+    for (const e of entries) {
+      const list = byUser.get(e.username) || [];
+      list.push(e);
+      byUser.set(e.username, list);
+    }
+    const toDelete: string[] = [];
+    for (const list of byUser.values()) {
+      const stale = list.filter(e => (e.timestamp || 0) < cutoff).map(e => e.key);
+      toDelete.push(...stale);
+      const fresh = list
+        .filter(e => (e.timestamp || 0) >= cutoff)
+        .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      if (fresh.length > DECRYPTED_HISTORY_MAX_ENTRIES) {
+        toDelete.push(...fresh.slice(0, fresh.length - DECRYPTED_HISTORY_MAX_ENTRIES).map(e => e.key));
+      }
+    }
+    if (toDelete.length === 0) return;
+    await new Promise<void>(resolve => {
+      const tx = db.transaction(IDB_HISTORY_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_HISTORY_STORE);
+      for (const key of toDelete) store.delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+    db.close();
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * بازپیچیدن ورودی‌های کش تاریخچهٔ یک کاربر زیر کلید پوششی تازه — هنگام
+ * فعال/غیرفعال‌کردن محافظت با رمز عبور (L8) کلید پوششی عوض می‌شود و بدون
+ * این مهاجرت، ورودی‌های قدیمی زیر کلید قبلی یتیم و ناخوانا می‌ماندند.
+ * Best-effort: خطا در یک ورودی، بقیه را متوقف نمی‌کند و هرگز عملیات L8 را
+ * شکست نمی‌دهد.
+ */
+export async function rewrapDecryptedHistoryForUser(
+  username: string,
+  oldWrappingKey: CryptoKey,
+  newWrappingKey: CryptoKey
+): Promise<void> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm || !oldWrappingKey || !newWrappingKey) return;
+  try {
+    let records: Array<StoredDecryptedHistoryRecord>;
+    if (!hasBrowserIndexedDB()) {
+      records = Array.from(nodeMemoryHistoryStore.values()).filter(r => r.username === norm);
+    } else {
+      const db = await openKeyStoreDB();
+      if (!db.objectStoreNames.contains(IDB_HISTORY_STORE)) return;
+      records = await new Promise<Array<StoredDecryptedHistoryRecord>>(resolve => {
+        const tx = db.transaction(IDB_HISTORY_STORE, 'readonly');
+        const store = tx.objectStore(IDB_HISTORY_STORE);
+        const req = store.getAll();
+        req.onsuccess = () => resolve((req.result as Array<StoredDecryptedHistoryRecord>) || []);
+        req.onerror = () => resolve([]);
+      });
+      db.close();
+    }
+    for (const rec of records) {
+      try {
+        const entry = await decryptDecryptedHistoryEntry(oldWrappingKey, norm, rec.roomId, rec.payloadHash, {
+          iv: rec.iv,
+          ciphertext: rec.ciphertext,
+        });
+        const wrapped = await encryptDecryptedHistoryEntry(newWrappingKey, norm, rec.roomId, rec.payloadHash, entry);
+        const updated: StoredDecryptedHistoryRecord = { ...rec, iv: wrapped.iv, ciphertext: wrapped.ciphertext };
+        if (!hasBrowserIndexedDB()) {
+          nodeMemoryHistoryStore.set(rec.key, updated);
+        } else {
+          const db = await openKeyStoreDB();
+          await new Promise<void>(resolve => {
+            const tx = db.transaction(IDB_HISTORY_STORE, 'readwrite');
+            const store = tx.objectStore(IDB_HISTORY_STORE);
+            store.put(updated);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => resolve();
+          });
+          db.close();
+        }
+      } catch {
+        // ورودی خراب/یتیم: همان‌طور بماند تا TTL آن را هرس کند.
+      }
+    }
+  } catch {
+    // ignore — مهاجرت کش هرگز عملیات L8 را شکست نمی‌دهد.
   }
 }
 
@@ -670,6 +1117,9 @@ export async function deleteIdentityRecordV4(username: string): Promise<void> {
   publicMetaMemoryCache.delete(norm);
   sessionWrappingKeys.delete(norm);
   await deletePasswordRootBlob(norm);
+  // حذف هویت، کش تاریخچهٔ آن کاربر را هم پاک می‌کند (متن‌های رمزنگاری‌شده
+  // زیر کلید هویت حذف‌شده باقی نمی‌مانند).
+  await deleteDecryptedHistoryForUser(norm);
   const ls = getSafeLocalStorage();
   if (ls) {
     try {
@@ -1020,6 +1470,9 @@ export async function enablePasswordProtection(username: string, passphrase: str
     mldsaSecretWrapped,
   });
   sessionWrappingKeys.set(norm, runtimeKey);
+  // کلید پوششی عوض شد — ورودی‌های کش تاریخچه زیر کلید تازه بازپیچیده
+  // می‌شوند تا تاریخچهٔ قبلی پس از فعال‌کردن محافظت هم خوانا بماند.
+  await rewrapDecryptedHistoryForUser(norm, record.wrappingKey, newWrappingKey);
 }
 
 /**
@@ -1063,6 +1516,9 @@ export async function disablePasswordProtection(username: string, passphrase: st
   });
   await deletePasswordRootBlob(norm);
   sessionWrappingKeys.delete(norm);
+  // کلید پوششی عوض شد — ورودی‌های کش تاریخچه زیر کلید تازه بازپیچیده
+  // می‌شوند تا تاریخچهٔ قبلی پس از غیرفعال‌کردن محافظت هم خوانا بماند.
+  await rewrapDecryptedHistoryForUser(norm, sessionKey, newWrappingKey);
 }
 
 /**
@@ -1100,6 +1556,11 @@ export function lockIdentity(username: string): void {
   if (norm) sessionWrappingKeys.delete(norm);
 }
 
+/** پاک‌کردن همهٔ کلیدهای پوششی بازشدهٔ نشست — فقط برای شبیه‌سازی رفرش در تست‌ها. */
+export function clearAllSessionWrappingKeysForTests(): void {
+  sessionWrappingKeys.clear();
+}
+
 /**
  * Reset in-memory test store & caches (for isolated unit testing only).
  */
@@ -1107,6 +1568,7 @@ export function resetInMemoryKeyStoreForTests(): void {
   nodeMemoryIdbStore.clear();
   nodeMemoryReplayStore.clear();
   nodeMemoryPasswordRootStore.clear();
+  nodeMemoryHistoryStore.clear();
   sessionWrappingKeys.clear();
   publicMetaMemoryCache.clear();
 }

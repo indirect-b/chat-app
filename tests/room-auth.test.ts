@@ -88,13 +88,15 @@ describe('route wiring (server.ts source — server never started in tests)', ()
   );
 
   it('/api/messages/:roomId calls checkRoomReadAccess and denies non-ok with 403', () => {
-    assert.ok(messagesHandler.includes('checkRoomReadAccess(getSessionUsername(req), roomId'));
+    // Round 5 (H3): getSessionUsername is async, so the call site awaits it.
+    assert.ok(messagesHandler.includes('checkRoomReadAccess(await getSessionUsername(req), roomId'));
     assert.ok(messagesHandler.includes("res.status(403)"));
     assert.ok(!messagesHandler.includes("res.status(401)"));
   });
 
   it('/api/groups/:username calls checkOwnGroupsAccess and denies non-ok with 403', () => {
-    assert.ok(groupsHandler.includes('checkOwnGroupsAccess(getSessionUsername(req)'));
+    // Round 5 (H3): getSessionUsername is async, so the call site awaits it.
+    assert.ok(groupsHandler.includes('checkOwnGroupsAccess(await getSessionUsername(req)'));
     assert.ok(groupsHandler.includes("res.status(403)"));
   });
 

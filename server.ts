@@ -14,10 +14,36 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { hkdf } from '@noble/hashes/hkdf.js';
 import { config, verifyAdminSecret } from './src/server/config';
 import * as bale from './src/server/bale';
-import { pool, init, isUsingFallback } from './src/server/db';
+import { pool, init, isUsingFallback, getDbEngine } from './src/server/db';
 import { presence } from './src/server/presence';
-import { getRoomId, resolveMediaAccess, canUploadToRoom, isRoomMember } from './src/server/media';
-import { checkRoomReadAccess, checkOwnGroupsAccess, checkOwnUsername } from './src/server/roomAccess';
+import {
+  getRoomId,
+  resolveMediaAccess,
+  canUploadToRoom,
+  isRoomMember,
+  deleteMediaIfUnreferenced,
+  extractMediaId,
+} from './src/server/media';
+import {
+  checkRoomReadAccess,
+  checkOwnGroupsAccess,
+  checkOwnUsername,
+  canActOnMessage,
+} from './src/server/roomAccess';
+import {
+  validateUploadFile,
+  readFileHead,
+  verifyStoredMime,
+  ALLOWED_UPLOAD_EXTENSIONS,
+} from './src/server/uploadPolicy';
+import { issueAdminSession, verifyAdminSession, adminLoginLimiter } from './src/server/adminAuth';
+import {
+  SlidingWindowLimiter,
+  rateLimitMiddleware,
+  getClientIp,
+} from './src/server/rateLimit';
+import { emitToRoom } from './src/server/roomEmit';
+import { parseMsg, safeParseMembers, safeParseReactions } from './src/server/messageParse';
 import {
   generateRecoveryCode,
   hashRecoveryCode,
@@ -49,6 +75,18 @@ const recoverRateLimiter = new RecoveryRateLimiter(5, 15 * 60 * 1000);
 const googleLoginLimiter = new RecoveryRateLimiter(20, 15 * 60 * 1000);
 const voprfRateLimiter = new RecoveryRateLimiter(60, 60 * 1000);
 
+// Round 5 (M7): sliding-window limiters. Global /api/ budget is generous;
+// the tight buckets sit on the abuse-prone routes. Per-user write buckets
+// are separate instances so each route gets its own budget.
+const apiGlobalLimiter = new SlidingWindowLimiter(300, 60 * 1000);
+const userLookupLimiter = new SlidingWindowLimiter(60, 60 * 1000);
+const healthLimiter = new SlidingWindowLimiter(30, 60 * 1000);
+const uploadLimiter = new SlidingWindowLimiter(20, 15 * 60 * 1000);
+const reportLimiter = new SlidingWindowLimiter(10, 15 * 60 * 1000);
+const addContactLimiter = new SlidingWindowLimiter(30, 15 * 60 * 1000);
+const userUpdateLimiter = new SlidingWindowLimiter(30, 15 * 60 * 1000);
+const createGroupLimiter = new SlidingWindowLimiter(30, 15 * 60 * 1000);
+
 // کلید سرور برای پروتکل احراز هویت کور Ristretto255-VOPRF (RFC 9497)
 // در صورت وجود VOPRF_SEED اختصاصی (۳۲ بایت Base64) از آن استفاده می‌شود؛ در غیاب
 // آن، مشتق HKDF از رمز مدیر با salt ثابت — نه یک SHA-256 مستقیم از رمز.
@@ -62,6 +100,12 @@ function resolveVoprfSeed(): Uint8Array {
       // fall through to HKDF derivation
     }
   }
+  // L7(c): falling back to an ADMIN_PASSWORD-derived VOPRF key. Loud
+  // warning — Render must set VOPRF_SEED (startup is NOT hard-failed,
+  // which would break the live deploy).
+  console.warn(
+    '⚠️ [Security] VOPRF_SEED is not set — the VOPRF key is derived from ADMIN_PASSWORD (admin-password compromise = VOPRF-key compromise); set VOPRF_SEED in Render env'
+  );
   return hkdf(
     sha256,
     new TextEncoder().encode(config.ADMIN_PASSWORD),
@@ -118,6 +162,13 @@ app.use(
   })
 );
 
+// L1: helmet 8 removed the permissionsPolicy option, so the header is set
+// directly. camera / microphone / geolocation / payment are all disabled.
+app.use((_req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+  next();
+});
+
 const server = http.createServer(app);
 const io = new SocketIOServer(server);
 
@@ -127,10 +178,15 @@ app.use(express.json({ limit: '5mb' }));
 // would leave req.body empty for that route.
 app.use(express.urlencoded({ extended: false }));
 
+// M7: global API budget — 300 req/min/IP on every /api/ route.
+app.use('/api/', rateLimitMiddleware(apiGlobalLimiter, (req) => getClientIp(req)));
+
 // آپلود فایل با پشتیبانی ترکیبی (Hybrid Cloud-Safe Media Storage + Disk Stream)
 // توجه: مسیر عمومی /uploads حذف شده — فایل‌ها فقط از طریق /api/media با
 // احراز هویت و بررسی عضویت در چت سرو می‌شوند (به بخش MEDIA در پایین نگاه کن).
-const uploadsDir = path.join(process.cwd(), 'public/uploads');
+// H1(b): uploads live OUTSIDE public/ (data/uploads) so the production
+// express.static(publicPath) can never serve them publicly.
+const uploadsDir = path.join(process.cwd(), 'data/uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
@@ -139,21 +195,23 @@ const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, uploadsDir),
   filename: (_req, file, cb) => cb(null, uuidv4() + path.extname(file.originalname)),
 });
-const upload = multer({ storage, limits: { fileSize: config.MAX_FILE_SIZE } });
+const upload = multer({
+  storage,
+  limits: { fileSize: config.MAX_FILE_SIZE },
+  // H1(a): extension allowlist enforced BEFORE the file is written.
+  fileFilter: (_req, file, cb) => {
+    if (!ALLOWED_UPLOAD_EXTENSIONS.has(path.extname(file.originalname).toLowerCase())) {
+      (_req as any).uploadRejected = true;
+      cb(null, false);
+    } else {
+      cb(null, true);
+    }
+  },
+});
 
-/** Do the first bytes of a file equal `magic`? Used to tell encrypted (PQF1) uploads from raw ones without trusting the client. */
-async function fileStartsWithMagic(filePath: string, magic: string): Promise<boolean> {
-  let fh: fs.promises.FileHandle | null = null;
-  try {
-    fh = await fs.promises.open(filePath, 'r');
-    const buf = Buffer.alloc(magic.length);
-    const { bytesRead } = await fh.read(buf, 0, magic.length, 0);
-    return bytesRead === magic.length && buf.toString('latin1') === magic;
-  } catch {
-    return false;
-  } finally {
-    if (fh) await fh.close().catch(() => undefined);
-  }
+/** Delete one uploaded file from the data/uploads disk store (H1(d)). */
+async function unlinkUploadFile(mediaId: string): Promise<void> {
+  await fs.promises.unlink(path.join(uploadsDir, path.basename(mediaId)));
 }
 
 // متغیرهای درون‌حافظه‌ای توکن‌های موقت
@@ -195,6 +253,45 @@ export async function removeAllUserSessions(username: string): Promise<void> {
   }
 }
 
+/**
+ * Revoke every session of a user EXCEPT the kept token (round 5, M2).
+ * Used on recovery-code reissue: revoking the current session would log
+ * the user out mid-flow and break subsequent REST calls, so it is kept.
+ */
+export async function removeAllUserSessionsExcept(
+  username: string,
+  keepToken: string
+): Promise<void> {
+  for (const [tok, sess] of Object.entries(userSessions)) {
+    if (sess.username === username && tok !== keepToken) {
+      delete userSessions[tok];
+    }
+  }
+  try {
+    await pool.query('DELETE FROM sessions WHERE username = $1 AND token <> $2', [
+      username,
+      keepToken,
+    ]);
+  } catch (e: any) {
+    console.warn('⚠️ اخطار در حذف سشن‌های دیگر کاربر از دیتابیس:', e?.message || e);
+  }
+}
+
+/** Extract the raw session token from Authorization Bearer or the cookie. */
+export function getSessionToken(req: Request): string | null {
+  const authHeader = req.headers.authorization;
+  const raw = Array.isArray(authHeader) ? authHeader[0] : authHeader;
+  if (raw && typeof raw === 'string') {
+    const match = raw.match(/^Bearer\s+(.+)$/i);
+    if (match) return match[1].trim();
+  }
+  if (req.headers.cookie) {
+    const cookies = parseCookies(req.headers.cookie);
+    if (cookies.session_token) return cookies.session_token;
+  }
+  return null;
+}
+
 export async function restoreSessionsFromDb(): Promise<void> {
   try {
     const { rows } = await pool.query('SELECT * FROM sessions');
@@ -229,24 +326,27 @@ export async function purgeExpiredSessions(): Promise<void> {
   }
 }
 
-function getSessionUsername(req: Request): string | null {
-  let token: string | null = null;
-  const authHeader = req.headers.authorization;
-  const raw = Array.isArray(authHeader) ? authHeader[0] : authHeader;
-  if (raw && typeof raw === 'string') {
-    const match = raw.match(/^Bearer\s+(.+)$/i);
-    if (match) token = match[1].trim();
-  }
-  if (!token && req.headers.cookie) {
-    const cookies = parseCookies(req.headers.cookie);
-    if (cookies.session_token) token = cookies.session_token;
-  }
+/**
+ * Resolve the session username for a request — async since round 5 (H3).
+ * A blocked user resolves to null on EVERY REST route (their token is
+ * worthless the moment the block lands), and a DB error inside the block
+ * check fails CLOSED (null) rather than letting a possibly-blocked user
+ * through. All call sites await this.
+ */
+async function getSessionUsername(req: Request): Promise<string | null> {
+  const token = getSessionToken(req);
   if (!token) return null;
   const session = userSessions[token];
   if (!session) return null;
   if (Date.now() > session.expire) {
     delete userSessions[token];
     void removeUserSession(token);
+    return null;
+  }
+  try {
+    if (await isUserBlocked(session.username)) return null;
+  } catch (e: any) {
+    console.error('❌ خطا در بررسی مسدودیت کاربر (fail-closed):', e?.message || e);
     return null;
   }
   return session.username;
@@ -264,10 +364,16 @@ async function setSetting(key: string, value: string): Promise<void> {
   );
 }
 
+/**
+ * Admin auth (round 5, H4): ONLY a valid admin session token issued by
+ * POST /api/admin/login is accepted in x-admin-token. The raw admin
+ * password no longer works as a bearer token.
+ */
 function isAdmin(req: Request): boolean {
   const headerToken = req.headers['x-admin-token'];
   const token = Array.isArray(headerToken) ? headerToken[0] : headerToken;
-  return verifyAdminSecret(token);
+  if (!token || typeof token !== 'string') return false;
+  return verifyAdminSession(token);
 }
 
 
@@ -291,17 +397,6 @@ async function isUserBlocked(username: string): Promise<boolean> {
   return false;
 }
 
-function parseMsg(m: any) {
-  return {
-    ...m,
-    reactions: typeof m.reactions === 'string' ? JSON.parse(m.reactions || '{}') : m.reactions || {},
-    is_edited: !!m.is_edited,
-    is_deleted: !!m.is_deleted,
-    is_pinned: !!m.is_pinned,
-    is_read: !!m.is_read,
-  };
-}
-
 // ===== HYBRID PERSISTENT FILE UPLOAD & MEDIA SERVING =====
 // Media E2EE: the client encrypts file bytes with the room key BEFORE upload,
 // so the server only ever sees ciphertext and stores it as-is (never decrypts).
@@ -311,19 +406,41 @@ function parseMsg(m: any) {
 // NOT encrypted. New media is both encrypted and access-controlled.
 app.post(
   '/api/upload',
-  (req: Request, res: Response, next: express.NextFunction) => {
+  async (req: Request, res: Response, next: express.NextFunction) => {
     // Auth runs BEFORE multer parses the body, so an unauthenticated upload
     // never writes a file to disk.
-    if (!getSessionUsername(req)) {
+    if (!(await getSessionUsername(req))) {
       return res.status(401).json({ ok: false, msg: 'unauthorized' });
     }
     next();
   },
+  // M7: 20 uploads / 15 min per user.
+  rateLimitMiddleware(
+    uploadLimiter,
+    async (req) => (await getSessionUsername(req)) || getClientIp(req)
+  ),
   upload.single('file'),
   async (req: Request, res: Response) => {
-    const sessionUser = getSessionUsername(req);
+    const sessionUser = await getSessionUsername(req);
     if (!sessionUser) return res.status(401).json({ ok: false, msg: 'unauthorized' });
-    if (!req.file) return res.json({ ok: false, msg: 'فایل آپلود نشد' });
+    if ((req as any).uploadRejected) {
+      return res.status(400).json({ ok: false, msg: 'نوع فایل مجاز نیست' });
+    }
+    if (!req.file) return res.status(400).json({ ok: false, msg: 'فایل آپلود نشد' });
+    // H1(a): magic-bytes validation of the written temp file. A rejected
+    // file is deleted from disk before any response is sent.
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    const uploadCheck = validateUploadFile(ext, await readFileHead(req.file.path), req.file.mimetype);
+    if (!uploadCheck.ok) {
+      // Read the reason before the await below (narrowing does not survive it).
+      const reason = uploadCheck.reason;
+      try {
+        await fs.promises.unlink(req.file.path);
+      } catch {
+        // ignore
+      }
+      return res.status(400).json({ ok: false, msg: reason });
+    }
     const kind = String((req.body as any)?.kind || '');
     const roomId = String((req.body as any)?.room_id || '');
 
@@ -352,10 +469,8 @@ app.post(
     // (PQF1 magic — must match FILE_ENCRYPTION_MAGIC in src/utils/crypto.ts),
     // never from a client claim: a raw file is stored as raw, an encrypted
     // file as encrypted. Avatars are always raw.
-    const isEncrypted =
-      kind === 'avatar' ? 0 : (await fileStartsWithMagic(req.file.path, 'PQF1')) ? 1 : 0;
+    const isEncrypted = kind === 'avatar' ? 0 : uploadCheck.isEncrypted ? 1 : 0;
 
-    const ext = path.extname(req.file.originalname).toLowerCase();
     let fileType = 'file';
     if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) fileType = 'image';
     else if (['.mp3', '.ogg', '.wav', '.webm', '.m4a'].includes(ext)) fileType = 'voice';
@@ -379,7 +494,8 @@ app.post(
         'INSERT INTO media_blobs (id, mime_type, data_base64, room_id, is_encrypted, uploaded_by, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)',
         [
           mediaId,
-          req.file.mimetype || 'application/octet-stream',
+          // H1(a): store the SERVER-VERIFIED mime, never the client claim.
+          uploadCheck.verifiedMime,
           base64Data,
           roomIdToStore,
           isEncrypted,
@@ -403,7 +519,7 @@ app.post(
 );
 
 app.get('/api/media/:id', async (req: Request, res: Response) => {
-  const sessionUser = getSessionUsername(req);
+  const sessionUser = await getSessionUsername(req);
   if (!sessionUser) return res.status(401).json({ ok: false, msg: 'unauthorized' });
   const mediaId = String(req.params.id);
   const access = await resolveMediaAccess(mediaId, sessionUser, (sql, params) =>
@@ -421,7 +537,13 @@ app.get('/api/media/:id', async (req: Request, res: Response) => {
   const encryptedHeader = access.isEncrypted ? '1' : '0';
   if (access.blob && access.blob.data_base64) {
     const buffer = Buffer.from(access.blob.data_base64, 'base64');
-    res.setHeader('Content-Type', access.blob.mime_type || 'application/octet-stream');
+    // H1(c): Content-Type is the SERVER-VERIFIED mime (a legacy stored
+    // client claim such as text/html is never served verbatim) and the
+    // file is always an attachment, never inline. In-app rendering is
+    // unaffected: the client fetches via fetch() + URL.createObjectURL
+    // and picks the element from the message's fileType.
+    res.setHeader('Content-Type', verifyStoredMime(access.blob.mime_type));
+    res.setHeader('Content-Disposition', 'attachment');
     res.setHeader('X-Media-Encrypted', encryptedHeader);
     res.setHeader('Cache-Control', 'private, max-age=3600, must-revalidate');
     return res.send(buffer);
@@ -429,6 +551,9 @@ app.get('/api/media/:id', async (req: Request, res: Response) => {
 
   const diskFile = path.join(uploadsDir, path.basename(mediaId));
   if (fs.existsSync(diskFile)) {
+    // H1(c): disk-only legacy file — mime unknown, serve as octet-stream.
+    res.setHeader('Content-Type', verifyStoredMime(access.blob ? access.blob.mime_type : null));
+    res.setHeader('Content-Disposition', 'attachment');
     res.setHeader('X-Media-Encrypted', encryptedHeader);
     res.setHeader('Cache-Control', 'private, max-age=3600, must-revalidate');
     return res.sendFile(diskFile);
@@ -443,7 +568,7 @@ app.get('/api/config', (_req: Request, res: Response) => {
 });
 
 // ===== HEALTH CHECK (Bale API + DB telemetry) =====
-app.get('/api/health', async (_req: Request, res: Response) => {
+app.get('/api/health', rateLimitMiddleware(healthLimiter, (req) => getClientIp(req)), async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
   let dbOk = true;
   try {
@@ -452,6 +577,12 @@ app.get('/api/health', async (_req: Request, res: Response) => {
     dbOk = false;
   }
   const baleStatus = bale.getBaleHealthStatus();
+  // L2: unauthenticated callers get only {ok} (the 503-on-degraded status
+  // stays); version / uptime / DB / Bale telemetry stay behind admin auth.
+  // The DB check itself stays — it is what makes health meaningful.
+  if (!isAdmin(req)) {
+    return res.status(dbOk ? 200 : 503).json({ ok: dbOk });
+  }
   return res.status(dbOk ? 200 : 503).json({
     ok: dbOk,
     version: APP_VERSION,
@@ -564,8 +695,10 @@ app.post('/api/google-login', async (req: Request, res: Response) => {
   }
   const email = verified.email;
 
+  // M3(a): a blocked account gets the SAME generic failure as invalid
+  // credentials — the block status must not leak.
   if (await isUserBlocked(email)) {
-    return res.status(403).json({ ok: false, msg: 'این حساب مسدود شده است.' });
+    return res.json({ ok: false, msg: GOOGLE_LOGIN_FAILED_MSG });
   }
 
   // گوگل خودش مالکیت ایمیل را اثبات کرده است؛ کاربر تازه اتمیک ساخته
@@ -577,7 +710,7 @@ app.post('/api/google-login', async (req: Request, res: Response) => {
 
   res.cookie('session_token', sessionToken, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
+    secure: req.secure,
     sameSite: 'lax',
     maxAge: 7 * 24 * 60 * 60 * 1000,
   });
@@ -633,8 +766,9 @@ app.post('/api/google-redirect', async (req: Request, res: Response) => {
   }
   const email = verified.email;
 
+  // M3(a): same status/message as an invalid credential — no block leak.
   if (await isUserBlocked(email)) {
-    return res.status(403).send('این حساب مسدود شده است.');
+    return res.status(403).send(GOOGLE_LOGIN_FAILED_MSG);
   }
 
   const { sessionToken, isNew, recoveryCode } = await completeGoogleSignIn(
@@ -647,7 +781,7 @@ app.post('/api/google-redirect', async (req: Request, res: Response) => {
 
   res.cookie('session_token', sessionToken, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
+    secure: req.secure,
     sameSite: 'lax',
     maxAge: 7 * 24 * 60 * 60 * 1000,
   });
@@ -710,8 +844,9 @@ app.post('/api/recover', async (req: Request, res: Response) => {
     return res.status(401).json({ ok: false, msg: 'آیدی یا کد بازیابی نامعتبر است.' });
   }
 
+  // M3(a): same generic 401 as an invalid code — no block leak.
   if (await isUserBlocked(key)) {
-    return res.status(403).json({ ok: false, msg: 'این حساب مسدود شده است.' });
+    return res.status(401).json({ ok: false, msg: 'آیدی یا کد بازیابی نامعتبر است.' });
   }
 
   const valid = await verifyRecoveryCode(code, user.recovery_code_hash);
@@ -724,13 +859,17 @@ app.post('/api/recover', async (req: Request, res: Response) => {
   const nextHash = await hashRecoveryCode(nextRecoveryCode);
   await pool.query('UPDATE users SET recovery_code_hash=$1 WHERE username=$2', [nextHash, key]);
 
+  // M2: a recovery means the old credentials may be compromised — revoke
+  // ALL existing sessions BEFORE issuing the new one.
+  await removeAllUserSessions(key);
+
   const sessionToken = uuidv4();
   const sessionExpire = Date.now() + 7 * 24 * 60 * 60 * 1000;
   await saveUserSession(sessionToken, key, sessionExpire);
 
   res.cookie('session_token', sessionToken, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
+    secure: req.secure,
     sameSite: 'lax',
     maxAge: 7 * 24 * 60 * 60 * 1000,
   });
@@ -746,6 +885,14 @@ app.post('/api/recover', async (req: Request, res: Response) => {
 app.post('/api/quick-login', (_req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
   return res.status(403).json({ ok: false, msg: 'ورود سریع تستی غیرفعال شده است' });
+});
+
+// M2: logout — revoke the token (Bearer or cookie) and clear the cookie.
+app.post('/api/logout', async (req: Request, res: Response) => {
+  const token = getSessionToken(req);
+  if (token) await removeUserSession(token);
+  res.clearCookie('session_token', { httpOnly: true, sameSite: 'lax' });
+  res.json({ ok: true });
 });
 
 // ===== RISTRETTO255-VOPRF BLINDED IDENTITY EVALUATION (RFC 9497) =====
@@ -778,7 +925,7 @@ app.post('/api/voprf/evaluate', (req: Request, res: Response) => {
 });
 
 // ===== USER & HYBRID POST-QUANTUM PUBLIC KEY DIRECTORY =====
-app.get('/api/user/:username', async (req: Request, res: Response) => {
+app.get('/api/user/:username', rateLimitMiddleware(userLookupLimiter, (req) => getClientIp(req)), async (req: Request, res: Response) => {
   const { rows } = await pool.query(
     'SELECT username, display_name, avatar, bio, status, public_key FROM users WHERE username = $1',
     [req.params.username]
@@ -803,7 +950,7 @@ app.post('/api/user/public-key', async (req: Request, res: Response) => {
   }
   // فقط کاربر احراز هویت شده با نشست معتبر امکان ثبت و تغییر باندل را دارد؛
   // در غیر این صورت هر کسی می‌توانست باندل هر کاربری را جایگزین کند.
-  const sessionUser = getSessionUsername(req);
+  const sessionUser = await getSessionUsername(req);
   if (!sessionUser || sessionUser !== username) {
     return res.status(401).json({ ok: false, msg: 'unauthorized' });
   }
@@ -820,11 +967,16 @@ app.post('/api/user/public-key', async (req: Request, res: Response) => {
 
 // صدور مجدد کد بازیابی برای کاربر احراز هویت شده
 app.post(['/api/auth/reissue-recovery-code', '/api/reissue-recovery-code'], async (req: Request, res: Response) => {
-  const sessionUser = getSessionUsername(req);
+  const sessionUser = await getSessionUsername(req);
   if (!sessionUser) return res.status(401).json({ ok: false, msg: 'unauthorized' });
   const newCode = generateRecoveryCode();
   const hash = await hashRecoveryCode(newCode);
   await pool.query('UPDATE users SET recovery_code_hash = $1 WHERE username = $2', [hash, sessionUser]);
+  // M2: revoke all OTHER sessions for this user, but KEEP the current one
+  // — revoking it would log the user out mid-flow and break subsequent
+  // REST calls.
+  const currentToken = getSessionToken(req);
+  if (currentToken) await removeAllUserSessionsExcept(sessionUser, currentToken);
   res.json({ ok: true, recoveryCode: newCode });
 });
 
@@ -833,7 +985,7 @@ app.post(['/api/auth/reissue-recovery-code', '/api/reissue-recovery-code'], asyn
 // ML-KEM-768 به هر عضو کپسوله می‌کند؛ سرور فقط کپسول‌ها را نگه می‌دارد و
 // جابه‌جا می‌کند و کلید را نمی‌بیند.
 app.post('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
-  const sessionUser = getSessionUsername(req);
+  const sessionUser = await getSessionUsername(req);
   if (!sessionUser) return res.status(401).json({ ok: false });
   const { epoch, keys, sig } = req.body as { epoch?: unknown; keys?: unknown; sig?: unknown };
   if (typeof epoch !== 'number' || !Number.isSafeInteger(epoch) || epoch < 1 || epoch > Number.MAX_SAFE_INTEGER) {
@@ -852,9 +1004,13 @@ app.post('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
     }
   }
   const { rows } = await pool.query('SELECT * FROM groups WHERE id = $1', [req.params.id]);
-  if (!rows.length) return res.json({ ok: false, msg: 'group not found' });
-  const members: string[] = JSON.parse(rows[0].members);
-  if (!members.includes(sessionUser)) return res.status(403).json({ ok: false });
+  // M3(b): 'group not found' and 'not a member' return the identical
+  // {ok:false} shape — no oracle.
+  if (!rows.length) return res.json({ ok: false });
+  // L7(e): a corrupt members row fails closed with the generic shape.
+  const members = safeParseMembers(rows[0].members);
+  if (!members) return res.json({ ok: false });
+  if (!members.includes(sessionUser)) return res.json({ ok: false });
   // H2: انحصار چرخش اپوک به توزیع‌کننده گروه (عضو اول)
   if (members[0] !== sessionUser) {
     return res.status(403).json({ ok: false, msg: 'only group distributor can post epoch packets' });
@@ -920,12 +1076,14 @@ app.post('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
 });
 
 app.get('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
-  const sessionUser = getSessionUsername(req);
+  const sessionUser = await getSessionUsername(req);
   if (!sessionUser) return res.status(401).json({ ok: false });
   const { rows } = await pool.query('SELECT * FROM groups WHERE id = $1', [req.params.id]);
   if (!rows.length) return res.json({ ok: false });
-  const members: string[] = JSON.parse(rows[0].members);
-  if (!members.includes(sessionUser)) return res.status(403).json({ ok: false });
+  // L7(e): a corrupt members row fails closed with the generic shape.
+  const members = safeParseMembers(rows[0].members);
+  if (!members) return res.json({ ok: false });
+  if (!members.includes(sessionUser)) return res.json({ ok: false });
   const raw = await getSetting(`group_epoch_packet_${req.params.id}`);
   if (!raw) return res.json({ ok: false });
   try {
@@ -936,7 +1094,7 @@ app.get('/api/group/:id/epoch-packet', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/api/user/update', async (req: Request, res: Response) => {
+app.post('/api/user/update', rateLimitMiddleware(userUpdateLimiter, async (req) => (await getSessionUsername(req)) || getClientIp(req)), async (req: Request, res: Response) => {
   // A user may only update their OWN profile: without this check anyone
   // could overwrite any user's bio, status and avatar by posting a username.
   // The display name is editable here too; a value that actually differs
@@ -944,9 +1102,17 @@ app.post('/api/user/update', async (req: Request, res: Response) => {
   // logins stop overwriting that field (a save that changes nothing
   // leaves the flags — and future Google sync — untouched).
   const { username, bio, status, avatar, display_name } = req.body || {};
-  const access = checkOwnUsername(getSessionUsername(req), String(username ?? ''));
+  const access = checkOwnUsername(await getSessionUsername(req), String(username ?? ''));
   if (access !== 'ok') {
     return res.status(403).json({ ok: false, msg: 'unauthorized' });
+  }
+  // M7: length caps (bio ≤1000, status ≤100). The avatar allowlist is
+  // enforced inside resolveProfileUpdate (single enforcement point, L7a).
+  if (typeof bio === 'string' && bio.length > 1000) {
+    return res.status(400).json({ ok: false, msg: 'bio too long' });
+  }
+  if (typeof status === 'string' && status.length > 100) {
+    return res.status(400).json({ ok: false, msg: 'status too long' });
   }
   const { rows } = await pool.query(
     'SELECT display_name, avatar, name_custom, avatar_custom FROM users WHERE username = $1',
@@ -971,11 +1137,11 @@ app.post('/api/user/update', async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
-app.post('/api/add-contact', async (req: Request, res: Response) => {
+app.post('/api/add-contact', rateLimitMiddleware(addContactLimiter, async (req) => (await getSessionUsername(req)) || getClientIp(req)), async (req: Request, res: Response) => {
   // A user may only add contacts to their OWN list — otherwise anyone could
   // insert contact rows for any account (and harvest public keys in return).
   const { myUsername, contactUsername } = req.body || {};
-  const access = checkOwnUsername(getSessionUsername(req), String(myUsername ?? ''));
+  const access = checkOwnUsername(await getSessionUsername(req), String(myUsername ?? ''));
   if (access !== 'ok') {
     return res.status(403).json({ ok: false, msg: 'unauthorized' });
   }
@@ -994,7 +1160,7 @@ app.post('/api/add-contact', async (req: Request, res: Response) => {
 app.get('/api/contacts/:username', async (req: Request, res: Response) => {
   // A user may only list their OWN contacts: without this check anyone could
   // enumerate any user's contact list with public keys, statuses and online state.
-  const access = checkOwnUsername(getSessionUsername(req), String(req.params.username));
+  const access = checkOwnUsername(await getSessionUsername(req), String(req.params.username));
   if (access !== 'ok') {
     return res.status(403).json({ ok: false, msg: 'unauthorized' });
   }
@@ -1022,7 +1188,7 @@ app.get('/api/contacts/:username', async (req: Request, res: Response) => {
 // so the response never leaks whether a room exists. Content stays E2EE.
 app.get('/api/messages/:roomId', async (req: Request, res: Response) => {
   const roomId = String(req.params.roomId);
-  const access = await checkRoomReadAccess(getSessionUsername(req), roomId, (sql, params) =>
+  const access = await checkRoomReadAccess(await getSessionUsername(req), roomId, (sql, params) =>
     pool.query(sql, params)
   );
   if (access !== 'ok') {
@@ -1038,7 +1204,7 @@ app.get('/api/messages/:roomId', async (req: Request, res: Response) => {
 app.get('/api/groups/:username', async (req: Request, res: Response) => {
   // A user may only list their own groups: the session username must equal
   // the username in the URL, otherwise anyone could enumerate anyone's groups.
-  const access = checkOwnGroupsAccess(getSessionUsername(req), String(req.params.username));
+  const access = checkOwnGroupsAccess(await getSessionUsername(req), String(req.params.username));
   if (access !== 'ok') {
     return res.status(403).json({ ok: false, msg: 'unauthorized' });
   }
@@ -1052,30 +1218,58 @@ app.get('/api/groups/:username', async (req: Request, res: Response) => {
       return false;
     }
   });
+  // M7: limit/offset pagination over the filtered result (default 50,
+  // max 100). No Postgres-only LIKE query — the fallback DB answers only
+  // its known SQL shapes, so filtering stays in JS.
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 100);
+  const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
+  const page = myGroups.slice(offset, offset + limit);
   res.json({
     ok: true,
-    groups: myGroups.map((g: any) => ({
+    total: myGroups.length,
+    limit,
+    offset,
+    groups: page.map((g: any) => ({
       ...g,
       epoch: Number(g.epoch) || 1,
-      members: JSON.parse(g.members),
+      members: safeParseMembers(g.members) ?? [],
     })),
   });
 });
 
 // ===== REPORT =====
-app.post('/api/report', async (req: Request, res: Response) => {
-  const { reporter, reportedUser, messageId, messageText, reason } = req.body;
-  await pool.query(
-    'INSERT INTO reports (id, reporter, reported_user, message_id, message_text, reason, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)',
-    [uuidv4(), reporter, reportedUser, messageId || null, messageText || null, reason, new Date().toISOString()]
-  );
-  res.json({ ok: true });
-});
+// M4: requires a session; reporter is FORCED to the session user (the
+// client-sent reporter is ignored); field lengths are capped; 10/15min
+// per user. The client sends the Authorization header.
+app.post(
+  '/api/report',
+  rateLimitMiddleware(
+    reportLimiter,
+    async (req) => (await getSessionUsername(req)) || getClientIp(req)
+  ),
+  async (req: Request, res: Response) => {
+    const sessionUser = await getSessionUsername(req);
+    if (!sessionUser) return res.status(401).json({ ok: false, msg: 'unauthorized' });
+    const { reportedUser, messageId, messageText, reason } = req.body || {};
+    const reported = String(reportedUser || '').slice(0, 256);
+    const mid = String(messageId || '').slice(0, 256) || null;
+    const mtext = String(messageText || '').slice(0, 2000) || null;
+    const rsn = String(reason || '').slice(0, 500);
+    if (!reported || !rsn) {
+      return res.status(400).json({ ok: false, msg: 'reportedUser and reason are required' });
+    }
+    await pool.query(
+      'INSERT INTO reports (id, reporter, reported_user, message_id, message_text, reason, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [uuidv4(), sessionUser, reported, mid, mtext, rsn, new Date().toISOString()]
+    );
+    res.json({ ok: true });
+  }
+);
 
 // ===== ACCOUNT DATA EXPORT & ERASURE (DATA RIGHTS) =====
 app.get('/api/account/export', async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
-  const username = getSessionUsername(req);
+  const username = await getSessionUsername(req);
   if (!username) return res.status(401).json({ ok: false });
 
   const { rows: userRows } = await pool.query(
@@ -1103,7 +1297,7 @@ app.get('/api/account/export', async (req: Request, res: Response) => {
 
 app.post('/api/account/delete', async (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, max-age=0, must-revalidate');
-  const username = getSessionUsername(req);
+  const username = await getSessionUsername(req);
   if (!username) return res.status(401).json({ ok: false, msg: 'ابتدا وارد حساب کاربری شوید.' });
 
   // Deletion is confirmed with the one-time recovery code (the Bale OTP
@@ -1121,9 +1315,36 @@ app.post('/api/account/delete', async (req: Request, res: Response) => {
     return res.status(403).json({ ok: false, msg: 'کد بازیابی نامعتبر است.' });
   }
 
+  // H1(d): collect the user's media FIRST (own blobs + media linked from
+  // their messages), then delete messages, then drop each blob only if no
+  // remaining non-deleted message references it (forwards copy file_url).
+  const ownBlobs = await pool.query('SELECT * FROM media_blobs WHERE uploaded_by = $1', [username]);
+  const ownMsgFiles = await pool.query('SELECT file_url FROM messages WHERE sender = $1', [username]);
+  const mediaIds = new Set<string>();
+  for (const b of ownBlobs.rows as any[]) mediaIds.add(String(b.id));
+  for (const m of ownMsgFiles.rows as any[]) {
+    const mid = extractMediaId(m.file_url);
+    if (mid) mediaIds.add(mid);
+  }
+
   await pool.query('DELETE FROM messages WHERE sender = $1', [username]);
   await pool.query('DELETE FROM contacts WHERE username = $1 OR contact = $1', [username]);
+  // H1(d): group memberships (no ghost member strings) and reports.
+  const { rows: allGroups } = await pool.query('SELECT * FROM groups');
+  for (const g of allGroups as any[]) {
+    const members = safeParseMembers(g.members);
+    if (members && members.includes(username)) {
+      await pool.query('UPDATE groups SET members = $1 WHERE id = $2', [
+        JSON.stringify(members.filter((m: string) => m !== username)),
+        g.id,
+      ]);
+    }
+  }
+  await pool.query('DELETE FROM reports WHERE reporter = $1 OR reported_user = $1', [username]);
   await pool.query('DELETE FROM users WHERE username = $1', [username]);
+  for (const mid of mediaIds) {
+    await deleteMediaIfUnreferenced(mid, (sql, params) => pool.query(sql, params), unlinkUploadFile);
+  }
 
   await removeAllUserSessions(username);
 
@@ -1145,18 +1366,17 @@ app.get('/api/settings/mode', async (req: Request, res: Response) => {
     return res.status(200).json({ ok: true, mode, msg });
   }
 
-  const rawSessionUser = req.headers['x-session-user'];
-  const sessionUser = (Array.isArray(rawSessionUser) ? rawSessionUser[0] : rawSessionUser || '')
-    .trim()
-    .toLowerCase();
-
+  // M3: a valid session proves the user — no spoofable X-Session-User
+  // header, no 401-vs-200 existence oracle. Info: the 401 uses the
+  // consistent JSON shape {ok:false, error:'unauthorized'}, not an empty body.
+  const sessionUser = await getSessionUsername(req);
   if (!sessionUser) {
-    return res.status(401).end();
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
   }
 
   const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [sessionUser]);
   if (!rows.length) {
-    return res.status(401).end();
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
   }
 
   const mode = (await getSetting('server_mode')) || 'normal';
@@ -1169,8 +1389,28 @@ app.get('/api/settings/mode', async (req: Request, res: Response) => {
 });
 
 // ===== ADMIN =====
+// H4: rate-limited + lockout (5 failures / 15 min / IP, exponential
+// backoff). Success issues a 30-minute admin session token; the password
+// itself is never returned and never works as a bearer token again.
 app.post('/api/admin/login', (req: Request, res: Response) => {
-  res.json({ ok: verifyAdminSecret(req.body.password) });
+  const clientIp = getClientIp(req);
+  const now = Date.now();
+  const lock = adminLoginLimiter.check(clientIp, now);
+  if (!lock.allowed) {
+    res.setHeader('Retry-After', String(lock.retryAfterSec));
+    return res
+      .status(429)
+      .json({ ok: false, msg: 'تلاش‌های ناموفق زیاد است؛ چند دقیقه دیگر تلاش کنید' });
+  }
+  if (!verifyAdminSecret((req.body || {}).password)) {
+    adminLoginLimiter.recordFailure(clientIp, now);
+    // Log the attempt (IP + time) — NEVER the password.
+    console.warn(`[Admin] failed admin login from ${clientIp} at ${new Date(now).toISOString()}`);
+    return res.json({ ok: false });
+  }
+  adminLoginLimiter.recordSuccess(clientIp);
+  const { token: adminToken } = issueAdminSession(now);
+  res.json({ ok: true, adminToken });
 });
 
 app.get('/api/admin/users', async (req: Request, res: Response) => {
@@ -1194,11 +1434,26 @@ app.post('/api/admin/report-action', async (req: Request, res: Response) => {
 
 app.post('/api/admin/block', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
-  const { username, reason, blockType, blockUntil } = req.body;
+  const { username, reason, blockType, blockUntil } = req.body || {};
+  // L7(f): validate blockType / blockUntil (admin-only, but garbage must
+  // not land in the row).
+  if (blockType !== undefined && blockType !== 'permanent' && blockType !== 'temporary') {
+    return res.status(400).json({ ok: false, msg: 'invalid blockType' });
+  }
+  if (blockUntil) {
+    const parsedUntil = new Date(blockUntil);
+    if (Number.isNaN(parsedUntil.getTime())) {
+      return res.status(400).json({ ok: false, msg: 'invalid blockUntil' });
+    }
+  }
   await pool.query(
     'UPDATE users SET is_blocked=1, block_reason=$1, block_type=$2, block_until=$3 WHERE username=$4',
     [reason || '', blockType || 'permanent', blockUntil || null, username]
   );
+
+  // H3: blocking revokes every session immediately (the block check inside
+  // getSessionUsername is the second layer for tokens issued afterwards).
+  await removeAllUserSessions(username);
 
   const { rows } = await pool.query('SELECT bale_chat_id FROM users WHERE username = $1', [username]);
   const user = rows[0];
@@ -1252,22 +1507,39 @@ app.post('/api/admin/kick', (req: Request, res: Response) => {
 
 app.delete('/api/admin/message', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
-  const { roomId, msgId } = req.body;
+  const { roomId, msgId } = req.body || {};
+  const { rows } = await pool.query('SELECT * FROM messages WHERE id=$1', [msgId]);
   await pool.query('UPDATE messages SET is_deleted=1 WHERE id=$1', [msgId]);
-  io.emit('msg-deleted', { roomId, msgId });
+  // H1(d): drop the media when no remaining non-deleted message uses it.
+  if (rows.length && rows[0].file_url) {
+    const mid = extractMediaId(rows[0].file_url);
+    if (mid) await deleteMediaIfUnreferenced(mid, (sql, params) => pool.query(sql, params), unlinkUploadFile);
+  }
+  // M5: msg-deleted goes to room members only, not every socket.
+  await emitToRoom(io, roomId, 'msg-deleted', { roomId, msgId }, (sql, params) =>
+    pool.query(sql, params)
+  );
   res.json({ ok: true });
 });
 
-app.post('/api/create-group', async (req: Request, res: Response) => {
+app.post('/api/create-group', rateLimitMiddleware(createGroupLimiter, async (req) => (await getSessionUsername(req)) || getClientIp(req)), async (req: Request, res: Response) => {
   const { name, members, creator } = req.body;
   if (!name || !name.trim()) return res.json({ ok: false, msg: 'نام گروه را وارد کنید' });
+  if (name.trim().length > 100) return res.status(400).json({ ok: false, msg: 'نام گروه بیش از حد طولانی است' });
   // ایجاد گروه صرفاً با شناسه کاربری معتبر انجام می‌شود.
-  const sessionUser = getSessionUsername(req);
+  const sessionUser = await getSessionUsername(req);
   if (!sessionUser || sessionUser !== creator) {
     return res.status(401).json({ ok: false });
   }
   const memberList = Array.isArray(members) ? members : [];
-  const allMembers = Array.from(new Set([creator, ...memberList].filter(Boolean)));
+  // M7: max 100 members total; every member must exist as a user.
+  const { rows: allUsers } = await pool.query('SELECT username FROM users');
+  const existingUsers = new Set((allUsers as any[]).map((u) => u.username));
+  const validMembers = memberList.filter((m: any) => typeof m === 'string' && existingUsers.has(m));
+  const allMembers = Array.from(new Set([creator, ...validMembers].filter(Boolean)));
+  if (allMembers.length > 100) {
+    return res.status(400).json({ ok: false, msg: 'تعداد اعضای گروه بیش از حد مجاز است' });
+  }
   const groupId = uuidv4();
   await pool.query('INSERT INTO groups (id, name, members, created_at) VALUES ($1,$2,$3,$4)', [
     groupId,
@@ -1290,16 +1562,27 @@ app.post('/api/create-group', async (req: Request, res: Response) => {
 
 app.post('/api/admin/create-group', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
-  const { name, members } = req.body;
+  const { name, members } = req.body || {};
+  if (!name || typeof name !== 'string' || !name.trim() || name.trim().length > 100) {
+    return res.status(400).json({ ok: false, msg: 'invalid group name' });
+  }
+  const memberList = Array.isArray(members) ? members.filter((m: any) => typeof m === 'string') : [];
+  // M7: max 100 members; every member must exist as a user.
+  const { rows: allUsers } = await pool.query('SELECT username FROM users');
+  const existingUsers = new Set((allUsers as any[]).map((u) => u.username));
+  const validMembers = Array.from(new Set(memberList.filter((m: string) => existingUsers.has(m))));
+  if (validMembers.length > 100) {
+    return res.status(400).json({ ok: false, msg: 'too many members' });
+  }
   const groupId = uuidv4();
   await pool.query('INSERT INTO groups (id, name, members, created_at) VALUES ($1,$2,$3,$4)', [
     groupId,
-    name,
-    JSON.stringify(members),
+    name.trim(),
+    JSON.stringify(validMembers),
     new Date().toISOString(),
   ]);
-  (members as string[]).forEach(m => {
-    presence.emitToUser(io, m, 'new-group', { id: groupId, name, members, epoch: 1 });
+  validMembers.forEach(m => {
+    presence.emitToUser(io, m, 'new-group', { id: groupId, name: name.trim(), members: validMembers, epoch: 1 });
   });
   res.json({ ok: true, groupId });
 });
@@ -1310,7 +1593,9 @@ app.post('/api/admin/add-to-group', async (req: Request, res: Response) => {
   const { rows } = await pool.query('SELECT * FROM groups WHERE id = $1', [groupId]);
   if (!rows.length) return res.json({ ok: false, msg: 'گروه یافت نشد' });
   const group = rows[0];
-  const members: string[] = JSON.parse(group.members);
+  // L7(e): a corrupt members row fails closed instead of throwing.
+  const members = safeParseMembers(group.members);
+  if (!members) return res.json({ ok: false, msg: 'گروه یافت نشد' });
   if (!members.includes(username)) members.push(username);
   const newEpoch = (Number(group.epoch) || 1) + 1;
   await pool.query('UPDATE groups SET members = $1, epoch = $2 WHERE id = $3', [
@@ -1338,7 +1623,7 @@ app.post('/api/admin/add-to-group', async (req: Request, res: Response) => {
 
 // اضافه کردن عضو جدید به گروه پس از ساخت توسط توزیع‌کننده (M6)
 app.post('/api/group/:id/add-member', async (req: Request, res: Response) => {
-  const sessionUser = getSessionUsername(req);
+  const sessionUser = await getSessionUsername(req);
   if (!sessionUser) return res.status(401).json({ ok: false, msg: 'unauthorized' });
   const { username } = req.body;
   if (!username || typeof username !== 'string') return res.status(400).json({ ok: false, msg: 'invalid username' });
@@ -1346,7 +1631,9 @@ app.post('/api/group/:id/add-member', async (req: Request, res: Response) => {
   const { rows } = await pool.query('SELECT * FROM groups WHERE id = $1', [req.params.id]);
   if (!rows.length) return res.json({ ok: false, msg: 'group not found' });
   const group = rows[0];
-  const members: string[] = JSON.parse(group.members);
+  // L7(e): a corrupt members row fails closed instead of throwing.
+  const members = safeParseMembers(group.members);
+  if (!members) return res.json({ ok: false, msg: 'گروه یافت نشد' });
   if (members[0] !== sessionUser) return res.status(403).json({ ok: false, msg: 'only distributor can add members' });
   if (members.includes(cleanUser)) return res.json({ ok: true, msg: 'already member', members, epoch: group.epoch });
   members.push(cleanUser);
@@ -1375,7 +1662,7 @@ app.post('/api/group/:id/add-member', async (req: Request, res: Response) => {
 
 // حذف عضو از گروه پس از ساخت توسط توزیع‌کننده (M6)
 app.post('/api/group/:id/remove-member', async (req: Request, res: Response) => {
-  const sessionUser = getSessionUsername(req);
+  const sessionUser = await getSessionUsername(req);
   if (!sessionUser) return res.status(401).json({ ok: false, msg: 'unauthorized' });
   const { username } = req.body;
   if (!username || typeof username !== 'string') return res.status(400).json({ ok: false, msg: 'invalid username' });
@@ -1383,7 +1670,9 @@ app.post('/api/group/:id/remove-member', async (req: Request, res: Response) => 
   const { rows } = await pool.query('SELECT * FROM groups WHERE id = $1', [req.params.id]);
   if (!rows.length) return res.json({ ok: false, msg: 'group not found' });
   const group = rows[0];
-  const members: string[] = JSON.parse(group.members);
+  // L7(e): a corrupt members row fails closed instead of throwing.
+  const members = safeParseMembers(group.members);
+  if (!members) return res.json({ ok: false, msg: 'گروه یافت نشد' });
   if (members[0] !== sessionUser) return res.status(403).json({ ok: false, msg: 'only distributor can remove members' });
   if (cleanUser === sessionUser) return res.status(400).json({ ok: false, msg: 'cannot remove distributor' });
   const idx = members.indexOf(cleanUser);
@@ -1412,7 +1701,7 @@ app.get('/api/admin/groups', async (req: Request, res: Response) => {
   const { rows } = await pool.query('SELECT * FROM groups');
   res.json({
     ok: true,
-    groups: rows.map((g: any) => ({ ...g, epoch: Number(g.epoch) || 1, members: JSON.parse(g.members) })),
+    groups: rows.map((g: any) => ({ ...g, epoch: Number(g.epoch) || 1, members: safeParseMembers(g.members) ?? [] })),
   });
 });
 
@@ -1478,7 +1767,11 @@ app.post('/api/admin/announce', async (req: Request, res: Response) => {
 
 app.post('/api/admin/set-mode', async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ ok: false });
-  const { mode, msg } = req.body;
+  const { mode, msg } = req.body || {};
+  // L7(f): mode must be one of the two known values.
+  if (mode !== 'normal' && mode !== 'maintenance') {
+    return res.status(400).json({ ok: false, msg: 'invalid mode' });
+  }
   await setSetting('server_mode', mode);
   if (msg) await setSetting('maintenance_msg', msg);
   if (mode === 'maintenance') io.emit('server-maintenance', { msg: msg || (await getSetting('maintenance_msg')) });
@@ -1513,9 +1806,9 @@ app.get('/api/admin-login-as/:token', async (req: Request, res: Response) => {
 
   if (!data || Date.now() > data.expire) {
     if (data) delete adminTokens[token];
-    return res.send(
-      `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><title>لینک منقضی</title><link rel="stylesheet" href="/css/error.css"/></head><body><main><div class="error-icon" aria-hidden="true">⏱️</div><h1>لینک منقضی شده</h1><p>این لینک دیگر معتبر نیست.</p></main></body></html>`
-    );
+    // Info: a bogus/expired link is a 404 with the consistent JSON shape,
+    // not a 200 HTML page.
+    return res.status(404).json({ ok: false, error: 'Not Found' });
   }
 
   const { rows } = await pool.query('SELECT username FROM users WHERE username = $1', [data.username]);
@@ -1538,10 +1831,16 @@ app.get(config.ADMIN_PATH, (_req: Request, res: Response) => {
   res.sendFile(path.join(process.cwd(), 'public', 'admin.html'));
 });
 
-app.get('/robots.txt', (req: Request, res: Response) => {
-  const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'https';
-  const host = req.get('host') || 'localhost:3000';
-  const baseUrl = `${proto.split(',')[0].trim()}://${host}`;
+app.get('/favicon.ico', (_req: Request, res: Response) => {
+  // Info: no favicon file exists in public/ — answer 204, not the 404 page.
+  return res.status(204).end();
+});
+
+// L7(d): a FIXED canonical host — never reflect req host / x-forwarded-proto.
+const CANONICAL_HOST = 'https://chatapp-server-1i2a.onrender.com';
+
+app.get('/robots.txt', (_req: Request, res: Response) => {
+  const baseUrl = CANONICAL_HOST;
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.setHeader('Cache-Control', 'public, max-age=3600');
   res.send(
@@ -1560,10 +1859,8 @@ app.get('/robots.txt', (req: Request, res: Response) => {
   );
 });
 
-app.get('/sitemap.xml', (req: Request, res: Response) => {
-  const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'https';
-  const host = req.get('host') || 'localhost:3000';
-  const baseUrl = `${proto.split(',')[0].trim()}://${host}`;
+app.get('/sitemap.xml', (_req: Request, res: Response) => {
+  const baseUrl = CANONICAL_HOST;
   res.setHeader('Content-Type', 'application/xml; charset=utf-8');
   res.setHeader('Cache-Control', 'public, max-age=3600');
   res.send(
@@ -1590,6 +1887,21 @@ app.get('/privacy', (_req: Request, res: Response) => {
 // ===== SOCKET.IO =====
 io.on('connection', async (socket) => {
   let currentUser: string | null = null;
+
+  // M7: per-connection event throttle — max 30 events/sec; excess events
+  // are dropped, never disconnecting the socket.
+  let socketEventCount = 0;
+  let socketEventWindowStart = Date.now();
+  socket.use((_packet: any, next: (err?: Error) => void) => {
+    const now = Date.now();
+    if (now - socketEventWindowStart >= 1000) {
+      socketEventWindowStart = now;
+      socketEventCount = 0;
+    }
+    socketEventCount += 1;
+    if (socketEventCount > 30) return; // drop silently
+    next();
+  });
 
   try {
     const mode = await getSetting('server_mode');
@@ -1640,6 +1952,8 @@ io.on('connection', async (socket) => {
   socket.on('send-message', async (data: any) => {
     if (!currentUser) return;
     const { to, text, fileUrl, fileType, replyToId, replyToText, isGroup, disappearAfter } = data;
+    // M7: message text cap (never truncate — the text is E2EE ciphertext).
+    if (typeof text === 'string' && text.length > 50000) return;
     const roomId = isGroup ? `group__${to}` : getRoomId(currentUser, to);
 
     if (!isGroup) {
@@ -1648,9 +1962,16 @@ io.on('connection', async (socket) => {
         to,
       ]);
       if (!rows.length) return;
+    } else {
+      // H2: group send requires membership (previously only the DM branch
+      // checked anything, so any authenticated user could post to any group).
+      if (!(await isRoomMember(currentUser, roomId, (sql, params) => pool.query(sql, params)))) return;
     }
 
-    const disappearAt = disappearAfter ? new Date(Date.now() + disappearAfter * 1000).toISOString() : null;
+    // M7: disappearAfter clamped to [0, 604800]s (7 days) — huge values
+    // used to overflow setTimeout and delete the message immediately.
+    const disappearSecs = Math.min(Math.max(Number(disappearAfter) || 0, 0), 604800);
+    const disappearAt = disappearSecs > 0 ? new Date(Date.now() + disappearSecs * 1000).toISOString() : null;
 
     const msg = {
       id: uuidv4(),
@@ -1697,8 +2018,9 @@ io.on('connection', async (socket) => {
 
     if (isGroup) {
       const { rows } = await pool.query('SELECT members FROM groups WHERE id=$1', [to]);
-      if (rows.length) {
-        JSON.parse(rows[0].members).forEach((m: string) => {
+      const members = rows.length ? safeParseMembers(rows[0].members) : null;
+      if (members) {
+        members.forEach((m: string) => {
           presence.emitToUser(io, m, 'new-message', { roomId, msg: parsedMsg });
         });
       }
@@ -1710,17 +2032,29 @@ io.on('connection', async (socket) => {
     if (disappearAt) {
       setTimeout(async () => {
         await pool.query('UPDATE messages SET is_deleted=1 WHERE id=$1', [msg.id]);
-        io.emit('msg-deleted', { roomId, msgId: msg.id });
-      }, disappearAfter * 1000);
+        if (msg.file_url) {
+          const mid = extractMediaId(msg.file_url);
+          if (mid) {
+            await deleteMediaIfUnreferenced(mid, (sql, params) => pool.query(sql, params), unlinkUploadFile);
+          }
+        }
+        await emitToRoom(io, roomId, 'msg-deleted', { roomId, msgId: msg.id }, (sql, params) =>
+          pool.query(sql, params)
+        );
+      }, disappearSecs * 1000);
     }
   });
 
   socket.on('edit-message', async ({ msgId, newText, roomId }: any) => {
     if (!currentUser) return;
+    // M7: text cap (never truncate E2EE ciphertext).
+    if (typeof newText !== 'string' || newText.length > 50000) return;
     const { rows } = await pool.query('SELECT * FROM messages WHERE id=$1 AND sender=$2', [msgId, currentUser]);
     if (!rows.length) return;
     await pool.query('UPDATE messages SET text=$1, is_edited=1 WHERE id=$2', [newText, msgId]);
-    io.emit('msg-edited', { roomId, msgId, newText });
+    await emitToRoom(io, roomId, 'msg-edited', { roomId, msgId, newText }, (sql, params) =>
+      pool.query(sql, params)
+    );
   });
 
   socket.on('delete-message', async ({ msgId, roomId }: any) => {
@@ -1728,31 +2062,54 @@ io.on('connection', async (socket) => {
     const { rows } = await pool.query('SELECT * FROM messages WHERE id=$1 AND sender=$2', [msgId, currentUser]);
     if (!rows.length) return;
     await pool.query('UPDATE messages SET is_deleted=1 WHERE id=$1', [msgId]);
-    io.emit('msg-deleted', { roomId, msgId });
+    // H1(d): drop the media when no remaining non-deleted message uses it.
+    if (rows[0].file_url) {
+      const mid = extractMediaId(rows[0].file_url);
+      if (mid) await deleteMediaIfUnreferenced(mid, (sql, params) => pool.query(sql, params), unlinkUploadFile);
+    }
+    await emitToRoom(io, roomId, 'msg-deleted', { roomId, msgId }, (sql, params) =>
+      pool.query(sql, params)
+    );
   });
 
   socket.on('pin-message', async ({ msgId, roomId }: any) => {
     if (!currentUser) return;
+    // H2: the message must belong to the room and the sender must be a member.
+    if (!(await canActOnMessage(currentUser, msgId, roomId, (sql, params) => pool.query(sql, params)))) return;
     await pool.query('UPDATE messages SET is_pinned=0 WHERE room_id=$1', [roomId]);
     await pool.query('UPDATE messages SET is_pinned=1 WHERE id=$1', [msgId]);
-    io.emit('msg-pinned', { roomId, msgId });
+    await emitToRoom(io, roomId, 'msg-pinned', { roomId, msgId }, (sql, params) =>
+      pool.query(sql, params)
+    );
   });
 
   socket.on('unpin-message', async ({ msgId, roomId }: any) => {
     if (!currentUser) return;
+    // H2: same membership rule as pin — by message, or by room when only
+    // a room id is given.
     if (msgId) {
+      if (!(await canActOnMessage(currentUser, msgId, roomId, (sql, params) => pool.query(sql, params)))) return;
       await pool.query('UPDATE messages SET is_pinned=0 WHERE id=$1', [msgId]);
     }
     if (roomId) {
+      if (!(await isRoomMember(currentUser, roomId, (sql, params) => pool.query(sql, params)))) return;
       await pool.query('UPDATE messages SET is_pinned=0 WHERE room_id=$1', [roomId]);
     }
-    io.emit('msg-unpinned', { roomId, msgId });
+    if (!msgId && !roomId) return;
+    await emitToRoom(io, roomId, 'msg-unpinned', { roomId, msgId }, (sql, params) =>
+      pool.query(sql, params)
+    );
   });
 
   socket.on('create-group', async ({ name, members }: any) => {
-    if (!currentUser || !name || !name.trim()) return;
+    if (!currentUser || !name || !name.trim() || name.trim().length > 100) return;
     const memberList = Array.isArray(members) ? members : [];
-    const allMembers = Array.from(new Set([currentUser, ...memberList].filter(Boolean)));
+    // M7: max 100 members total; every member must exist as a user.
+    const { rows: allUsers } = await pool.query('SELECT username FROM users');
+    const existingUsers = new Set((allUsers as any[]).map((u) => u.username));
+    const validMembers = memberList.filter((m: any) => typeof m === 'string' && existingUsers.has(m));
+    const allMembers = Array.from(new Set([currentUser, ...validMembers].filter(Boolean)));
+    if (allMembers.length > 100) return;
     const groupId = uuidv4();
     await pool.query('INSERT INTO groups (id, name, members, created_at) VALUES ($1,$2,$3,$4)', [
       groupId,
@@ -1775,16 +2132,22 @@ io.on('connection', async (socket) => {
 
   socket.on('react', async ({ msgId, roomId, emoji }: any) => {
     if (!currentUser) return;
+    // M7: emoji cap. H2: the message must belong to the room, sender member.
+    if (typeof emoji !== 'string' || !emoji || emoji.length > 16) return;
+    if (!(await canActOnMessage(currentUser, msgId, roomId, (sql, params) => pool.query(sql, params)))) return;
     const { rows } = await pool.query('SELECT reactions FROM messages WHERE id=$1', [msgId]);
     if (!rows.length) return;
-    const reactions: Record<string, string[]> = JSON.parse(rows[0].reactions || '{}');
+    // L7(e): corrupt reactions JSON degrades to {} instead of throwing.
+    const reactions: Record<string, string[]> = safeParseReactions(rows[0].reactions);
     if (!reactions[emoji]) reactions[emoji] = [];
     const idx = reactions[emoji].indexOf(currentUser);
     if (idx === -1) reactions[emoji].push(currentUser);
     else reactions[emoji].splice(idx, 1);
     if (reactions[emoji].length === 0) delete reactions[emoji];
     await pool.query('UPDATE messages SET reactions=$1 WHERE id=$2', [JSON.stringify(reactions), msgId]);
-    io.emit('msg-reaction', { roomId, msgId, reactions });
+    await emitToRoom(io, roomId, 'msg-reaction', { roomId, msgId, reactions }, (sql, params) =>
+      pool.query(sql, params)
+    );
   });
 
   socket.on('forward-message', async (data: any) => {
@@ -1794,6 +2157,8 @@ io.on('connection', async (socket) => {
     const { rows } = await pool.query('SELECT * FROM messages WHERE id=$1', [msgId]);
     if (!rows.length) return;
     const orig = rows[0];
+    // M5: a deleted original must not be resurrected into another room.
+    if (orig.is_deleted) return;
     const canReadOrig = await isRoomMember(currentUser, orig.room_id, (sql, params) => pool.query(sql, params));
     if (!canReadOrig) return;
 
@@ -1840,7 +2205,9 @@ io.on('connection', async (socket) => {
           newMsg.timestamp,
         ]
       );
-      io.emit('new-message', { roomId, msg: parseMsg(newMsg) });
+      await emitToRoom(io, roomId, 'new-message', { roomId, msg: parseMsg(newMsg) }, (sql, params) =>
+        pool.query(sql, params)
+      );
     }
   });
 
@@ -1848,27 +2215,43 @@ io.on('connection', async (socket) => {
     if (!currentUser) return;
     const roomId = isGroup ? `group__${to}` : getRoomId(currentUser, to);
     if (isGroup) {
+      // H2: group typing requires membership.
+      if (!(await isRoomMember(currentUser, roomId, (sql, params) => pool.query(sql, params)))) return;
       const { rows } = await pool.query('SELECT members FROM groups WHERE id=$1', [to]);
-      if (rows.length) {
-        JSON.parse(rows[0].members).forEach((m: string) => {
+      const members = rows.length ? safeParseMembers(rows[0].members) : null;
+      if (members) {
+        members.forEach((m: string) => {
           if (m !== currentUser) {
             presence.emitToUser(io, m, 'typing', { roomId, username: currentUser, isTyping });
           }
         });
       }
     } else {
+      // H2: DM typing requires a contacts row (same check send-message uses).
+      const { rows } = await pool.query('SELECT 1 FROM contacts WHERE username=$1 AND contact=$2', [
+        currentUser,
+        to,
+      ]);
+      if (!rows.length) return;
       presence.emitToUser(io, to, 'typing', { roomId, username: currentUser, isTyping });
     }
   });
 
   socket.on('read', async ({ roomId, msgId }: any) => {
-    if (!msgId) return;
+    // H2: read previously needed no auth at all — now it requires a
+    // session AND membership, and the message must belong to the room.
+    if (!currentUser || !msgId) return;
+    if (!(await canActOnMessage(currentUser, msgId, roomId, (sql, params) => pool.query(sql, params)))) return;
     await pool.query('UPDATE messages SET is_read=1 WHERE id=$1', [msgId]);
-    io.emit('read', { roomId, msgId });
+    await emitToRoom(io, roomId, 'read', { roomId, msgId }, (sql, params) =>
+      pool.query(sql, params)
+    );
   });
 
   socket.on('update-status', async (status: string) => {
     if (!currentUser) return;
+    // M7: status cap.
+    if (typeof status !== 'string' || status.length > 100) return;
     await pool.query('UPDATE users SET status=$1 WHERE username=$2', [status, currentUser]);
     const { rows: contacts } = await pool.query('SELECT contact FROM contacts WHERE username=$1', [currentUser]);
     contacts.forEach(({ contact }: any) => {
@@ -1895,6 +2278,13 @@ async function start(): Promise<void> {
   } catch (e: any) {
     console.warn('⚠️ اخطار در آماده‌سازی اولیه دیتابیس:', e.message);
   }
+
+  // M6: log loudly which engine is active.
+  console.log(
+    getDbEngine() === 'postgres'
+      ? '🗄️ Database engine: PostgreSQL'
+      : '⚠️ JSON FALLBACK ACTIVE (ALLOW_JSON_FALLBACK=1) — data is ephemeral'
+  );
 
   const distPath = path.join(process.cwd(), 'dist');
   const publicPath = path.join(process.cwd(), 'public');

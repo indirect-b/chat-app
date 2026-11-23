@@ -12,19 +12,21 @@ import { hkdf } from '@noble/hashes/hkdf.js';
 import {
   KEY_STORAGE_VERSION,
   StoredIdentityRecordV4,
+  clearAllSessionWrappingKeysForTests,
   discardLegacyLocalStorageKeys,
   generateNonExtractableEcdhKeyPair,
   generateNonExtractableWrappingKey,
   getCachedPublicKeyMetadataV4,
+  getDecryptedHistoryEntry,
   getSessionWrappingKey,
   getWebCrypto,
-  hasBrowserIndexedDB,
   isDurableReplaySeen,
   loadIdentityRecordV4,
   normalizeKeystoreUsername,
   recordDurableReplaySeen,
   resetInMemoryKeyStoreForTests,
   saveIdentityRecordV4,
+  storeDecryptedHistoryEntry,
   unwrapSecretBytes,
   wrapSecretBytes,
 } from './keystore';
@@ -70,6 +72,7 @@ export type E2EEErrorCode =
   | 'UNVERIFIED_PEER_KEY'
   | 'UNSUPPORTED_VERSION' // L3 (round 4): an E2EE payload with an unknown version
   | 'PAYLOAD_TOO_LARGE' // L15 (round 4): decrypt input exceeds MAX_DECRYPT_INPUT_BYTES
+  | 'REPLAY_CHECK_FAILED' // M1 (round 5): the durable replay store errored — fail closed, never decrypt
   | 'IDENTITY_LOCKED'; // L8: هویت با رمز عبور محافظت شده و در این نشست باز نشده است
 
 export class E2EEError extends Error {
@@ -124,6 +127,15 @@ export function setStoredPeerPublicKey(peerUsername: string, key: string): void 
   } catch {
     // ignore
   }
+}
+
+/**
+ * کلید کش پیام: ۲۴ کاراکتر اول base64(sha256(payload)) — همان طرحی که کش
+ * حافظه‌ای پیام‌های ارسالی و کش رمزنگاری‌شدهٔ تاریخچه استفاده می‌کنند، تا
+ * ارسال و دریافتِ یک پیام، یک کلید کش مشترک داشته باشند.
+ */
+export function computePayloadHashKey(payload: string): string {
+  return bufToBase64(sha256(new TextEncoder().encode(payload))).slice(0, 24);
 }
 
 export interface HybridPublicKeyBundle {
@@ -888,6 +900,33 @@ export function resetAllCryptoStateForTests(): void {
   resetInMemoryKeyStoreForTests();
 }
 
+/**
+ * شبیه‌سازی رفرش صفحه در تست‌ها: فقط وضعیت فرّار درون‌حافظه‌ای پاک
+ * می‌شود (نشست راتچت، کش متن پیام‌های ارسالی، FSM گروه، کش باندل، کلیدهای
+ * پوششی بازشدهٔ نشست) و انبارهای با دوام — هویت در IndexedDB، انبار Replay
+ * و کش رمزنگاری‌شدهٔ تاریخچه — دست‌نخورده می‌مانند؛ دقیقاً همان چیزی که
+ * یک رفرش واقعی در مرورگر انجام می‌دهد.
+ *
+ * توجه: resetAllCryptoStateForTests برای این کار مناسب نیست، چون در
+ * تست‌های Node انبار شبیه‌سازی‌شدهٔ IndexedDB (از جمله خود هویت و کلید
+ * پوششی آن) را هم پاک می‌کند — چیزی که رفرش مرورگر هرگز نمی‌کند.
+ */
+export function simulateRefreshForTests(): void {
+  for (const state of ratchetStateMap.values()) {
+    zeroizeRatchetState(state);
+  }
+  ratchetStateMap.clear();
+  sentPlaintextMemoryCache.clear();
+  for (const gsm of groupFsmMap.values()) {
+    for (const rec of Object.values(gsm.epochs)) {
+      zeroizeBuffer(rec.rootKey);
+    }
+  }
+  groupFsmMap.clear();
+  clearVerifiedBundleCache();
+  clearAllSessionWrappingKeysForTests();
+}
+
 function loadRatchetState(myUsername: string, roomId: string): RatchetSessionState | null {
   const key = getRatchetMapKey(myUsername, roomId);
   const state = ratchetStateMap.get(key) || null;
@@ -1098,6 +1137,22 @@ async function ensurePQRatchetSession(
 /**
  * رمزگشایی پیام در زنجیره راتچت با پشتیبانی از پیام‌های خارج از نوبت، محافظت قطعی در برابر Replay، و Zeroization فوری
  */
+
+// M1 (round 5): the durable replay check is consulted unconditionally
+// (it falls back to the in-memory store in Node) and a real store error
+// fails CLOSED as E2EEError('REPLAY_CHECK_FAILED') — "unknown" is never
+// treated as "not seen".
+async function isDurableReplaySeenOrThrow(roomId: string, token: string): Promise<boolean> {
+  try {
+    return await isDurableReplaySeen(roomId, token);
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith('DURABLE_REPLAY_CHECK_FAILED')) {
+      throw new E2EEError('REPLAY_CHECK_FAILED', 'Durable replay check failed; refusing to decrypt');
+    }
+    throw err;
+  }
+}
+
 async function ratchetDecryptWithSkippedKeys(
   state: RatchetSessionState,
   msgStep: number,
@@ -1117,7 +1172,11 @@ async function ratchetDecryptWithSkippedKeys(
   if (state.seenRecvSteps.has(msgStep)) {
     throw new E2EEError('REPLAY_DETECTED', `Replayed ratchet step ${msgStep} rejected`);
   }
-  if (roomId && hasBrowserIndexedDB() && (await isDurableReplaySeen(roomId, replayToken))) {
+  // M1 (round 5): consult the durable store unconditionally — the
+  // hasBrowserIndexedDB() gate used to skip it entirely in non-IndexedDB
+  // runtimes, so a replay after ratchet-state loss (refresh) decrypted
+  // fine even though the token was recorded.
+  if (roomId && (await isDurableReplaySeenOrThrow(roomId, replayToken))) {
     throw new E2EEError('REPLAY_DETECTED', `Replayed ratchet step ${msgStep} rejected`);
   }
 
@@ -1627,7 +1686,12 @@ export async function encryptMessageText(
     const encoded = new TextEncoder().encode(plainText);
 
     // ۱. اگر اتاق گروهی است، از ماشین وضعیت اپوک گروه (Group Epoch FSM) استفاده کن
-    if (roomId.startsWith('group__') && !manualSecret) {
+    // L5 (round 5) — PRECEDENCE: the FSM path wins whenever a current
+    // epoch key exists, even if a manual room secret is set. A manual
+    // secret must never silently downgrade PQ group encryption to PBKDF2.
+    // With no epoch key we fall through to the PBKDF2/manual path below
+    // (or MISSING_KEYS if no secret is set either).
+    if (roomId.startsWith('group__')) {
       const groupId = roomId.replace('group__', '');
       const fsm = getGroupEpochState(groupId, options?.groupMembers || []);
 
@@ -1636,10 +1700,7 @@ export async function encryptMessageText(
       }
 
       const epochRec = fsm.epochs[fsm.currentEpoch];
-      if (!epochRec) {
-        throw new E2EEError('MISSING_KEYS', 'Current group epoch key is unavailable');
-      }
-
+      if (epochRec) {
       const msgKeyBytes = hkdf(
         sha256,
         epochRec.rootKey,
@@ -1689,7 +1750,7 @@ export async function encryptMessageText(
         } else {
           payload = `${E2EE_GROUP_EPOCH_PREFIX}${fsm.currentEpoch}:${epochRec.membersHash}:${bufToBase64(iv)}:${bufToBase64(cipherBuffer)}`;
         }
-        const payloadHashKey = bufToBase64(sha256(new TextEncoder().encode(payload))).slice(0, 24);
+        const payloadHashKey = computePayloadHashKey(payload);
         if (options?.myUsername) {
           saveSentPlaintextInMemory(options.myUsername, roomId, payloadHashKey, plainText);
         }
@@ -1697,10 +1758,17 @@ export async function encryptMessageText(
       } finally {
         zeroizeBuffer(msgKeyBytes);
       }
+      } // no epoch key → fall through to the PBKDF2 / MISSING_KEYS paths below
     }
 
     // ۲. اگر چت خصوصی است و کلید عمومی مخاطب موجود است
-    if (!manualSecret && options?.myUsername && options?.peerPublicKey) {
+    // L5 (round 5) — PRECEDENCE: a verified fully-PQ peer bundle always
+    // wins over a manual room secret. A manual secret only downgrades to
+    // PBKDF2 when the peer has no usable PQ bundle (classical-only peer);
+    // it must never silently override an available PQ session. A bundle
+    // whose ML-DSA signature is invalid still throws (fail closed) rather
+    // than silently falling back to the weaker PBKDF2 path.
+    if (options?.myUsername && options?.peerPublicKey) {
       const peerBundle = parsePeerKeyBundle(options.peerPublicKey, options.peerUsername, { skipCache: true });
 
       if (peerBundle.isMldsaSignatureInvalid) {
@@ -1785,7 +1853,7 @@ export async function encryptMessageText(
         saveRatchetState(options.myUsername, roomId, ratchetState);
 
         const payload = `${E2EE_PQ_RATCHET_PREFIX}${stepIndex}:${kemCipherB64}:${ivB64}:${cipherB64}:${msgSigB64}`;
-        const payloadHashKey = bufToBase64(sha256(new TextEncoder().encode(payload))).slice(0, 24);
+        const payloadHashKey = computePayloadHashKey(payload);
         saveSentPlaintextInMemory(options.myUsername, roomId, payloadHashKey, plainText);
         return payload;
       }
@@ -1795,7 +1863,12 @@ export async function encryptMessageText(
       // (HKDF info bound the role-dependent name), so producing e2ee:ecdh:
       // payloads only created undecryptable messages. A peer with only a
       // classical ECDH key and no PQ material is now rejected fail-closed.
-      throw new E2EEError('INVALID_BUNDLE', 'Peer public key bundle is invalid or incomplete');
+      // L5 (round 5): ...unless a manual room secret is set, in which case
+      // the old PBKDF2 fallback is preserved for classical-only peers —
+      // execution falls through to section 3 below instead of throwing.
+      if (!manualSecret) {
+        throw new E2EEError('INVALID_BUNDLE', 'Peer public key bundle is invalid or incomplete');
+      }
     }
 
     // ۳. در صورت تنظیم رمز دستی (PBKDF2 Override)
@@ -1876,7 +1949,7 @@ export async function decryptMessageText(
   }
 
   const webCrypto = getWebCrypto();
-  const payloadHashKey = bufToBase64(sha256(new TextEncoder().encode(payload))).slice(0, 24);
+  const payloadHashKey = computePayloadHashKey(payload);
   const effectivePeerKey =
     options?.peerPublicKey ||
     (options?.peerUsername ? getStoredPeerPublicKey(options.peerUsername) : null);
@@ -1967,6 +2040,16 @@ export async function decryptMessageText(
 
     // پیام دریافتی از مخاطب: ابتدا باندل کلید مخاطب و سپس امضای ML-DSA-65 پیام را پیش از هرگونه تغییر در راتچت یا رمزگشایی بررسی کن
     const peerBundle = parsePeerKeyBundleStrict(effectivePeerKey, options.peerUsername, { skipCache: true });
+    // L6 (round 5): bind the envelope sender to the verified bundle —
+    // a valid Alice-signed message decrypted with sender='carol' used to
+    // verify fine and be attributed to Carol. (The self-sent branch above
+    // returns before this, so it is unaffected.)
+    if (
+      options.sender &&
+      normalizeKeystoreUsername(options.sender) !== normalizeKeystoreUsername(options.peerUsername ?? '')
+    ) {
+      throw new E2EEError('INVALID_SIGNATURE', 'Envelope sender does not match the verified peer identity');
+    }
     let mldsaVerified = false;
     try {
       mldsaVerified = ml_dsa65.verify(sigBytes, signData, peerBundle.mldsaPub!);
@@ -2048,26 +2131,58 @@ export async function decryptMessageText(
       throw new E2EEError('MALFORMED_PAYLOAD', 'Group ciphertext too short');
     }
 
+    // L3 (round 5): isSelfSent is computed BEFORE the v3 block — the
+    // fail-closed requirement below must not apply to my own messages
+    // (the app never stores my own key in the peer store, so a naive
+    // fail-closed would lock all my sent group messages on first load;
+    // ownership is proven by the sent-plaintext cache lookup below, and
+    // a cache miss still decrypts with mldsaVerified:false + the L4 UI
+    // warning).
+    const normMy = options?.myUsername ? normalizeKeystoreUsername(options.myUsername) : '';
+    const normSender = options?.sender ? normalizeKeystoreUsername(options.sender) : '';
+    const isSelfSent = Boolean(normMy && normSender && normMy === normSender);
+
     let isMldsaVerified = false;
     if (isGepV3) {
-      const senderKeyStr = options?.peerPublicKey || (options?.sender ? getStoredPeerPublicKey(options.sender) : null);
-      if (senderKeyStr && options?.sender) {
-        const parsed = parsePeerKeyBundle(senderKeyStr, options.sender, { skipCache: true });
-        if (parsed.hasMLDSA && parsed.mldsaPub) {
-          const signTarget = serializeGroupMessageForSigning({
-            roomId,
-            epoch: msgEpoch,
-            membersHash,
-            ivB64,
-            cipherB64,
-          });
-          const sigBytes = base64ToBuf(senderSigB64);
-          const valid = ml_dsa65.verify(sigBytes, signTarget, parsed.mldsaPub);
-          if (!valid) {
-            throw new E2EEError('INVALID_SIGNATURE', 'Group sender ML-DSA-65 signature verification failed');
-          }
-          isMldsaVerified = true;
+      if (!isSelfSent) {
+        const senderKeyStr = options?.peerPublicKey || (options?.sender ? getStoredPeerPublicKey(options.sender) : null);
+        if (!options?.sender || !senderKeyStr) {
+          throw new E2EEError(
+            'INVALID_BUNDLE',
+            'Group v3 message requires the sender and their verified public-key bundle'
+          );
         }
+        const parsed = parsePeerKeyBundle(senderKeyStr, options.sender, { skipCache: true });
+        // L6 (group): parsePeerKeyBundle flags a bundle-username vs
+        // sender mismatch as isMldsaSignatureInvalid, so this throw also
+        // binds the sender to the verified bundle on the group path.
+        if (parsed.isMldsaSignatureInvalid || !parsed.hasMLDSA || !parsed.mldsaPub) {
+          throw new E2EEError(
+            'INVALID_SIGNATURE',
+            'Group sender ML-DSA-65 identity key is missing or invalid'
+          );
+        }
+        const signTarget = serializeGroupMessageForSigning({
+          roomId,
+          epoch: msgEpoch,
+          membersHash,
+          ivB64,
+          cipherB64,
+        });
+        const sigBytes = base64ToBuf(senderSigB64);
+        if (sigBytes.byteLength !== ml_dsa65.lengths.signature) {
+          throw new E2EEError('INVALID_SIGNATURE', 'Invalid group ML-DSA-65 signature byte length');
+        }
+        let valid = false;
+        try {
+          valid = ml_dsa65.verify(sigBytes, signTarget, parsed.mldsaPub);
+        } catch {
+          valid = false;
+        }
+        if (!valid) {
+          throw new E2EEError('INVALID_SIGNATURE', 'Group sender ML-DSA-65 signature verification failed');
+        }
+        isMldsaVerified = true;
       }
     }
 
@@ -2083,10 +2198,6 @@ export async function decryptMessageText(
     if (epochRec.membersHash !== membersHash) {
       throw new E2EEError('DECRYPTION_FAILED', 'Group epoch membersHash mismatch');
     }
-
-    const normMy = options?.myUsername ? normalizeKeystoreUsername(options.myUsername) : '';
-    const normSender = options?.sender ? normalizeKeystoreUsername(options.sender) : '';
-    const isSelfSent = Boolean(normMy && normSender && normMy === normSender);
 
     if (isSelfSent) {
       const cached = getSentPlaintextFromMemory(normMy, roomId, replayKey);
@@ -2104,7 +2215,10 @@ export async function decryptMessageText(
 
     // جلوگیری از Replay پیام گروهی (M1: هم حافظه RAM و هم انبار دائم IndexedDB)
     const seenSet = epochRec.seenMessageSet || (epochRec.seenMessageSet = new Set(epochRec.seenMessageKeys || []));
-    const isDurableReplay = await isDurableReplaySeen(roomId, `group_msg_${msgEpoch}_${replayKey}`);
+    // M1 (round 5): this call site already consulted the durable store
+    // unconditionally; a store error now fails closed (REPLAY_CHECK_FAILED)
+    // instead of being treated as "not seen".
+    const isDurableReplay = await isDurableReplaySeenOrThrow(roomId, `group_msg_${msgEpoch}_${replayKey}`);
     if (!isSelfSent && (seenSet.has(replayKey) || isDurableReplay)) {
       throw new E2EEError('REPLAY_DETECTED', 'Replayed group message rejected');
     }
@@ -2213,6 +2327,76 @@ export async function decryptMessageText(
     mode: 'PBKDF2',
     failed: false,
   };
+}
+
+/**
+ * رمزگشایی با کش رمزنگاری‌شدهٔ تاریخچه — نقطهٔ ورود واحد رمزگشایی پیام در
+ * رابط کاربری (ChatApp) برای بارگذاری تاریخچه و پیام‌های زنده.
+ *
+ * چرا: پس از رفرش، رمزگشایی دوبارهٔ یک پیامِ از قبل تحویل‌شده با
+ * REPLAY_DETECTED رد می‌شود (انبار دائم Replay) و پیام ارسالی خود کاربر
+ * هم کلیدش را از دست داده است — هر دو به‌جای متن، جای‌نمای قفل‌شده نشان
+ * می‌دهند. این تابع پیش از رمزگشایی دوباره، کش تاریخچه را می‌خواند و پس
+ * از هر رمزگشایی موفق، نتیجه را در کش ذخیره می‌کند.
+ *
+ * چه چیزی تغییر نمی‌کند: بررسی Replay، راتچت، seenRecvSteps و اعتبارسنجی
+ * امضای ML-DSA-65 دست‌نخورده‌اند — کش فقط نتیجهٔ یک رمزگشاییِ قبلاً
+ * موفق و اعتبارسنجی‌شده را برمی‌گرداند و هرگز جایگزین آن بررسی‌ها
+ * نمی‌شود. خواندن/نوشتن کش best-effort است: خطا (از جمله قفل‌بودن هویت
+ * L8) هرگز throw نمی‌کند و مسیر عادی رمزگشایی ادامه پیدا می‌کند.
+ */
+export async function decryptMessageTextWithHistoryCache(
+  payload: string,
+  roomId: string,
+  options?: {
+    myUsername?: string;
+    peerPublicKey?: string | null;
+    peerUsername?: string;
+    customSecret?: string;
+    sender?: string;
+    groupMembers?: string[];
+  }
+): Promise<Awaited<ReturnType<typeof decryptMessageText>>> {
+  if (typeof payload === 'string' && isE2EEPayload(payload) && options?.myUsername && roomId) {
+    try {
+      const cached = await getDecryptedHistoryEntry(
+        options.myUsername,
+        roomId,
+        computePayloadHashKey(payload)
+      );
+      if (cached) {
+        return {
+          text: cached.text,
+          isEncrypted: true,
+          mode: cached.mode,
+          ratchetStep: cached.ratchetStep,
+          epoch: cached.epoch,
+          mldsaVerified: cached.mldsaVerified,
+          failed: false,
+        };
+      }
+    } catch {
+      // کش خراب/در دسترس نیست — مسیر عادی رمزگشایی ادامه پیدا می‌کند.
+    }
+  }
+
+  const dec = await decryptMessageText(payload, roomId, options);
+
+  if (dec.isEncrypted && !dec.failed && options?.myUsername && roomId) {
+    try {
+      await storeDecryptedHistoryEntry(options.myUsername, roomId, computePayloadHashKey(payload), {
+        text: dec.text,
+        mode: dec.mode,
+        ratchetStep: dec.ratchetStep,
+        epoch: dec.epoch,
+        mldsaVerified: dec.mldsaVerified ?? false,
+      });
+    } catch {
+      // نوشتن کش best-effort است — شکست آن رمزگشایی موفق را خراب نمی‌کند.
+    }
+  }
+
+  return dec;
 }
 
 // ===== رمزنگاری سرتاسری فایل (Media E2EE) =====
