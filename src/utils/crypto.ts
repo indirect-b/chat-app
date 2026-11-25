@@ -12,7 +12,9 @@ import { hkdf } from '@noble/hashes/hkdf.js';
 import {
   KEY_STORAGE_VERSION,
   StoredIdentityRecordV4,
+  DurableRatchetStateV1,
   clearAllSessionWrappingKeysForTests,
+  deleteDurableRatchetState,
   discardLegacyLocalStorageKeys,
   generateNonExtractableEcdhKeyPair,
   generateNonExtractableWrappingKey,
@@ -21,8 +23,10 @@ import {
   getSessionWrappingKey,
   getWebCrypto,
   isDurableReplaySeen,
+  loadDurableRatchetState,
   loadIdentityRecordV4,
   normalizeKeystoreUsername,
+  persistDurableRatchetState,
   recordDurableReplaySeen,
   resetInMemoryKeyStoreForTests,
   saveIdentityRecordV4,
@@ -872,6 +876,8 @@ export function clearRatchetSession(myUsername: string, roomId: string): void {
     zeroizeRatchetState(existing);
     ratchetStateMap.delete(key);
   }
+  // نشست دائم هم حذف می‌شود تا پس از clear، رفرش نشست پاک‌شده را برنگرداند.
+  void deleteDurableRatchetState(myUsername, roomId);
   // Remove any legacy localStorage ratchet state if present
   const ls = getSafeLocalStorage();
   if (ls) {
@@ -941,6 +947,88 @@ function saveRatchetState(myUsername: string, roomId: string, state: RatchetSess
   ratchetStateMap.set(key, state);
 }
 
+/**
+ * سریال‌سازی وضعیت راتچت برای انبار دائم (رفع باگ #2). نشست قبلی
+ * (previousSession) عمداً ذخیره نمی‌شود — توضیح در keystore.ts.
+ */
+function serializeRatchetStateForDurable(state: RatchetSessionState): DurableRatchetStateV1 {
+  const skippedKeys = Array.from(state.skippedKeys.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([step, entry]) => ({ step, mk: Array.from(entry.mk), timestamp: entry.timestamp }));
+  return {
+    sendChainKey: Array.from(state.sendChainKey),
+    recvChainKey: Array.from(state.recvChainKey),
+    sendStep: state.sendStep,
+    recvStep: state.recvStep,
+    sentSinceRekey: state.sentSinceRekey,
+    seenRecvSteps: Array.from(state.seenRecvSteps),
+    kemCipherTextB64: state.kemCipherTextB64,
+    peerKemFingerprint: state.peerKemFingerprint,
+    skippedKeys,
+    sessionEpoch: state.sessionEpoch,
+    hkdfSaltVersion: state.hkdfSaltVersion,
+  };
+}
+
+function deserializeDurableRatchetState(data: DurableRatchetStateV1): RatchetSessionState {
+  const skippedKeys = new Map<number, SkippedKeyEntry>();
+  for (const entry of data.skippedKeys) {
+    skippedKeys.set(entry.step, { mk: new Uint8Array(entry.mk), timestamp: entry.timestamp });
+  }
+  return {
+    sendChainKey: new Uint8Array(data.sendChainKey),
+    recvChainKey: new Uint8Array(data.recvChainKey),
+    sendStep: data.sendStep,
+    recvStep: data.recvStep,
+    sentSinceRekey: data.sentSinceRekey,
+    seenRecvSteps: new Set(data.seenRecvSteps),
+    kemCipherTextB64: data.kemCipherTextB64,
+    peerKemFingerprint: data.peerKemFingerprint,
+    skippedKeys,
+    sessionEpoch: data.sessionEpoch,
+    previousSession: undefined,
+    hkdfSaltVersion: data.hkdfSaltVersion,
+  };
+}
+
+/**
+ * نوشتن وضعیت راتچت در انبار دائم — best-effort و هرگز throw نمی‌کند تا
+ * مسیر رمزنگاری/رمزگشایی با خطای ذخیره‌سازی خراب نشود. در نقاط commit
+ * (پس از هر رمزنگاری موفق و هر رمزگشایی موفق) await می‌شود.
+ */
+async function saveDurableRatchetStateBestEffort(
+  myUsername: string,
+  roomId: string,
+  state: RatchetSessionState
+): Promise<void> {
+  try {
+    await persistDurableRatchetState(myUsername, roomId, serializeRatchetStateForDurable(state));
+  } catch {
+    // ignore — انبار دائم best-effort است؛ وضعیت درون‌حافظه‌ای دست‌نخورده می‌ماند.
+  }
+}
+
+/**
+ * بازیابی وضعیت راتچت از انبار دائم پس از رفرش — فقط وقتی در حافظه
+ * نیست. null یعنی رکوردی نیست، هویت قفل است، یا رکورد خراب بوده است؛
+ * در همهٔ این حالت‌ها نشست از نو ساخته می‌شود (رفتار امروز).
+ */
+async function restoreDurableRatchetState(
+  myUsername: string,
+  roomId: string
+): Promise<RatchetSessionState | null> {
+  try {
+    const data = await loadDurableRatchetState(myUsername, roomId);
+    if (!data) return null;
+    const state = deserializeDurableRatchetState(data);
+    pruneExpiredSkippedKeys(state);
+    saveRatchetState(myUsername, roomId, state);
+    return state;
+  } catch {
+    return null;
+  }
+}
+
 function saveSentPlaintextInMemory(myUsername: string, roomId: string, payloadHashKey: string, plainText: string): void {
   const cacheKey = `${normalizeKeystoreUsername(myUsername)}::${roomId}::${payloadHashKey}`;
   if (sentPlaintextMemoryCache.size >= MAX_SENT_PLAINTEXT_CACHE) {
@@ -973,7 +1061,11 @@ async function ensurePQRatchetSession(
   const mlkemPub = bundle.mlkemPub!;
 
   const normMyUser = normalizeKeystoreUsername(myUsername);
-  const existing = loadRatchetState(normMyUser, roomId);
+  // رفرش: اگر نشست در حافظه نیست، اول از انبار دائم بازیابی کن (رفع باگ #2).
+  let existing = loadRatchetState(normMyUser, roomId);
+  if (!existing) {
+    existing = await restoreDurableRatchetState(normMyUser, roomId);
+  }
   const peerFingerprint = bufToBase64(sha256(mlkemPub)).slice(0, 16);
 
   // اگر کپسول جدیدی از سمت مقابل آمده که نیاز به Decapsulation دارد
@@ -991,6 +1083,7 @@ async function ensurePQRatchetSession(
       restored.previousSession = existing;
       existing.previousSession = undefined;
       saveRatchetState(normMyUser, roomId, restored);
+      await saveDurableRatchetStateBestEffort(normMyUser, roomId, restored);
       return restored;
     }
 
@@ -1055,6 +1148,7 @@ async function ensurePQRatchetSession(
       };
 
       saveRatchetState(normMyUser, roomId, newState);
+      await saveDurableRatchetStateBestEffort(normMyUser, roomId, newState);
       return newState;
     } catch (err) {
       if (err instanceof E2EEError) throw err;
@@ -1122,6 +1216,7 @@ async function ensurePQRatchetSession(
     };
 
     saveRatchetState(normMyUser, roomId, newState);
+    await saveDurableRatchetStateBestEffort(normMyUser, roomId, newState);
     return newState;
   } catch (err) {
     if (err instanceof E2EEError) throw err;
@@ -1851,6 +1946,7 @@ export async function encryptMessageText(
         ratchetState.sendStep = stepIndex + 1;
         ratchetState.sentSinceRekey = (ratchetState.sentSinceRekey || 0) + 1;
         saveRatchetState(options.myUsername, roomId, ratchetState);
+        await saveDurableRatchetStateBestEffort(options.myUsername, roomId, ratchetState);
 
         const payload = `${E2EE_PQ_RATCHET_PREFIX}${stepIndex}:${kemCipherB64}:${ivB64}:${cipherB64}:${msgSigB64}`;
         const payloadHashKey = computePayloadHashKey(payload);
@@ -2077,6 +2173,11 @@ export async function decryptMessageText(
       roomId,
       normMyUser
     );
+
+    // رمزگشایی موفق شد و وضعیت راتچت commit شد (کلیدهای ردشدهٔ تازه،
+    // حذف کلید مصرف‌شده، گام جدید) — وضعیت را در انبار دائم هم بنویس
+    // تا پس از رفرش، پیام‌های خارج از نوبت همچنان رمزگشایی شوند (رفع باگ #2).
+    await saveDurableRatchetStateBestEffort(normMyUser, roomId, ratchetState);
 
     return {
       text: plainText,

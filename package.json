@@ -1,6 +1,6 @@
 {
   "name": "chat-app",
-  "version": "6.5.0",
+  "version": "6.5.1",
   "main": "server.ts",
   "scripts": {
     "dev": "tsx server.ts",

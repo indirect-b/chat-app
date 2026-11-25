@@ -38,7 +38,9 @@ const IDB_PASSWORD_ROOT_STORE = 'password_wrapped_root_v1';
 export const IDB_TOFU_STORE = 'tofu_pinned_keys_v1';
 /** کش رمزنگاری‌شدهٔ تاریخچهٔ رمزگشایی‌شده (رفع باگ قفل‌شدن پیام‌ها پس از رفرش). */
 export const IDB_HISTORY_STORE = 'decrypted_history_v1';
-const IDB_VERSION = 5;
+/** انبار دائم نشست‌های راتچت (رفع باگ #2 — vault کلیدهای ردشده فقط در RAM بود). */
+export const IDB_RATCHET_STORE = 'ratchet_sessions_v1';
+const IDB_VERSION = 6;
 
 const LEGACY_STORAGE_PREFIXES = [
   'chat_ecdh_kp_',
@@ -176,6 +178,9 @@ function openKeyStoreDB(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(IDB_HISTORY_STORE)) {
         db.createObjectStore(IDB_HISTORY_STORE, { keyPath: 'key' });
+      }
+      if (!db.objectStoreNames.contains(IDB_RATCHET_STORE)) {
+        db.createObjectStore(IDB_RATCHET_STORE, { keyPath: 'key' });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -866,6 +871,419 @@ export async function pruneDecryptedHistory(nowMs: number = Date.now()): Promise
 }
 
 /**
+ * انبار دائم نشست راتچت (رفع باگ #2 — «تلهٔ حافظه و انقضای کلیدها»):
+ * تا پیش از این، وضعیت راتچت (زنجیرهٔ دریافت، گام‌ها، و vault کلیدهای
+ * ردشده) فقط در `ratchetStateMap` درون‌حافظه‌ای زندگی می‌کرد؛ با هر رفرش
+ * یا بستن تب، همه‌چیز — از جمله کلیدهای پیام‌های خارج از نوبت — از بین
+ * می‌رفت و پیام‌های قدیمی برای همیشه قفل می‌شدند. این بخش همان وضعیت را
+ * در IndexedDB نگه می‌دارد، دقیقاً با همان الگوی کش تاریخچه (رفع راند ۵):
+ * AES-256-GCM زیر کلید پوششی دستگاه، AAD متصل به کاربر + اتاق، و
+ * هرگز متن ساده یا کلید خام روی دیسک نمی‌نشیند. در حالت قفل (L8) کلید
+ * پوششی در دسترس نیست و خواندن/نوشتن بی‌صدا no-op می‌شود.
+ *
+ * چه چیزی ذخیره می‌شود: زنجیره‌های ارسال/دریافت، گام‌ها، seenRecvSteps،
+ * کپسول ML-KEM نشست، و vault کلیدهای ردشده. نشست قبلی (previousSession)
+ * عمداً ذخیره نمی‌شود — فقط برای محافظت Replay در برابر تناوب کپسول
+ * (H1) در نشست زنده کاربرد دارد؛ پس از رفرش، پیام بعدی با کپسول جاری
+ * نشست را از نو می‌سازد و این از دست‌رفتن، دقیقاً همان رفتار امروز است.
+ */
+export const DURABLE_RATCHET_SKIPPED_KEY_TTL_MS = 10 * 60 * 1000; // باید با SKIPPED_KEY_TTL_MS در crypto.ts برابر بماند
+export const DURABLE_RATCHET_MAX_SKIPPED_KEYS = 100; // باید با MAX_SKIP در crypto.ts برابر بماند
+export const DURABLE_RATCHET_MAX_SEEN_STEPS = 10_000; // باید با MAX_SEEN_RECV_STEPS در crypto.ts برابر بماند
+
+/** شکل سریال‌شدهٔ نشست راتچت — بایت‌ها به‌صورت آرایهٔ عدد (بدون base64) تا در Node و مرورگر یکسان کار کند. */
+export interface DurableRatchetStateV1 {
+  sendChainKey: number[]; // ۳۲ بایت
+  recvChainKey: number[]; // ۳۲ بایت
+  sendStep: number;
+  recvStep: number;
+  sentSinceRekey: number;
+  seenRecvSteps: number[];
+  kemCipherTextB64: string;
+  peerKemFingerprint: string;
+  skippedKeys: Array<{ step: number; mk: number[]; timestamp: number }>;
+  sessionEpoch?: number;
+  hkdfSaltVersion?: 'v1' | 'v2';
+}
+
+interface StoredRatchetSessionRecord {
+  key: string;
+  username: string;
+  roomId: string;
+  iv: Uint8Array;
+  ciphertext: Uint8Array;
+  timestamp: number;
+}
+
+// In-memory IndexedDB fallback used ONLY when globalThis.indexedDB is absent (e.g. Node.js tests)
+const nodeMemoryRatchetStore = new Map<string, StoredRatchetSessionRecord>();
+
+function ratchetSessionKey(username: string, roomId: string): string {
+  return `${normalizeKeystoreUsername(username)}::${roomId}`;
+}
+
+const RATCHET_AAD_LABEL = 'PQ-MPRBA:RATCHET-V1';
+
+function ratchetAad(username: string, roomId: string): Uint8Array {
+  return new TextEncoder().encode(
+    `${RATCHET_AAD_LABEL}:${normalizeKeystoreUsername(username)}:${roomId}`
+  );
+}
+
+function isValidByteArray(v: unknown, len: number): v is number[] {
+  return (
+    Array.isArray(v) &&
+    v.length === len &&
+    v.every(b => Number.isInteger(b) && (b as number) >= 0 && (b as number) <= 255)
+  );
+}
+
+function isValidSkippedEntry(v: unknown): v is { step: number; mk: number[]; timestamp: number } {
+  if (typeof v !== 'object' || v === null) return false;
+  const e = v as { step?: unknown; mk?: unknown; timestamp?: unknown };
+  return (
+    Number.isSafeInteger(e.step) &&
+    (e.step as number) >= 0 &&
+    isValidByteArray(e.mk, 32) &&
+    Number.isSafeInteger(e.timestamp) &&
+    (e.timestamp as number) >= 0
+  );
+}
+
+/**
+ * اعتبارسنجی سخت‌گیرانهٔ حالت بازیابی‌شده + هرس ورودی‌های منقضی‌شده
+ * (TTL ۱۰ دقیقه) + سقف ۱۰۰ کلید ردشده (تازه‌ترین گام‌ها می‌مانند) و سقف
+ * ۱۰٬۰۰۰ گام دیده‌شده. هر شکل نامعتبر → null (fail closed).
+ */
+function validateAndPruneDurableRatchetState(
+  parsed: unknown,
+  nowMs: number
+): { state: DurableRatchetStateV1; dropped: number } | null {
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const s = parsed as Record<string, unknown>;
+  if (!isValidByteArray(s.sendChainKey, 32) || !isValidByteArray(s.recvChainKey, 32)) return null;
+  if (!Number.isSafeInteger(s.sendStep) || (s.sendStep as number) < 0) return null;
+  if (!Number.isSafeInteger(s.recvStep) || (s.recvStep as number) < 0) return null;
+  if (!Number.isSafeInteger(s.sentSinceRekey) || (s.sentSinceRekey as number) < 0) return null;
+  if (
+    !Array.isArray(s.seenRecvSteps) ||
+    !s.seenRecvSteps.every(n => Number.isSafeInteger(n) && (n as number) >= 0)
+  ) {
+    return null;
+  }
+  if (typeof s.kemCipherTextB64 !== 'string' || !s.kemCipherTextB64) return null;
+  if (typeof s.peerKemFingerprint !== 'string') return null;
+  if (!Array.isArray(s.skippedKeys) || !s.skippedKeys.every(isValidSkippedEntry)) return null;
+  if (
+    s.sessionEpoch !== undefined &&
+    (!Number.isSafeInteger(s.sessionEpoch) || (s.sessionEpoch as number) < 0)
+  ) {
+    return null;
+  }
+  if (
+    s.hkdfSaltVersion !== undefined &&
+    s.hkdfSaltVersion !== 'v1' &&
+    s.hkdfSaltVersion !== 'v2'
+  ) {
+    return null;
+  }
+
+  const entries = s.skippedKeys as Array<{ step: number; mk: number[]; timestamp: number }>;
+  const fresh = entries
+    .filter(e => nowMs - e.timestamp <= DURABLE_RATCHET_SKIPPED_KEY_TTL_MS)
+    .sort((a, b) => a.step - b.step);
+  const dropped = entries.length - fresh.length;
+  const kept =
+    fresh.length > DURABLE_RATCHET_MAX_SKIPPED_KEYS
+      ? fresh.slice(fresh.length - DURABLE_RATCHET_MAX_SKIPPED_KEYS)
+      : fresh;
+  const seen = Array.from(new Set(s.seenRecvSteps as number[]));
+  const seenKept =
+    seen.length > DURABLE_RATCHET_MAX_SEEN_STEPS
+      ? seen.slice(seen.length - DURABLE_RATCHET_MAX_SEEN_STEPS)
+      : seen;
+
+  return {
+    state: {
+      sendChainKey: s.sendChainKey as number[],
+      recvChainKey: s.recvChainKey as number[],
+      sendStep: s.sendStep as number,
+      recvStep: s.recvStep as number,
+      sentSinceRekey: s.sentSinceRekey as number,
+      seenRecvSteps: seenKept,
+      kemCipherTextB64: s.kemCipherTextB64 as string,
+      peerKemFingerprint: s.peerKemFingerprint as string,
+      skippedKeys: kept,
+      sessionEpoch: s.sessionEpoch as number | undefined,
+      hkdfSaltVersion: s.hkdfSaltVersion as 'v1' | 'v2' | undefined,
+    },
+    dropped,
+  };
+}
+
+async function encryptDurableRatchetState(
+  wrappingKey: CryptoKey,
+  username: string,
+  roomId: string,
+  state: DurableRatchetStateV1
+): Promise<WrappedSecretBlob> {
+  const webCrypto = getWebCrypto();
+  const iv = webCrypto.getRandomValues(new Uint8Array(12));
+  const plain = new TextEncoder().encode(JSON.stringify(state));
+  const ctBuf = await webCrypto.subtle.encrypt(
+    {
+      name: 'AES-GCM',
+      iv: iv as unknown as BufferSource,
+      additionalData: ratchetAad(username, roomId) as unknown as BufferSource,
+    },
+    wrappingKey,
+    plain as unknown as BufferSource
+  );
+  return { iv, ciphertext: new Uint8Array(ctBuf) };
+}
+
+async function decryptDurableRatchetState(
+  wrappingKey: CryptoKey,
+  username: string,
+  roomId: string,
+  wrapped: WrappedSecretBlob
+): Promise<{ state: DurableRatchetStateV1; dropped: number } | null> {
+  const webCrypto = getWebCrypto();
+  const plainBuf = await webCrypto.subtle.decrypt(
+    {
+      name: 'AES-GCM',
+      iv: wrapped.iv as unknown as BufferSource,
+      additionalData: ratchetAad(username, roomId) as unknown as BufferSource,
+    },
+    wrappingKey,
+    wrapped.ciphertext as unknown as BufferSource
+  );
+  const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(plainBuf));
+  return validateAndPruneDurableRatchetState(parsed, Date.now());
+}
+
+/**
+ * ذخیرهٔ وضعیت راتچت در انبار دائم (best-effort: بدون کلید یا با خطا،
+ * false برمی‌گردد و هرگز throw نمی‌کند تا مسیر پیام خراب نشود).
+ */
+export async function persistDurableRatchetState(
+  username: string,
+  roomId: string,
+  state: DurableRatchetStateV1
+): Promise<boolean> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm || !roomId) return false;
+  try {
+    const wrappingKey = await getHistoryWrappingKey(norm);
+    if (!wrappingKey) return false;
+    const wrapped = await encryptDurableRatchetState(wrappingKey, norm, roomId, state);
+    const record: StoredRatchetSessionRecord = {
+      key: ratchetSessionKey(norm, roomId),
+      username: norm,
+      roomId,
+      iv: wrapped.iv,
+      ciphertext: wrapped.ciphertext,
+      timestamp: Date.now(),
+    };
+    if (!hasBrowserIndexedDB()) {
+      nodeMemoryRatchetStore.set(record.key, record);
+      return true;
+    }
+    const db = await openKeyStoreDB();
+    if (!db.objectStoreNames.contains(IDB_RATCHET_STORE)) return false;
+    await new Promise<void>(resolve => {
+      const tx = db.transaction(IDB_RATCHET_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_RATCHET_STORE);
+      store.put(record);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+    db.close();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * خواندن وضعیت راتچت از انبار دائم. نبود رکورد، قفل‌بودن هویت (L8)،
+ * یا هر خطای رمزگشایی/اعتبارسنجی → null (نشست از نو ساخته می‌شود — همان
+ * رفتار امروز). رکورد خراب حذف می‌شود تا تلاش‌های بعدی تکراری نباشند.
+ * اگر هرس TTL ورودی‌ای را انداخته باشد، حالت هرس‌شده دوباره نوشته
+ * می‌شود تا کلیدهای منقضی در انبار باقی نمانند.
+ */
+export async function loadDurableRatchetState(
+  username: string,
+  roomId: string
+): Promise<DurableRatchetStateV1 | null> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm || !roomId) return null;
+  try {
+    const key = ratchetSessionKey(norm, roomId);
+    let stored: StoredRatchetSessionRecord | undefined;
+    if (!hasBrowserIndexedDB()) {
+      stored = nodeMemoryRatchetStore.get(key);
+    } else {
+      const db = await openKeyStoreDB();
+      if (!db.objectStoreNames.contains(IDB_RATCHET_STORE)) return null;
+      stored = await new Promise<StoredRatchetSessionRecord | undefined>(resolve => {
+        const tx = db.transaction(IDB_RATCHET_STORE, 'readonly');
+        const store = tx.objectStore(IDB_RATCHET_STORE);
+        const req = store.get(key);
+        req.onsuccess = () => resolve((req.result as StoredRatchetSessionRecord) || undefined);
+        req.onerror = () => resolve(undefined);
+      });
+      db.close();
+    }
+    if (!stored) return null;
+    const wrappingKey = await getHistoryWrappingKey(norm);
+    if (!wrappingKey) return null;
+    let result: { state: DurableRatchetStateV1; dropped: number } | null;
+    try {
+      result = await decryptDurableRatchetState(wrappingKey, norm, roomId, {
+        iv: stored.iv,
+        ciphertext: stored.ciphertext,
+      });
+    } catch {
+      await deleteDurableRatchetState(norm, roomId);
+      return null;
+    }
+    if (!result) {
+      await deleteDurableRatchetState(norm, roomId);
+      return null;
+    }
+    if (result.dropped > 0) {
+      void persistDurableRatchetState(norm, roomId, result.state);
+    }
+    return result.state;
+  } catch {
+    return null;
+  }
+}
+
+export async function deleteDurableRatchetState(username: string, roomId: string): Promise<void> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm || !roomId) return;
+  const key = ratchetSessionKey(norm, roomId);
+  try {
+    if (!hasBrowserIndexedDB()) {
+      nodeMemoryRatchetStore.delete(key);
+      return;
+    }
+    const db = await openKeyStoreDB();
+    if (!db.objectStoreNames.contains(IDB_RATCHET_STORE)) return;
+    await new Promise<void>(resolve => {
+      const tx = db.transaction(IDB_RATCHET_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_RATCHET_STORE);
+      store.delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+    db.close();
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * حذف همهٔ نشست‌های دائم یک کاربر — هنگام حذف هویت فراخوانی می‌شود تا
+ * هیچ وضعیت راتچتی از هویت حذف‌شده باقی نماند.
+ */
+export async function deleteDurableRatchetStateForUser(username: string): Promise<void> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm) return;
+  try {
+    if (!hasBrowserIndexedDB()) {
+      for (const key of Array.from(nodeMemoryRatchetStore.keys())) {
+        if (key.startsWith(`${norm}::`)) nodeMemoryRatchetStore.delete(key);
+      }
+      return;
+    }
+    const db = await openKeyStoreDB();
+    if (!db.objectStoreNames.contains(IDB_RATCHET_STORE)) return;
+    const entries = await new Promise<Array<StoredRatchetSessionRecord>>(resolve => {
+      const tx = db.transaction(IDB_RATCHET_STORE, 'readonly');
+      const store = tx.objectStore(IDB_RATCHET_STORE);
+      const req = store.getAll();
+      req.onsuccess = () => resolve((req.result as Array<StoredRatchetSessionRecord>) || []);
+      req.onerror = () => resolve([]);
+    });
+    const ownKeys = entries.filter(e => e.username === norm).map(e => e.key);
+    if (ownKeys.length === 0) return;
+    await new Promise<void>(resolve => {
+      const tx = db.transaction(IDB_RATCHET_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_RATCHET_STORE);
+      for (const key of ownKeys) store.delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+    db.close();
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * بازپیچیدن نشست‌های دائم یک کاربر زیر کلید پوششی تازه — هنگام
+ * فعال/غیرفعال‌کردن محافظت با رمز عبور (L8) کلید پوششی عوض می‌شود؛ بدون
+ * این مهاجرت، نشست‌های قدیمی زیر کلید قبلی یتیم و ناخوانا می‌ماندند و
+ * پس از رفرش، پیام‌های خارج از نوبت دوباره قفل می‌شدند. Best-effort.
+ */
+export async function rewrapDurableRatchetStateForUser(
+  username: string,
+  oldWrappingKey: CryptoKey,
+  newWrappingKey: CryptoKey
+): Promise<void> {
+  const norm = normalizeKeystoreUsername(username);
+  if (!norm || !oldWrappingKey || !newWrappingKey) return;
+  try {
+    let records: Array<StoredRatchetSessionRecord>;
+    if (!hasBrowserIndexedDB()) {
+      records = Array.from(nodeMemoryRatchetStore.values()).filter(r => r.username === norm);
+    } else {
+      const db = await openKeyStoreDB();
+      if (!db.objectStoreNames.contains(IDB_RATCHET_STORE)) return;
+      records = await new Promise<Array<StoredRatchetSessionRecord>>(resolve => {
+        const tx = db.transaction(IDB_RATCHET_STORE, 'readonly');
+        const store = tx.objectStore(IDB_RATCHET_STORE);
+        const req = store.getAll();
+        req.onsuccess = () => resolve((req.result as Array<StoredRatchetSessionRecord>) || []);
+        req.onerror = () => resolve([]);
+      });
+      db.close();
+    }
+    for (const rec of records) {
+      try {
+        const decrypted = await decryptDurableRatchetState(oldWrappingKey, norm, rec.roomId, {
+          iv: rec.iv,
+          ciphertext: rec.ciphertext,
+        });
+        if (!decrypted) continue;
+        const wrapped = await encryptDurableRatchetState(newWrappingKey, norm, rec.roomId, decrypted.state);
+        const updated: StoredRatchetSessionRecord = { ...rec, iv: wrapped.iv, ciphertext: wrapped.ciphertext };
+        if (!hasBrowserIndexedDB()) {
+          nodeMemoryRatchetStore.set(rec.key, updated);
+        } else {
+          const db = await openKeyStoreDB();
+          await new Promise<void>(resolve => {
+            const tx = db.transaction(IDB_RATCHET_STORE, 'readwrite');
+            const store = tx.objectStore(IDB_RATCHET_STORE);
+            store.put(updated);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => resolve();
+          });
+          db.close();
+        }
+      } catch {
+        // رکورد خراب/یتیم: همان‌طور بماند تا بارگذاری بعدی آن را حذف کند.
+      }
+    }
+  } catch {
+    // ignore — مهاجرت انبار هرگز عملیات L8 را شکست نمی‌دهد.
+  }
+}
+
+/**
  * بازپیچیدن ورودی‌های کش تاریخچهٔ یک کاربر زیر کلید پوششی تازه — هنگام
  * فعال/غیرفعال‌کردن محافظت با رمز عبور (L8) کلید پوششی عوض می‌شود و بدون
  * این مهاجرت، ورودی‌های قدیمی زیر کلید قبلی یتیم و ناخوانا می‌ماندند.
@@ -1120,6 +1538,8 @@ export async function deleteIdentityRecordV4(username: string): Promise<void> {
   // حذف هویت، کش تاریخچهٔ آن کاربر را هم پاک می‌کند (متن‌های رمزنگاری‌شده
   // زیر کلید هویت حذف‌شده باقی نمی‌مانند).
   await deleteDecryptedHistoryForUser(norm);
+  // و نشست‌های دائم راتچت آن کاربر را هم پاک می‌کند.
+  await deleteDurableRatchetStateForUser(norm);
   const ls = getSafeLocalStorage();
   if (ls) {
     try {
@@ -1473,6 +1893,7 @@ export async function enablePasswordProtection(username: string, passphrase: str
   // کلید پوششی عوض شد — ورودی‌های کش تاریخچه زیر کلید تازه بازپیچیده
   // می‌شوند تا تاریخچهٔ قبلی پس از فعال‌کردن محافظت هم خوانا بماند.
   await rewrapDecryptedHistoryForUser(norm, record.wrappingKey, newWrappingKey);
+  await rewrapDurableRatchetStateForUser(norm, record.wrappingKey, newWrappingKey);
 }
 
 /**
@@ -1519,6 +1940,7 @@ export async function disablePasswordProtection(username: string, passphrase: st
   // کلید پوششی عوض شد — ورودی‌های کش تاریخچه زیر کلید تازه بازپیچیده
   // می‌شوند تا تاریخچهٔ قبلی پس از غیرفعال‌کردن محافظت هم خوانا بماند.
   await rewrapDecryptedHistoryForUser(norm, sessionKey, newWrappingKey);
+  await rewrapDurableRatchetStateForUser(norm, sessionKey, newWrappingKey);
 }
 
 /**

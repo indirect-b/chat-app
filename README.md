@@ -9,7 +9,7 @@ Every message is protected by **PQ-MPRBA** — an original browser-native protoc
 and **ML-DSA-65 (FIPS 204)** identity signatures.
 The server never sees plaintext, and never learns who is talking to whom.
 
-[![Version](https://img.shields.io/badge/version-6.5.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-6.5.1-blue)](CHANGELOG.md)
 [![React](https://img.shields.io/badge/React-19-61dafb?logo=react&logoColor=white)](https://react.dev)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
 [![Node.js](https://img.shields.io/badge/Node.js-Express-339933?logo=nodedotjs&logoColor=white)](https://expressjs.com)
@@ -447,7 +447,7 @@ Vectors fetched fresh on 2026-11-21 from `usnistgov/ACVP-Server` (vsId 42, FIPS 
 
 ## 🔧 Remediation — fix rounds, 21 November 2026
 
-**The findings above are the record of what was found. This section is the record of what was done about them.** After the self-assessment, three fix rounds ran on branch `fix/audit-2026-11-21` and were merged to `main` on 2026-11-22 (via the UI redesign branch). A fourth round ran on 2026-11-22 on branch `fix/audit-2026-11-22-round4` and was merged to `main` the same day. A fifth round ran on 2026-11-23, fixing all 18 findings from a live pentest of the deployed app (see Round 5 below). The code on `main` is now the fixed version. This is still a self-assessment follow-up — not an independent audit, not a FIPS 140-3 validation, not a formal proof.
+**The findings above are the record of what was found. This section is the record of what was done about them.** After the self-assessment, three fix rounds ran on branch `fix/audit-2026-11-21` and were merged to `main` on 2026-11-22 (via the UI redesign branch). A fourth round ran on 2026-11-22 on branch `fix/audit-2026-11-22-round4` and was merged to `main` the same day. A fifth round ran on 2026-11-23, fixing all 18 findings from a live pentest of the deployed app (see Round 5 below). A sixth round ran on 2026-11-24, fixing the one remaining code issue from an external review of the crypto (durable ratchet state) and recording the other four claims honestly — one was already fixed, three are known limitations (see Round 6 below). The code on `main` is now the fixed version. This is still a self-assessment follow-up — not an independent audit, not a FIPS 140-3 validation, not a formal proof.
 
 ### Outcome
 
@@ -561,6 +561,20 @@ Honest limits: no authenticated or state-changing attack could be executed again
 #### Message history after refresh — fixed in the same push
 
 Refreshing the page locked all received history (the durable replay store rejected any already-decrypted message on re-decrypt) and all own sent messages (they lived only in an in-memory cache). Fixed Signal-style: decrypt-once + an encrypted durable plaintext cache — a new IndexedDB store `decrypted_history_v1`, AES-GCM under the device wrapping key, 10,000 entries per user, 30-day TTL, wiped on identity delete, re-wrapped on password-protection key rotation, unreadable while locked. Replay protection, the ratchet and ML-DSA verification are untouched. Messages that were never successfully decrypted before the fix stay locked — they were never cached.
+
+### Round 6 — security review follow-up, 24 November 2026 (1 fixed in code, 1 confirmed already fixed, 3 recorded as known limitations)
+
+On 2026-11-24 an external security review of `src/utils/crypto.ts` (v6.0–v6.5.0) raised 5 claims. Each was verified against the real code before acting on it — one of the five turned out to be stale:
+
+| # | Claim | Verdict |
+| --- | --- | --- |
+| 1 | 1:1 file keys are ECDH-only (classical downgrade) | ❌ Stale — already fixed by M10 (round 3): new 1:1 files are PQF1 kind 4 (per-file random key, ML-KEM-768-encapsulated to peer and self). The v6.3.0 CHANGELOG line saying otherwise is superseded by the v6.5.1 entry. Only pre-M10 files still use kind-1 ECDH keys. |
+| 2 | Skipped-keys vault is RAM-only (MAX_SKIP=100, 10-min TTL) — a refresh loses out-of-order messages | ✅ Fixed — new encrypted IndexedDB store `ratchet_sessions_v1` (AES-256-GCM under the device wrapping key, AAD-bound to user + room). The whole ratchet session persists (chain keys, steps, seen steps, vault); TTL and caps enforced on load; tampered records fail closed and are deleted; wiped on identity delete; re-wrapped on L8 key rotation; unreadable while locked. 6 new tests in `tests/durable-ratchet-state.test.ts`, including the reload-survival round-trip. |
+| 3 | PQ keys are AES-GCM-wrapped in IndexedDB with no hardware backing — XSS can unwrap them | ⏸️ Known limitation — true, and inherent to browser E2EE: the wrapping key is non-extractable and the CSP is strict, but an active same-origin XSS can still use the key's decrypt operation. A complete fix needs hardware-backed storage, i.e. a native client. Recorded in CHANGELOG v6.5.1. |
+| 4 | Group epoch distribution is O(N) ML-KEM encapsulations per membership change | ⏸️ Known limitation — true (~55 KB packet for 50 members). The right fix is TreeKEM/MLS — a protocol redesign, not a patch. Recorded in CHANGELOG v6.5.1. |
+| 5 | DM room ID is the sorted join of the two usernames — the server sees the social graph | ⏸️ Known limitation — true. The fix is opaque room IDs (random IDs + a server-side membership mapping) with dual support for existing rooms — a cross-cutting migration across client, server, ratchet role derivation and the database. Planned, not yet implemented. Recorded in CHANGELOG v6.5.1. |
+
+Verification — independent re-run on the fixed tree: `tsc --noEmit` clean; full suite **332 pass, 0 fail, 0 skipped** (72 suites — 326 baseline from round 5 + 6 new durable-ratchet tests); `vite build` OK.
 
 ### Full per-finding status
 
@@ -803,6 +817,8 @@ data/database.json        # Auto-generated fallback database snapshot
 ## 📋 Version history
 
 Full details in [CHANGELOG.md](CHANGELOG.md).
+
+- **v6.5.1** — Durable ratchet state: the skipped-keys vault and ratchet session now survive refresh (encrypted IndexedDB store `ratchet_sessions_v1`); the v6.3.0 "1:1 file key is ECDH-derived" limit is superseded (M10 already fixed it); 3 review claims recorded as known limitations (no hardware-backed keys in a browser, O(N) group epoch distribution, username-derived DM room IDs)
 
 - **v6.5.0** — Google profile sync: display name + photo come from the Google profile, manual edits win
 

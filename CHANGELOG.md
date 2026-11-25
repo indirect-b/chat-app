@@ -2,7 +2,13 @@
 
 ---
 
-## v6.5.0 (Latest) — Google profile sync: display name + photo from the Google profile
+## v6.5.1 (Latest) — Durable ratchet state: the skipped-keys vault survives refresh
+- The ratchet session state (receive/send chain keys, steps, seen steps, and the out-of-order skipped-keys vault) is now persisted in a new encrypted IndexedDB store `ratchet_sessions_v1` (AES-256-GCM under the device wrapping key, AAD-bound to user + room), instead of living only in RAM. After a refresh, out-of-order messages still decrypt from the vault and the session continues at the same step. Skipped keys keep their 10-minute TTL and 100-key cap (pruned on load); a tampered record fails closed and is deleted; the store is wiped on identity delete and re-wrapped when the password-protection key rotates; unreadable while the identity is locked.
+- The v6.3.0 known limit "the 1:1 file key is ECDH-derived (classical)" no longer applies: round 3 (M10) already replaced it — every new 1:1 file gets a fresh random 32-byte key, ML-KEM-768-encapsulated to both the recipient and the sender (PQF1 kind 4). Only files encrypted before that fix still rely on the legacy kind-1 ECDH key.
+- Known limitations (reviewed 2026-11-24, recorded honestly — not fixed in this round): (1) PQ secrets are AES-GCM-wrapped in IndexedDB with no hardware backing in a browser — a same-origin XSS could use the wrapping key's decrypt operation; mitigated by the strict CSP and non-extractable keys, fully solvable only on a native client with hardware-backed storage; (2) group epoch distribution is O(N) ML-KEM encapsulations per membership change (TreeKEM/MLS is the right direction for large groups — a protocol redesign, not a patch); (3) a DM room ID is the sorted join of the two usernames, so the server sees the conversation graph — opaque room IDs need a server-side membership mapping and a migration of existing rooms (planned, not yet implemented).
+- 332/332 tests pass.
+
+## v6.5.0 — Google profile sync: display name + photo from the Google profile
 - The name and photo from the Google profile now become the user's chat profile at sign-in. Existing users get updated on their next Google login.
 - If the user edits their display name or photo in the profile settings, their own choice wins — Google sign-in will not overwrite it afterwards.
 - The Google photo loads from lh3.googleusercontent.com (the only new image host allowed); other external avatar URLs are not loaded.
